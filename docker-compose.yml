@@ -1,0 +1,24 @@
+version: '3.8'
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: gia-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: gia_admin
+      POSTGRES_PASSWORD: gia_secure_pass
+      POSTGRES_DB: gia_development
+    volumes:
+      - gia_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: gia-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+volumes:
+  gia_postgres_data:

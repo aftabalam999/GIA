@@ -1927,3 +1927,14 @@ Ask instead of guessing when the requirement is materially ambiguous.
 The goal is not to produce the most code.
 
 The goal is to produce the **correct code inside the correct architecture with the smallest unnecessary change**.
+
+NEVER implement multiple major subsystems in one task unless explicitly instructed.
+
+After completing a subsystem:
+1. Run tests.
+2. Run lint/type checks.
+3. Verify affected APIs.
+4. Inspect the diff.
+5. Fix regressions.
+6. Update documentation if architecture changed.
+7. Stop and wait for the next instruction.

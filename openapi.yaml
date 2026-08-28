@@ -1,0 +1,1084 @@
+openapi: 3.0.3
+info:
+  title: GIA — Gemini Intelligent Assistant API
+  description: |
+    Production-grade API definition for GIA.
+    Orchestrates memory stores, document uploads, semantic searches, RAG pipelines, and multi-LLM workflows with Redis session storage and token revocation capabilities.
+  version: 1.0.0
+servers:
+  - url: http://localhost:5000/api/v1
+    description: Local development backend server
+paths:
+  /auth/signup:
+    post:
+      summary: User Registration
+      description: Create a new user account and set up a stateful session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+                - password
+                - name
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: developer@gia.ai
+                password:
+                  type: string
+                  format: password
+                  minLength: 8
+                  example: secure_pass_123
+                name:
+                  type: string
+                  minLength: 1
+                  example: Alice Developer
+      responses:
+        '211':
+          description: Created successfully (maps to 201)
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+                example: session_id=abc123xyz; Path=/; HttpOnly; Secure; SameSite=Lax
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  user:
+                    $ref: '#/components/schemas/User'
+                  token:
+                    type: string
+                    description: Opaque session ID (returned for API client compatibility)
+                    example: 7c57f7dfd311910cf9cf6a3bcf4489a7f34c2b9a764d23bb5e468da40177fc22
+        '400':
+          description: Validation error or duplicate email
+  /auth/login:
+    post:
+      summary: User Authentication
+      description: Validate credentials and initialize a Redis session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+                - password
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: developer@gia.ai
+                password:
+                  type: string
+                  format: password
+                  example: secure_pass_123
+      responses:
+        '200':
+          description: Logged in successfully
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+                example: session_id=abc123xyz; Path=/; HttpOnly; Secure; SameSite=Lax
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  user:
+                    $ref: '#/components/schemas/User'
+                  token:
+                    type: string
+                    description: Opaque session ID
+                    example: 7c57f7dfd311910cf9cf6a3bcf4489a7f34c2b9a764d23bb5e468da40177fc22
+        '400':
+          description: Validation failed
+        '401':
+          description: Invalid email or password
+  /auth/me:
+    get:
+      summary: Get User Profile
+      description: Retrieve user details from the active session.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Session valid
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  user:
+                    $ref: '#/components/schemas/User'
+        '401':
+          description: Missing or expired session
+  /auth/logout:
+    post:
+      summary: Session Sign Out
+      description: Revoke the active session key from Redis and clear cookies.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Successfully signed out
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+                example: session_id=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+  /auth/revoke-all:
+    post:
+      summary: Revoke All Sessions
+      description: Invalidate all active session IDs for the authenticated user (e.g., on key compromise).
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      responses:
+        '200':
+          description: All sessions revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+  /health/live:
+    get:
+      summary: Liveness Probe
+      description: Basic liveness indicator checking if GIA backend process is alive.
+      responses:
+        '200':
+          description: Process running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  timestamp:
+                    type: string
+                    format: date-time
+  /health/ready:
+    get:
+      summary: Readiness Probe
+      description: Asserts that required internal services (Database and Redis) are connected and reachable.
+      responses:
+        '200':
+          description: Ready to serve traffic
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  timestamp:
+                    type: string
+                    format: date-time
+        '503':
+          description: Core dependency offline
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: unhealthy
+                  timestamp:
+                    type: string
+                    format: date-time
+                  dependencies:
+                    type: object
+                    properties:
+                      database:
+                        type: string
+                        example: unhealthy
+                      redis:
+                        type: string
+                        example: healthy
+  /health:
+    get:
+      summary: Detailed Dependency Probe
+      description: Complete health audit of databases, Redis, and configured external LLM / Embedding APIs.
+      responses:
+        '200':
+          description: Core components online (status can be degraded if external APIs are unreachable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthReport'
+        '503':
+          description: Mandatory database or Redis down
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthReport'
+  /health/dependencies:
+    get:
+      summary: Detailed Dependency Probe (Alias)
+      description: Audit report of internal and external GIA dependencies.
+      responses:
+        '200':
+          description: Audit successfully completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthReport'
+  /conversations:
+    get:
+      summary: List Conversations
+      description: Fetch conversation history logs for the current user.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      responses:
+        '200':
+          description: List retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  conversations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Conversation'
+        '401':
+          description: Unauthorized
+    post:
+      summary: Create Conversation
+      description: Initialize a new thread.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+              properties:
+                title:
+                  type: string
+                  minLength: 1
+                  example: TypeScript Refactoring Guide
+      responses:
+        '200':
+          description: Conversation initialized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  conversation:
+                    $ref: '#/components/schemas/Conversation'
+  /conversations/{id}:
+    delete:
+      summary: Delete Conversation
+      description: Invalidate and remove a conversation and its messages.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+        '403':
+          description: Access denied (IDOR protection)
+        '404':
+          description: Conversation not found
+  /conversations/{id}/messages:
+    get:
+      summary: Fetch Conversation Messages
+      description: Retrieve chronological dialogue logs for a conversation thread.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Messages retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  messages:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Message'
+        '403':
+          description: Access denied
+    post:
+      summary: Send Message (Synchronous)
+      description: Submit a query message and receive a synchronous LLM answer.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - content
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                  example: Explain closures in JS.
+      responses:
+        '200':
+          description: Response received
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  userMessage:
+                    $ref: '#/components/schemas/Message'
+                  assistantMessage:
+                    $ref: '#/components/schemas/Message'
+  /conversations/{id}/messages/rag:
+    post:
+      summary: Send Message with RAG Retrieval
+      description: Submit a prompt querying active semantic memories and uploaded knowledge documents.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - content
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                  example: What are GIA's database constraints?
+      responses:
+        '200':
+          description: Response with source citations retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  userMessage:
+                    $ref: '#/components/schemas/Message'
+                  assistantMessage:
+                    $ref: '#/components/schemas/Message'
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title:
+                          type: string
+                          example: architecture_spec.pdf
+                        content:
+                          type: string
+                          example: "...uuid_generate_v4() is utilized for..."
+                        score:
+                          type: number
+                          example: 0.88
+                        sourceUrl:
+                          type: string
+                          nullable: true
+                          example: http://localhost:5000/docs/arch.pdf
+  /conversations/{id}/messages/agent:
+    post:
+      summary: Send Message to Agent Orchestration
+      description: Run query through the Agent Orchestrator state machine loop (Planning -> Executing -> Responding).
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - content
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                  example: Create a memory noting I prefer dark theme.
+      responses:
+        '200':
+          description: Agent execution run completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  userMessage:
+                    $ref: '#/components/schemas/Message'
+                  assistantMessage:
+                    $ref: '#/components/schemas/Message'
+                  runId:
+                    type: string
+                    format: uuid
+                    example: f7b9c9f2-29fc-487b-a25e-b2d9b23fa5cd
+  /memories:
+    get:
+      summary: List/Keyword Search Memories
+      description: Retrieve user memories filtered by keyword filters.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: query
+          in: query
+          schema:
+            type: string
+          description: Optional case-insensitive keyword search
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Memories retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  memories:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Memory'
+    post:
+      summary: Create Memory
+      description: Manually insert a preference or fact memory record.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - content
+                - type
+                - confidence
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                  example: User prefers Python 3.12 over Node.js
+                type:
+                  type: string
+                  enum: [user_preference, explicit_note, conversation_context]
+                  example: user_preference
+                importance:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                  default: 5
+                  example: 8
+                confidence:
+                  type: number
+                  minimum: 0.0
+                  maximum: 1.0
+                  example: 0.95
+                metadata:
+                  type: object
+                  example: { "source": "settings_panel" }
+      responses:
+        '201':
+          description: Memory saved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  memory:
+                    $ref: '#/components/schemas/Memory'
+  /memories/search:
+    get:
+      summary: Semantic Search Memories
+      description: Search memories using vector cosine similarity.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search text query
+        - name: semantic
+          in: query
+          schema:
+            type: boolean
+            default: true
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 5
+      responses:
+        '200':
+          description: Match records found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  memories:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Memory'
+  /memories/{id}:
+    put:
+      summary: Update Memory
+      description: Update memory content or rating parameters.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - content
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                  example: User prefers Python 3.12 and Go.
+                importance:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                type:
+                  type: string
+                  enum: [user_preference, explicit_note, conversation_context]
+                confidence:
+                  type: number
+                  minimum: 0.0
+                  maximum: 1.0
+                metadata:
+                  type: object
+      responses:
+        '200':
+          description: Updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  memory:
+                    $ref: '#/components/schemas/Memory'
+        '403':
+          description: Access denied
+    delete:
+      summary: Delete Memory
+      description: Remove memory record.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+  /memories/extract:
+    post:
+      summary: Extract Memories from Conversation
+      description: Ask LLM to parse a conversation thread, extract facts, and save them.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - conversationId
+                - content
+              properties:
+                conversationId:
+                  type: string
+                  format: uuid
+                  example: e6d092d6-47b2-4d43-aa9d-29bcbb3f374c
+                content:
+                  type: string
+                  description: Dialog context string to extract facts from
+                  example: "Alice mentioned today that she is learning Rust."
+      responses:
+        '200':
+          description: Extraction complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  memories:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Memory'
+  /documents:
+    get:
+      summary: List Documents
+      description: Fetch index lists of uploaded documents metadata.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Documents list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  documents:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Document'
+    post:
+      summary: Ingest Document
+      description: Upload document chunks text to process embeddings index.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+                - content
+                - sourceType
+              properties:
+                title:
+                  type: string
+                  maxLength: 500
+                  example: database_indices.txt
+                content:
+                  type: string
+                  maxLength: 50000
+                  example: "HNSW indexes accelerate search latency..."
+                sourceType:
+                  type: string
+                  maxLength: 100
+                  example: text/plain
+                sourceUrl:
+                  type: string
+                  format: uri
+                  nullable: true
+                metadata:
+                  type: object
+      responses:
+        '201':
+          description: Document processed and saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  document:
+                    $ref: '#/components/schemas/Document'
+  /documents/{id}:
+    delete:
+      summary: Delete Document
+      description: Remove document metadata and all chunk embeddings.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+  /tools/execute:
+    post:
+      summary: Execute Safe Reference Tool
+      description: Execute read-only system tools like clock checking or document lookups.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - toolName
+                - arguments
+              properties:
+                toolName:
+                  type: string
+                  enum: [get_current_time, search_memories, list_documents]
+                  example: get_current_time
+                arguments:
+                  type: object
+                  example: {}
+                messageId:
+                  type: string
+                  format: uuid
+                  description: Optional dialogue boundary message context
+      responses:
+        '200':
+          description: Tool execution return results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  result:
+                    type: string
+                    example: "{\"time\":\"2026-08-29T01:45:00+05:30\"}"
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: session_id
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: d2d092d6-47b2-4d43-aa9d-29bcbb3f374c
+        email:
+          type: string
+          format: email
+          example: developer@gia.ai
+        name:
+          type: string
+          example: Alice Developer
+    Conversation:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: c3a092d6-47b2-4d43-aa9d-29bcbb3f374c
+        user_id:
+          type: string
+          format: uuid
+          example: d2d092d6-47b2-4d43-aa9d-29bcbb3f374c
+        title:
+          type: string
+          example: TypeScript Refactoring Guide
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Message:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: m4f092d6-47b2-4d43-aa9d-29bcbb3f374c
+        conversation_id:
+          type: string
+          format: uuid
+          example: c3a092d6-47b2-4d43-aa9d-29bcbb3f374c
+        role:
+          type: string
+          enum: [user, assistant, system]
+          example: user
+        content:
+          type: string
+          example: Explain closures in JS.
+        created_at:
+          type: string
+          format: date-time
+    Memory:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: f9d092d6-47b2-4d43-aa9d-29bcbb3f374c
+        user_id:
+          type: string
+          format: uuid
+          example: d2d092d6-47b2-4d43-aa9d-29bcbb3f374c
+        type:
+          type: string
+          enum: [user_preference, explicit_note, conversation_context]
+          example: user_preference
+        content:
+          type: string
+          example: User prefers Python 3.12 over Node.js
+        importance:
+          type: integer
+          example: 8
+        confidence:
+          type: number
+          example: 0.95
+        metadata:
+          type: object
+          nullable: true
+          example: { "source": "settings_panel" }
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Document:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: e1d092d6-47b2-4d43-aa9d-29bcbb3f374c
+        user_id:
+          type: string
+          format: uuid
+          example: d2d092d6-47b2-4d43-aa9d-29bcbb3f374c
+        title:
+          type: string
+          example: database_indices.txt
+        source_type:
+          type: string
+          example: text/plain
+        source_url:
+          type: string
+          format: uri
+          nullable: true
+        metadata:
+          type: object
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    HealthReport:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+          example: healthy
+        timestamp:
+          type: string
+          format: date-time
+        version:
+          type: string
+          example: 1.0.0
+        dependencies:
+          type: object
+          properties:
+            database:
+              type: string
+              enum: [healthy, unhealthy]
+              example: healthy
+            redis:
+              type: string
+              enum: [healthy, unhealthy]
+              example: healthy
+            llm:
+              type: string
+              enum: [healthy, unhealthy, unconfigured]
+              example: healthy
+            embeddings:
+              type: string
+              enum: [healthy, unhealthy, unconfigured]
+              example: healthy
+        latency:
+          type: object
+          properties:
+            database:
+              type: number
+              example: 4
+            redis:
+              type: number
+              example: 2
+            llm:
+              type: number
+              example: 154
+            embeddings:
+              type: number
+              example: 142

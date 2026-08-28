@@ -1,0 +1,16 @@
+{
+  "name": "gia-monorepo",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "backend:dev": "npm --prefix backend run dev",
+    "backend:test": "npm --prefix backend run test",
+    "frontend:dev": "npm --prefix frontend run dev",
+    "tauri:dev": "npm --prefix frontend run tauri dev"
+  }
+}
