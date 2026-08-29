@@ -11,11 +11,11 @@ export type ModelType = 'fast' | 'general' | 'reasoning';
 export const ROUTER_CONFIGS: Record<ModelType, ModelConfig> = {
   fast: {
     provider: 'gemini',
-    model: 'gemini-2.5-flash',
+    model: 'gemini-3.6-flash',
   },
   general: {
-    provider: 'openai',
-    model: 'gpt-4o-mini', // default mini for development
+    provider: 'gemini',
+    model: 'gemini-3.6-flash', // switched from openai: no credits
   },
   reasoning: {
     provider: 'anthropic',

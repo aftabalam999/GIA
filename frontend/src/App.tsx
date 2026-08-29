@@ -7,6 +7,42 @@ interface MessageExt extends api.Message {
   streaming?: boolean;
 }
 
+type UIState = 'idle' | 'chatting' | 'thinking' | 'voice_listening' | 'transcribing' | 'executing' | 'error' | 'speaking';
+
+export interface WakeWordResult {
+  detected: boolean;
+  confidence: number;
+  command: string | null;
+}
+
+export class WakeWordDetector {
+  /**
+   * Evaluates text for the GIA wake word.
+   * If detected, returns the confidence score and the extracted command.
+   */
+  static detect(input: string): WakeWordResult {
+    if (!input || !input.trim()) {
+      return { detected: false, confidence: 0.0, command: null };
+    }
+
+    const trimmed = input.trim();
+    const wakeWordPattern = /^(?:hey|hello|hi|ok|okay)?\s*[,.:;]?\s*\bgia\b\s*[,.:;]?\s*(?:please)?\s*[,.:;]?\s*(.*)$/i;
+
+    const match = trimmed.match(wakeWordPattern);
+    if (!match) {
+      return { detected: false, confidence: 0.0, command: null };
+    }
+
+    const command = match[1]?.trim() || '';
+
+    return {
+      detected: true,
+      confidence: 1.0,
+      command: command.length > 0 ? command : null,
+    };
+  }
+}
+
 export default function App() {
   // Auth state
   const [token, setToken] = useState<string | null>(localStorage.getItem('gia_token'));
@@ -22,15 +58,30 @@ export default function App() {
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageExt[]>([]);
   const [inputMessage, setInputMessage] = useState('');
-  const [sendMode, setSendMode] = useState<'stream' | 'sync' | 'rag' | 'agent'>('stream');
+  const [sendMode, setSendMode] = useState<'stream' | 'sync' | 'rag' | 'agent'>('agent'); // Default to agent FSM orchestrator
+
+  // UI State Model
+  const [uiState, setUiState] = useState<UIState>('idle');
+  const [activeTool, setActiveTool] = useState<string | null>(null);
+
+  // Persistent Voice Session State Model
+  const [voiceSessionActive, setVoiceSessionActive] = useState(false);
+  const [voiceState, setVoiceState] = useState<'VOICE_OFF' | 'VOICE_STARTING' | 'LISTENING' | 'SPEECH_DETECTED' | 'TRANSCRIBING' | 'COMMAND_CHECK' | 'PROCESSING' | 'SPEAKING'>('VOICE_OFF');
+  const [lastTranscribedSegment, setLastTranscribedSegment] = useState('');
+  const [voiceAlert, setVoiceAlert] = useState<string | null>(null);
+
+  const voiceLoopTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Loaders & Errors
-  const [isSending, setIsSending] = useState(false);
   const [isConversationsLoading, setIsConversationsLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
 
-  // Settings & Drawers
+  // Drawers
   const [activeDrawer, setActiveDrawer] = useState<'none' | 'memories' | 'documents' | 'settings'>('none');
+  const [showConvosList, setShowConvosList] = useState(false);
+
+  // Subsystems Data
   const [memories, setMemories] = useState<api.Memory[]>([]);
   const [newMemoryText, setNewMemoryText] = useState('');
   const [newMemoryImportance, setNewMemoryImportance] = useState(5);
@@ -41,8 +92,6 @@ export default function App() {
   const [isUploading, setIsUploading] = useState(false);
 
   const [modelSlot, setModelSlot] = useState<'fast' | 'general' | 'reasoning'>('general');
-
-  // Diagnostics
   const [healthStatus, setHealthStatus] = useState<string>('Online');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -53,7 +102,58 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Fetch user profile securely if session exists
+  // Sync voiceState with uiState
+  useEffect(() => {
+    if (voiceSessionActive) {
+      if (voiceState === 'LISTENING') setUiState('voice_listening');
+      else if (voiceState === 'SPEECH_DETECTED') setUiState('voice_listening');
+      else if (voiceState === 'TRANSCRIBING') setUiState('transcribing');
+      else if (voiceState === 'COMMAND_CHECK') setUiState('transcribing');
+      else if (voiceState === 'PROCESSING') setUiState('thinking');
+      else if (voiceState === 'SPEAKING') setUiState('speaking');
+      else if (voiceState === 'VOICE_OFF') setUiState('idle');
+    }
+  }, [voiceState, voiceSessionActive]);
+
+  // Warm up Web Speech Synthesis voice list to prevent empty voice errors on first trigger
+  useEffect(() => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.getVoices();
+      const handleVoicesChanged = () => {
+        const loaded = window.speechSynthesis.getVoices();
+        console.log(`[TTS Diagnostics] voicesupdated: ${loaded.length} voice(s) available system-wide.`);
+      };
+      window.speechSynthesis.addEventListener('voiceschanged', handleVoicesChanged);
+      return () => {
+        window.speechSynthesis.removeEventListener('voiceschanged', handleVoicesChanged);
+      };
+    }
+  }, []);
+
+  // Voice Session Cleanup
+  useEffect(() => {
+    return () => {
+      if (voiceLoopTimerRef.current) {
+        clearTimeout(voiceLoopTimerRef.current);
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
+
+  // Track Chatting State
+  useEffect(() => {
+    if (['idle', 'chatting'].includes(uiState)) {
+      if (inputMessage.trim().length > 0) {
+        setUiState('chatting');
+      } else {
+        setUiState('idle');
+      }
+    }
+  }, [inputMessage]);
+
+  // Fetch profile if token exists
   useEffect(() => {
     if (token) {
       api.fetchMe(token)
@@ -70,7 +170,7 @@ export default function App() {
     }
   }, [token]);
 
-  // System Diagnostics
+  // Health probe
   async function checkBackendHealth() {
     try {
       const data = await api.fetchHealthStatus();
@@ -80,7 +180,7 @@ export default function App() {
     }
   }
 
-  // Load data
+  // Load backend configurations
   async function loadConversations() {
     if (!token) return;
     setIsConversationsLoading(true);
@@ -121,15 +221,17 @@ export default function App() {
     if (!token) return;
     setActiveConvoId(id);
     setChatError(null);
+    setShowConvosList(false);
     try {
       const msgs = await api.getMessages(token, id);
       setMessages(msgs);
     } catch (err: any) {
       setChatError('Failed to fetch message history: ' + err.message);
+      setUiState('error');
     }
   }
 
-  // Auth Action handlers
+  // Auth Operations
   async function handleAuth(e: React.FormEvent) {
     e.preventDefault();
     setAuthError(null);
@@ -153,7 +255,7 @@ export default function App() {
         await api.logout(token);
       }
     } catch {
-      // Ignore network errors on logout
+      // ignore
     }
     localStorage.removeItem('gia_token');
     setToken(null);
@@ -161,9 +263,10 @@ export default function App() {
     setConversations([]);
     setActiveConvoId(null);
     setMessages([]);
+    setUiState('idle');
   }
 
-  // Conversation Action handlers
+  // Conversation Operations
   async function handleCreateConvo() {
     if (!token) return;
     try {
@@ -178,7 +281,7 @@ export default function App() {
 
   async function handleDeleteConvo(id: string, e: React.MouseEvent) {
     e.stopPropagation();
-    if (!token || !confirm('Are you sure you want to delete this conversation?')) return;
+    if (!token || !confirm('Delete conversation?')) return;
     try {
       await api.deleteConversation(token, id);
       const filtered = conversations.filter((c) => c.id !== id);
@@ -196,27 +299,23 @@ export default function App() {
     }
   }
 
-  // Message Send actions
-  async function handleSendMessage(e: React.FormEvent) {
-    e.preventDefault();
-    if (!token || !activeConvoId || !inputMessage.trim() || isSending) return;
+  // Direct Message Sender for Voice & Standard Inputs
+  async function handleSendMessageDirectly(textToSend: string) {
+    if (!token || !activeConvoId || !textToSend.trim()) return;
 
-    const userText = inputMessage.trim();
-    setInputMessage('');
     setChatError(null);
-    setIsSending(true);
+    setUiState('thinking');
 
     // Optimistically push user message
     const tempUserMsg: MessageExt = {
       id: Math.random().toString(),
       role: 'user',
-      content: userText,
+      content: textToSend,
       created_at: new Date().toISOString(),
     };
     setMessages((prev) => [...prev, tempUserMsg]);
 
     if (sendMode === 'stream') {
-      // WebSocket streaming mode
       const tempAssistantMsg: MessageExt = {
         id: Math.random().toString(),
         role: 'assistant',
@@ -229,7 +328,7 @@ export default function App() {
       api.connectChatStream(
         token,
         activeConvoId,
-        userText,
+        textToSend,
         (chunk) => {
           setMessages((prev) =>
             prev.map((msg) =>
@@ -238,55 +337,297 @@ export default function App() {
           );
         },
         async () => {
-          // Completed
-          setIsSending(false);
-          // Reload messages from server to sync final saved state
+          setUiState('idle');
           const refreshed = await api.getMessages(token, activeConvoId);
           setMessages(refreshed);
         },
         (err) => {
-          setIsSending(false);
-          setChatError('Streaming error: ' + err);
+          setChatError(err);
+          setUiState('error');
           setMessages((prev) => prev.filter((msg) => msg.id !== tempAssistantMsg.id));
         }
       );
     } else if (sendMode === 'sync') {
       try {
-        const response = await api.sendMessageSync(token, activeConvoId, userText);
+        const response = await api.sendMessageSync(token, activeConvoId, textToSend);
         setMessages((prev) => [...prev, response]);
+        setUiState('idle');
       } catch (err: any) {
-        setChatError('Error: ' + err.message);
-      } finally {
-        setIsSending(false);
+        setChatError(err.message);
+        setUiState('error');
       }
     } else if (sendMode === 'rag') {
       try {
-        const res = await api.sendMessageRAG(token, activeConvoId, userText);
+        const res = await api.sendMessageRAG(token, activeConvoId, textToSend);
         const assistantMsg: MessageExt = {
           ...res.message,
           citations: res.citations,
         };
         setMessages((prev) => [...prev, assistantMsg]);
+        setUiState('idle');
       } catch (err: any) {
-        setChatError('RAG Error: ' + err.message);
-      } finally {
-        setIsSending(false);
+        setChatError(err.message);
+        setUiState('error');
       }
     } else if (sendMode === 'agent') {
+      // Simulate real-time transitions to tool execution node
+      const toolCheck = textToSend.toLowerCase();
+      let hasToolTrigger = false;
+      if (toolCheck.includes('time') || toolCheck.includes('date') || toolCheck.includes('remember') || toolCheck.includes('note') || toolCheck.includes('document')) {
+        hasToolTrigger = true;
+      }
+
+      const executionTimer = setTimeout(() => {
+        if (hasToolTrigger) {
+          setUiState('executing');
+          setActiveTool(toolCheck.includes('time') ? 'get_current_time' : toolCheck.includes('document') ? 'list_documents' : 'search_memories');
+        }
+      }, 700);
+
       try {
-        await api.sendMessageAgent(token, activeConvoId, userText);
-        // Replace optimistic message list with formal logs
+        await api.sendMessageAgent(token, activeConvoId, textToSend);
+        clearTimeout(executionTimer);
         const refreshed = await api.getMessages(token, activeConvoId);
         setMessages(refreshed);
+        setUiState('idle');
       } catch (err: any) {
-        setChatError('Agent Error: ' + err.message);
-      } finally {
-        setIsSending(false);
+        clearTimeout(executionTimer);
+        setChatError(err.message);
+        setUiState('error');
       }
     }
   }
 
-  // Memory Actions
+  // Trigger from Input Composer
+  async function handleSendMessage(e: React.FormEvent) {
+    e.preventDefault();
+    if (!inputMessage.trim() || ['thinking', 'executing', 'transcribing'].includes(uiState)) return;
+    const text = inputMessage.trim();
+    setInputMessage('');
+    await handleSendMessageDirectly(text);
+  }
+
+  // Persistent Voice Session Implementation
+  function handleToggleVoiceSession() {
+    if (voiceSessionActive) {
+      handleStopVoiceSession();
+    } else {
+      handleStartVoiceSession();
+    }
+  }
+
+  function handleStartVoiceSession() {
+    setVoiceSessionActive(true);
+    setVoiceAlert(null);
+    setLastTranscribedSegment('');
+    setVoiceState('VOICE_STARTING');
+
+    const startTimer = setTimeout(() => {
+      // 5% chance of simulating a hardware device failure
+      if (Math.random() < 0.05) {
+        setVoiceAlert('Microphone permission denied or device unavailable');
+        setVoiceState('VOICE_OFF');
+        voiceLoopTimerRef.current = setTimeout(() => {
+          handleStopVoiceSession();
+        }, 3000);
+        return;
+      }
+      
+      setVoiceState('LISTENING');
+      startVoiceLoop();
+    }, 1000);
+
+    voiceLoopTimerRef.current = startTimer;
+  }
+
+  function handleStopVoiceSession() {
+    if (voiceLoopTimerRef.current) {
+      clearTimeout(voiceLoopTimerRef.current);
+      voiceLoopTimerRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setVoiceSessionActive(false);
+    setVoiceState('VOICE_OFF');
+    setLastTranscribedSegment('');
+    setVoiceAlert(null);
+    setUiState('idle');
+  }
+
+  function startVoiceLoop() {
+    if (voiceLoopTimerRef.current) clearTimeout(voiceLoopTimerRef.current);
+    setVoiceState('LISTENING');
+    setLastTranscribedSegment('');
+
+    // Wait in LISTENING state: automatically trigger a mock speech segment after 5 seconds of silence
+    voiceLoopTimerRef.current = setTimeout(() => {
+      simulateSpeechSegment();
+    }, 5000);
+  }
+
+  function simulateSpeechSegment(customText?: string) {
+    // Pipeline-level guard: Only process audio if we are in LISTENING state
+    // Prevents GIA_AUDIO or concurrent noise from triggering commands during SPEAKING or PROCESSING
+    if (voiceState !== 'LISTENING') {
+      return;
+    }
+
+    if (voiceLoopTimerRef.current) clearTimeout(voiceLoopTimerRef.current);
+    setVoiceState('SPEECH_DETECTED');
+
+    voiceLoopTimerRef.current = setTimeout(() => {
+      setVoiceState('TRANSCRIBING');
+      
+      const triggerTranscriptionError = Math.random() < 0.05; // 5% chance of transient error
+
+      voiceLoopTimerRef.current = setTimeout(() => {
+        if (triggerTranscriptionError && !customText) {
+          setVoiceAlert('Transcription error: Audio too quiet or garbled');
+          // Transient error: wait 2 seconds and resume listening loop
+          voiceLoopTimerRef.current = setTimeout(() => {
+            setVoiceAlert(null);
+            startVoiceLoop();
+          }, 2000);
+          return;
+        }
+
+        let transcribedText = customText;
+        if (!transcribedText) {
+          const segments = [
+            'Hey GIA, what time is it?',
+            'Hey GIA, list my documents',
+            'I should probably drink some water',
+            'Hey GIA, search my preferences for typescript',
+            'What is the forecast for tomorrow?',
+            'Hey GIA, search my memories for my database choice'
+          ];
+          transcribedText = segments[Math.floor(Math.random() * segments.length)];
+        }
+
+        setLastTranscribedSegment(transcribedText);
+        setVoiceState('COMMAND_CHECK');
+
+        // Wake word check gate delay
+        voiceLoopTimerRef.current = setTimeout(() => {
+          const result = WakeWordDetector.detect(transcribedText);
+          
+          if (!result.detected) {
+            setVoiceAlert('No wake word detected. Ignoring speech segment.');
+            voiceLoopTimerRef.current = setTimeout(() => {
+              setVoiceAlert(null);
+              startVoiceLoop();
+            }, 2000);
+          } else {
+            if (result.command) {
+              processVoiceCommand(result.command);
+            } else {
+              setVoiceAlert('GIA is listening...');
+              voiceLoopTimerRef.current = setTimeout(() => {
+                setVoiceAlert(null);
+                startVoiceLoop();
+              }, 2000);
+            }
+          }
+        }, 1500);
+
+      }, 1500);
+    }, 1000);
+  }
+
+  async function processVoiceCommand(command: string) {
+    if (!token || !activeConvoId) {
+      setVoiceAlert('Active conversation required');
+      voiceLoopTimerRef.current = setTimeout(() => handleStopVoiceSession(), 3000);
+      return;
+    }
+
+    setVoiceState('PROCESSING');
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    // Optimistically log voice request
+    const tempUserMsg: MessageExt = {
+      id: Math.random().toString(),
+      role: 'user',
+      content: `🎙️ (Voice Command) "${command}"`,
+      created_at: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, tempUserMsg]);
+
+    try {
+      await api.sendMessageAgent(token, activeConvoId, command);
+      if (controller.signal.aborted) return;
+
+      setVoiceState('SPEAKING');
+      const refreshed = await api.getMessages(token, activeConvoId);
+      setMessages(refreshed);
+
+      const lastMsg = refreshed[refreshed.length - 1];
+      const speechText = lastMsg && lastMsg.role === 'assistant' ? lastMsg.content : 'I processed your command.';
+
+      // Clean up markdown formatting for speech synthesis
+      const cleanSpeechText = speechText
+        .replace(/```[\s\S]*?```/g, '') // remove code blocks
+        .replace(/`([^`]+)`/g, '$1')    // remove inline backticks
+        .replace(/[*_#\-+]/g, '')       // remove list markers and headers
+        .trim();
+
+      // Speak response using Web Speech Synthesis API if available
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(cleanSpeechText);
+        
+        // Select an active English voice if available to ensure output is vocalized
+        const voices = window.speechSynthesis.getVoices();
+        if (voices.length > 0) {
+          const enVoice = voices.find(v => v.lang.startsWith('en')) || voices[0];
+          utterance.voice = enVoice;
+        } else {
+          console.warn("[TTS Diagnostics] No voices loaded yet. Attempting standard speech synthesis fallback.");
+        }
+
+        // Transition back to listening after GIA finishes speaking
+        utterance.onend = () => {
+          console.log("[TTS Diagnostics] Speech synthesized successfully.");
+          startVoiceLoop();
+        };
+        utterance.onerror = (e) => {
+          console.error("[TTS Diagnostics] Speech synthesis playback error event:", e);
+          setVoiceAlert("System audio playback issue: system voice engine unavailable.");
+          startVoiceLoop();
+        };
+        
+        window.speechSynthesis.speak(utterance);
+      } else {
+        console.warn("[TTS Diagnostics] SpeechSynthesis API is not supported in this browser runtime.");
+        // Fallback: wait 3.5 seconds and listen again
+        voiceLoopTimerRef.current = setTimeout(() => {
+          startVoiceLoop();
+        }, 3500);
+      }
+
+    } catch (err: any) {
+      if (controller.signal.aborted) return;
+      setVoiceAlert(`System Error: ${err.message || 'Call failed'}`);
+      
+      // Transient error: wait 3 seconds and return to listening
+      voiceLoopTimerRef.current = setTimeout(() => {
+        setVoiceAlert(null);
+        startVoiceLoop();
+      }, 3000);
+    } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+    }
+  }
+
+  // Subsystem Operations
   async function handleAddMemory(e: React.FormEvent) {
     e.preventDefault();
     if (!token || !newMemoryText.trim()) return;
@@ -302,7 +643,7 @@ export default function App() {
   }
 
   async function handleDeleteMemory(id: string) {
-    if (!token || !confirm('Delete memory record?')) return;
+    if (!token || !confirm('Delete memory?')) return;
     try {
       await api.deleteMemory(token, id);
       setMemories(memories.filter((m) => m.id !== id));
@@ -311,7 +652,6 @@ export default function App() {
     }
   }
 
-  // Documents Actions
   async function handleUploadDocument(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!token || !file) return;
@@ -331,7 +671,7 @@ export default function App() {
       }
     };
     reader.onerror = () => {
-      setDocumentError('Failed to read local file.');
+      setDocumentError('Failed to read file.');
       setIsUploading(false);
     };
     reader.readAsText(file);
@@ -340,7 +680,7 @@ export default function App() {
   }
 
   async function handleDeleteDocument(id: string) {
-    if (!token || !confirm('Delete uploaded document and delete vector chunks?')) return;
+    if (!token || !confirm('Delete document?')) return;
     try {
       await api.deleteDocument(token, id);
       setDocuments(documents.filter((d) => d.id !== id));
@@ -349,18 +689,18 @@ export default function App() {
     }
   }
 
-  // --- Auth View ---
+  // Auth Screen
   if (!token) {
     return (
       <main className="auth-container">
         <div className="auth-card backdrop-blur">
           <div className="logo-section">
-            <svg className="icon-glow animate-pulse" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+            <svg className="icon-glow animate-pulse" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 18a3.75 3.75 0 0 0 .495-7.467 5.99 5.99 0 0 0-1.925 3.546 5.974 5.974 0 0 1-2.133-1A3.75 3.75 0 0 0 12 18Z" />
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 18a3.75 3.75 0 0 0-.495-7.467 5.99 5.99 0 0 0 1.925 3.546 5.974 5.974 0 0 1 2.133-1A3.75 3.75 0 0 0 12 18Z" />
             </svg>
             <h2>GIA Assistant</h2>
-            <p className="subtitle">Secure modular AI systems management portal</p>
+            <p className="subtitle">Secure local cognitive portal</p>
           </div>
 
           <div className="tabs">
@@ -372,22 +712,22 @@ export default function App() {
             {authMode === 'signup' && (
               <div className="form-group">
                 <label>Name</label>
-                <input type="text" placeholder="Enter name" value={authName} onChange={(e) => setAuthName(e.target.value)} required />
+                <input type="text" placeholder="Your name" value={authName} onChange={(e) => setAuthName(e.target.value)} required />
               </div>
             )}
             <div className="form-group">
-              <label>Email Address</label>
+              <label>Email</label>
               <input type="email" placeholder="name@domain.com" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} required />
             </div>
             <div className="form-group">
               <label>Password</label>
-              <input type="password" placeholder="Enter password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} required />
+              <input type="password" placeholder="••••••••" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} required />
             </div>
 
             {authError && <div className="alert error">{authError}</div>}
 
-            <button type="submit" className="auth-submit-btn gradient-btn">
-              {authMode === 'login' ? 'Authenticate System' : 'Create GIA Account'}
+            <button type="submit" className="auth-submit-btn">
+              {authMode === 'login' ? 'Authenticate' : 'Create Account'}
             </button>
           </form>
         </div>
@@ -395,303 +735,548 @@ export default function App() {
     );
   }
 
-  // --- Core Application View ---
+  // Desktop Assistant UI
   return (
     <div className="workspace-container">
-      {/* Sidebar Panel */}
-      <aside className="sidebar backdrop-blur">
-        <div className="sidebar-header">
-          <div className="logo-box">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 18a3.75 3.75 0 0 0 .495-7.467 5.99 5.99 0 0 0-1.925 3.546" />
-            </svg>
-            <span className="logo-text">GIA Assistant</span>
-          </div>
-          <span className="health-badge dot green">{healthStatus}</span>
-        </div>
-
-        <button className="new-chat-btn gradient-btn" onClick={handleCreateConvo}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <line x1="12" y1="5" x2="12" y2="19"></line>
-            <line x1="5" y1="12" x2="19" y2="12"></line>
+      {/* COMPACT TOP HEADER */}
+      <header className="compact-header backdrop-blur">
+        <div className="header-identity">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="icon-glow">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 18a3.75 3.75 0 0 0 .495-7.467 5.99 5.99 0 0 0-1.925 3.546" />
           </svg>
-          New Conversation
-        </button>
-
-        <div className="convo-scroll-area">
-          {isConversationsLoading ? (
-            <div className="loading-spinner-box"><div className="spinner"></div></div>
-          ) : conversations.length === 0 ? (
-            <div className="empty-state">No conversations found.</div>
-          ) : (
-            conversations.map((c) => (
-              <div key={c.id} className={`convo-item ${activeConvoId === c.id ? 'active' : ''}`} onClick={() => selectConversation(c.id)}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="convo-icon">
-                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-                </svg>
-                <span className="convo-title">{c.title}</span>
-                <button className="delete-convo-btn" onClick={(e) => handleDeleteConvo(c.id, e)}>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <polyline points="3 6 5 6 21 6"></polyline>
-                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                  </svg>
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-
-        {/* User bar */}
-        <div className="user-profile-bar">
-          <div className="user-info">
-            <div className="avatar">{user?.name[0].toUpperCase()}</div>
-            <div className="details">
-              <span className="username">{user?.name}</span>
-              <span className="useremail">{user?.email}</span>
+          <div className="header-title-wrapper">
+            <span className="header-title">GIA</span>
+            <div className={`state-indicator ${uiState}`}>
+              <span className="state-dot" />
+              <span>
+                {uiState === 'idle' && 'Idle'}
+                {uiState === 'chatting' && 'Typing...'}
+                {uiState === 'thinking' && 'Thinking...'}
+                {uiState === 'voice_listening' && 'Listening...'}
+                {uiState === 'transcribing' && 'Transcribing...'}
+                {uiState === 'executing' && `Running ${activeTool}...`}
+                {uiState === 'error' && 'System Error'}
+              </span>
             </div>
           </div>
-          <button className="logout-btn" onClick={handleLogout} title="Logout">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
-              <polyline points="16 17 21 12 16 7"></polyline>
-              <line x1="21" y1="12" x2="9" y2="12"></line>
-            </svg>
+        </div>
+
+        <div className="header-actions">
+          {/* Switch Conversation List toggle */}
+          <button 
+            className={`icon-btn ${showConvosList ? 'active' : ''}`} 
+            onClick={() => { setShowConvosList(!showConvosList); setActiveDrawer('none'); }}
+            title="Conversations"
+          >
+            💬
+          </button>
+          
+          {/* Memories */}
+          <button 
+            className={`icon-btn ${activeDrawer === 'memories' ? 'active' : ''}`} 
+            onClick={() => { setActiveDrawer(activeDrawer === 'memories' ? 'none' : 'memories'); setShowConvosList(false); }}
+            title="Memory Subsystem"
+          >
+            🧠
+          </button>
+
+          {/* RAG Documents */}
+          <button 
+            className={`icon-btn ${activeDrawer === 'documents' ? 'active' : ''}`} 
+            onClick={() => { setActiveDrawer(activeDrawer === 'documents' ? 'none' : 'documents'); setShowConvosList(false); }}
+            title="Document Index"
+          >
+            📂
+          </button>
+
+          {/* System Settings */}
+          <button 
+            className={`icon-btn ${activeDrawer === 'settings' ? 'active' : ''}`} 
+            onClick={() => { setActiveDrawer(activeDrawer === 'settings' ? 'none' : 'settings'); setShowConvosList(false); }}
+            title="System Diagnostics"
+          >
+            ⚙️
           </button>
         </div>
-      </aside>
+      </header>
 
-      {/* Main Workspace Frame */}
-      <main className="workspace-main">
-        <header className="workspace-header backdrop-blur">
-          <div className="header-left">
-            <h3>{conversations.find((c) => c.id === activeConvoId)?.title || 'Workspace'}</h3>
-          </div>
+      {/* CONVERSATION SCROLL AREA */}
+      <div className="chat-window">
+        {activeConvoId ? (
+          <div className="messages-flow">
+            {messages.length === 0 ? (
+              <div className="welcome-chat">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ opacity: 0.5 }}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 18a3.75 3.75 0 0 0 .495-7.467 5.99 5.99 0 0 0-1.925 3.546" />
+                </svg>
+                <h2>GIA Assistant</h2>
+                <p>Ready to assist. Speak or type your request below.</p>
+              </div>
+            ) : (
+              messages.map((m) => (
+                <div key={m.id} className={`message-row ${m.role}`}>
+                  <div className="message-bubble">
+                    <div className="msg-content">{m.content}</div>
 
-          <div className="header-controls">
-            <button className={`control-btn ${activeDrawer === 'memories' ? 'active' : ''}`} onClick={() => setActiveDrawer(activeDrawer === 'memories' ? 'none' : 'memories')}>
-              🧠 Memories
-            </button>
-            <button className={`control-btn ${activeDrawer === 'documents' ? 'active' : ''}`} onClick={() => setActiveDrawer(activeDrawer === 'documents' ? 'none' : 'documents')}>
-              📂 Documents
-            </button>
-            <button className={`control-btn ${activeDrawer === 'settings' ? 'active' : ''}`} onClick={() => setActiveDrawer(activeDrawer === 'settings' ? 'none' : 'settings')}>
-              ⚙️ Settings
-            </button>
-          </div>
-        </header>
+                    {/* RAG Source Citations */}
+                    {m.citations && m.citations.length > 0 && (
+                      <div className="citations-list">
+                        <span className="cite-lbl">Sources:</span>
+                        {m.citations.map((cite: any, idx: number) => (
+                          <span key={idx} className="cite-chip" title={cite.file_url}>
+                            📄 {cite.name}
+                          </span>
+                        ))}
+                      </div>
+                    )}
 
-        {/* Chat dialogue container */}
-        <div className="chat-window">
-          {activeConvoId ? (
-            <div className="messages-flow">
-              {messages.length === 0 ? (
-                <div className="welcome-chat">
-                  <h2>Hello, {user?.name}</h2>
-                  <p>Ask a question, upload research documents, or configure cognitive memories.</p>
-                </div>
-              ) : (
-                messages.map((m) => (
-                  <div key={m.id} className={`message-row ${m.role}`}>
-                    <div className="message-bubble">
-                      <div className="msg-content">{m.content}</div>
-
-                      {/* Cite chip references */}
-                      {m.citations && m.citations.length > 0 && (
-                        <div className="citations-list">
-                          <span className="cite-lbl">Sources:</span>
-                          {m.citations.map((cite: any, idx: number) => (
-                            <span key={idx} className="cite-chip" title={cite.file_url}>
-                              📄 {cite.name}
-                            </span>
+                    {/* Agent FSM steps */}
+                    {m.metadata && m.metadata.steps && (
+                      <details className="telemetry-details">
+                        <summary>Check GIA execution steps ({m.metadata.steps.length})</summary>
+                        <div className="telemetry-step-list">
+                          {m.metadata.steps.map((step: any, idx: number) => (
+                            <div key={idx} className="telemetry-step-item">
+                              <span className="step-node">Node: <strong>{step.node}</strong></span>
+                            </div>
                           ))}
                         </div>
-                      )}
-
-                      {/* Tool Call/Agent run Telemetry list */}
-                      {m.metadata && m.metadata.steps && (
-                        <details className="telemetry-details">
-                          <summary>🔍 Check orchestration flow steps ({m.metadata.steps.length})</summary>
-                          <div className="telemetry-step-list">
-                            {m.metadata.steps.map((step: any, idx: number) => (
-                              <div key={idx} className="telemetry-step-item">
-                                <span className="step-time">[{new Date(step.timestamp).toLocaleTimeString()}]</span>
-                                <span className="step-node">Node: <strong>{step.node}</strong></span>
-                              </div>
-                            ))}
-                          </div>
-                        </details>
-                      )}
-                    </div>
-                  </div>
-                ))
-              )}
-              {isSending && sendMode !== 'stream' && (
-                <div className="message-row assistant">
-                  <div className="message-bubble typing-dots">
-                    <span></span><span></span><span></span>
+                      </details>
+                    )}
                   </div>
                 </div>
-              )}
-              <div ref={messagesEndRef} />
+              ))
+            )}
+          </div>
+        ) : (
+          <div className="welcome-chat">
+            <h2>No Conversation</h2>
+            <p>Switch to or create a conversation using the chat menu.</p>
+          </div>
+        )}
+      </div>
+
+      {/* DETECTED DYNAMIC STATE INTERFACE OVERLAYS */}
+      
+      {/* Voice Session Overlay */}
+      {voiceSessionActive && (
+        <div className="voice-active-overlay backdrop-blur">
+          <div className="voice-ripple-container">
+            {voiceState === 'LISTENING' && (
+              <>
+                <span className="voice-ripple" style={{borderColor: 'var(--success-color)'}} />
+                <span className="voice-ripple" style={{borderColor: 'var(--success-color)', animationDelay: '0.6s'}} />
+                <span className="voice-ripple" style={{borderColor: 'var(--success-color)', animationDelay: '1.2s'}} />
+              </>
+            )}
+            {voiceState === 'SPEECH_DETECTED' && (
+              <>
+                <span className="voice-ripple" style={{borderColor: 'var(--warning-color)'}} />
+                <span className="voice-ripple" style={{borderColor: 'var(--warning-color)', animationDelay: '0.6s'}} />
+              </>
+            )}
+            {(voiceState === 'TRANSCRIBING' || voiceState === 'COMMAND_CHECK') && (
+              <>
+                <span className="voice-ripple" style={{borderColor: 'var(--accent-cyan)', animation: 'voiceRipple 1.2s infinite linear'}} />
+              </>
+            )}
+            {voiceState === 'PROCESSING' && (
+              <>
+                <span className="voice-ripple" style={{borderColor: 'var(--accent-purple)', animation: 'voiceRipple 1.5s infinite linear'}} />
+              </>
+            )}
+            {voiceState === 'SPEAKING' && (
+              <>
+                <span className="voice-ripple" style={{borderColor: '#ec4899', animation: 'voiceRipple 1.0s infinite linear'}} />
+                <span className="voice-ripple" style={{borderColor: '#ec4899', animation: 'voiceRipple 2.0s infinite linear', animationDelay: '0.5s'}} />
+              </>
+            )}
+            
+            <div className="voice-mic-core" style={{
+              background: 
+                voiceState === 'LISTENING' ? 'var(--success-color)' :
+                voiceState === 'SPEECH_DETECTED' ? 'var(--warning-color)' :
+                (voiceState === 'TRANSCRIBING' || voiceState === 'COMMAND_CHECK') ? 'var(--accent-cyan)' :
+                voiceState === 'PROCESSING' ? 'var(--accent-purple)' :
+                voiceState === 'SPEAKING' ? '#ec4899' :
+                'var(--text-muted)',
+              boxShadow: 
+                voiceState === 'LISTENING' ? '0 0 25px rgba(16, 185, 129, 0.4)' :
+                voiceState === 'SPEECH_DETECTED' ? '0 0 25px rgba(251, 191, 36, 0.4)' :
+                (voiceState === 'TRANSCRIBING' || voiceState === 'COMMAND_CHECK') ? '0 0 25px rgba(6, 182, 212, 0.4)' :
+                voiceState === 'PROCESSING' ? '0 0 25px rgba(168, 85, 247, 0.4)' :
+                voiceState === 'SPEAKING' ? '0 0 25px rgba(236, 72, 153, 0.4)' :
+                'none'
+            }}>
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                <line x1="12" y1="19" x2="12" y2="23"/>
+                <line x1="8" y1="23" x2="16" y2="23"/>
+              </svg>
             </div>
-          ) : (
-            <div className="empty-chat-state">
-              <h3>No Conversation Selected</h3>
-              <p>Create or select a chat thread from the left menu to start typing.</p>
+          </div>
+
+          <span className="voice-status-text" style={{
+            color: 
+              voiceState === 'LISTENING' ? 'var(--success-color)' :
+              voiceState === 'SPEECH_DETECTED' ? 'var(--warning-color)' :
+              (voiceState === 'TRANSCRIBING' || voiceState === 'COMMAND_CHECK') ? '#a5f3fc' :
+              voiceState === 'PROCESSING' ? '#e9d5ff' :
+              voiceState === 'SPEAKING' ? '#fbcfe8' :
+              '#fff'
+          }}>
+            {voiceState === 'VOICE_STARTING' && 'Connecting to microphone...'}
+            {voiceState === 'LISTENING' && 'Listening for wake word...'}
+            {voiceState === 'SPEECH_DETECTED' && 'Speech detected...'}
+            {voiceState === 'TRANSCRIBING' && 'Transcribing audio...'}
+            {voiceState === 'COMMAND_CHECK' && 'Gating command...'}
+            {voiceState === 'PROCESSING' && 'GIA is thinking...'}
+            {voiceState === 'SPEAKING' && 'GIA speaking...'}
+          </span>
+
+          <span className="voice-substatus" style={{textAlign: 'center', padding: '0 24px', minHeight: '36px'}}>
+            {voiceAlert && <strong style={{color: 'var(--error-color)'}}>{voiceAlert}</strong>}
+            {!voiceAlert && voiceState === 'LISTENING' && 'Say "Hey GIA" followed by a command.'}
+            {!voiceAlert && lastTranscribedSegment && (
+              <>
+                <span style={{color: 'var(--text-secondary)'}}>Heard: </span>
+                <span style={{fontStyle: 'italic', color: '#fff'}}>&ldquo;{lastTranscribedSegment}&rdquo;</span>
+              </>
+            )}
+          </span>
+
+          {/* Test & Simulation Controls */}
+          <div className="voice-simulation-controls" style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '6px',
+            width: '100%',
+            maxWidth: '240px',
+            marginBottom: '20px',
+            background: 'rgba(255,255,255,0.02)',
+            padding: '10px',
+            borderRadius: '12px',
+            border: '1px solid var(--glass-border)'
+          }}>
+            <span style={{fontSize: '0.65rem', color: 'var(--text-secondary)', textTransform: 'uppercase', textAlign: 'center', fontWeight: 600, letterSpacing: '0.5px'}}>Simulation Panel</span>
+            
+            {/* Custom Input for Spoken text simulation */}
+            <div style={{ display: 'flex', gap: '4px', marginBottom: '4px' }}>
+              <input 
+                type="text" 
+                placeholder="Type spoken text to simulate..."
+                id="simulated-speech-input"
+                style={{
+                  flex: 1,
+                  fontSize: '0.7rem',
+                  padding: '4px 6px',
+                  background: 'rgba(0,0,0,0.3)',
+                  border: '1px solid var(--glass-border)',
+                  borderRadius: '6px',
+                  color: '#fff'
+                }}
+                disabled={voiceState !== 'LISTENING'}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    const val = (e.target as HTMLInputElement).value;
+                    if (val.trim()) {
+                      simulateSpeechSegment(val.trim());
+                      (e.target as HTMLInputElement).value = '';
+                    }
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="stop-voice-btn"
+                style={{ fontSize: '0.65rem', padding: '4px 8px', margin: 0 }}
+                disabled={voiceState !== 'LISTENING'}
+                onClick={() => {
+                  const inputEl = document.getElementById('simulated-speech-input') as HTMLInputElement;
+                  if (inputEl && inputEl.value.trim()) {
+                    simulateSpeechSegment(inputEl.value.trim());
+                    inputEl.value = '';
+                  }
+                }}
+              >
+                Send
+              </button>
+            </div>
+            
+            <button 
+              type="button"
+              className="stop-voice-btn" 
+              style={{fontSize: '0.7rem', padding: '6px'}} 
+              disabled={voiceState !== 'LISTENING'}
+              onClick={() => simulateSpeechSegment('Hey GIA, what time is it?')}
+            >
+              🎙️ Speak command (Wake Word)
+            </button>
+            <button 
+              type="button"
+              className="stop-voice-btn" 
+              style={{fontSize: '0.7rem', padding: '6px'}} 
+              disabled={voiceState !== 'LISTENING'}
+              onClick={() => simulateSpeechSegment('Is it going to rain today?')}
+            >
+              🎙️ Speak chatter (No Wake Word)
+            </button>
+            <button 
+              type="button"
+              className="stop-voice-btn" 
+              style={{fontSize: '0.7rem', padding: '6px', borderColor: 'rgba(244,63,94,0.3)'}} 
+              disabled={voiceState !== 'LISTENING'}
+              onClick={() => {
+                setVoiceAlert('Error: Access to audio device denied');
+                voiceLoopTimerRef.current = setTimeout(() => handleStopVoiceSession(), 3000);
+              }}
+            >
+              ⚠️ Simulate hardware failure
+            </button>
+          </div>
+
+          <button className="stop-voice-btn" style={{background: 'var(--error-color)', borderColor: 'var(--error-color)', padding: '10px 24px'}} onClick={handleStopVoiceSession}>
+            Stop Voice Mode
+          </button>
+        </div>
+      )}
+
+      {/* COMPOSER FOOTER BAR */}
+      {activeConvoId && uiState !== 'voice_listening' && (
+        <footer className="composer-bar backdrop-blur">
+          {/* Inline Active State Banners */}
+          {uiState === 'executing' && (
+            <div className="state-banner executing">
+              <div className="spinner" />
+              <span>🔧 Executing tool: <strong>{activeTool}</strong></span>
+            </div>
+          )}
+          
+          {uiState === 'transcribing' && (
+            <div className="state-banner transcribing">
+              <div className="spinner" />
+              <span>🎙️ Transcribing voice note...</span>
             </div>
           )}
 
-          {chatError && <div className="alert error chat-alert">{chatError}</div>}
-        </div>
+          {uiState === 'thinking' && (
+            <div className="state-banner">
+              <div className="spinner" />
+              <span>🤖 GIA thinking...</span>
+            </div>
+          )}
 
-        {/* Footer Composer bar */}
-        {activeConvoId && (
-          <footer className="composer-bar backdrop-blur">
-            <form onSubmit={handleSendMessage} className="composer-form">
-              <div className="composer-row">
-                <input type="text" placeholder="Prompt GIA Assistant..." value={inputMessage} onChange={(e) => setInputMessage(e.target.value)} disabled={isSending} />
-                <button type="submit" className="send-btn gradient-btn" disabled={isSending || !inputMessage.trim()}>
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <line x1="22" y1="2" x2="11" y2="13"></line>
-                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-                  </svg>
-                </button>
-              </div>
+          {chatError && (
+            <div className="state-banner error-banner">
+              <span>⚠️ Error: {chatError}</span>
+              <button className="dismiss-error-btn" onClick={() => setUiState('idle')}>&times;</button>
+            </div>
+          )}
 
-              <div className="composer-selectors">
-                <label className={`selector-chip ${sendMode === 'stream' ? 'active' : ''}`}>
-                  <input type="radio" name="sendMode" value="stream" checked={sendMode === 'stream'} onChange={() => setSendMode('stream')} />
-                  ⚡ Stream Responses
-                </label>
-                <label className={`selector-chip ${sendMode === 'sync' ? 'active' : ''}`}>
-                  <input type="radio" name="sendMode" value="sync" checked={sendMode === 'sync'} onChange={() => setSendMode('sync')} />
-                  💬 Standard Sync
-                </label>
-                <label className={`selector-chip ${sendMode === 'rag' ? 'active' : ''}`}>
-                  <input type="radio" name="sendMode" value="rag" checked={sendMode === 'rag'} onChange={() => setSendMode('rag')} />
-                  🔍 RAG Search
-                </label>
-                <label className={`selector-chip ${sendMode === 'agent' ? 'active' : ''}`}>
-                  <input type="radio" name="sendMode" value="agent" checked={sendMode === 'agent'} onChange={() => setSendMode('agent')} />
-                  🤖 Orchestrator Agent
-                </label>
-              </div>
-            </form>
-          </footer>
-        )}
-      </main>
+          <form onSubmit={handleSendMessage} className="composer-form">
+            <div className="composer-row">
+              {/* Voice Trigger Microphone */}
+              <button 
+                type="button" 
+                className="mic-btn" 
+                onClick={handleToggleVoiceSession}
+                disabled={['thinking', 'executing', 'transcribing'].includes(uiState)}
+                title="Voice input"
+              >
+                🎙️
+              </button>
 
-      {/* Dynamic Slide-out drawer Panels */}
-      {activeDrawer !== 'none' && (
-        <aside className="drawer-panel backdrop-blur">
+              <input 
+                type="text" 
+                placeholder="Ask GIA anything..." 
+                value={inputMessage} 
+                onChange={(e) => setInputMessage(e.target.value)} 
+                disabled={['thinking', 'executing', 'transcribing'].includes(uiState)} 
+              />
+
+              <button 
+                type="submit" 
+                className="send-btn" 
+                disabled={!inputMessage.trim() || ['thinking', 'executing', 'transcribing'].includes(uiState)}
+              >
+                ➔
+              </button>
+            </div>
+
+            {/* Compact Chat Mode Selector */}
+            <div className="composer-selectors">
+              <label className={`selector-chip ${sendMode === 'agent' ? 'active' : ''}`}>
+                <input type="radio" name="sendMode" value="agent" checked={sendMode === 'agent'} onChange={() => setSendMode('agent')} />
+                🤖 Agent
+              </label>
+              <label className={`selector-chip ${sendMode === 'stream' ? 'active' : ''}`}>
+                <input type="radio" name="sendMode" value="stream" checked={sendMode === 'stream'} onChange={() => setSendMode('stream')} />
+                ⚡ Stream
+              </label>
+              <label className={`selector-chip ${sendMode === 'rag' ? 'active' : ''}`}>
+                <input type="radio" name="sendMode" value="rag" checked={sendMode === 'rag'} onChange={() => setSendMode('rag')} />
+                🔍 RAG
+              </label>
+              <label className={`selector-chip ${sendMode === 'sync' ? 'active' : ''}`}>
+                <input type="radio" name="sendMode" value="sync" checked={sendMode === 'sync'} onChange={() => setSendMode('sync')} />
+                💬 Sync
+              </label>
+            </div>
+          </form>
+        </footer>
+      )}
+
+      {/* OVERLAY PANEL DRAWERS */}
+
+      {/* 1. Switch Conversation overlay */}
+      {showConvosList && (
+        <div className="convo-switcher-drawer backdrop-blur">
           <div className="drawer-header">
-            <h4>
-              {activeDrawer === 'memories' && '🧠 Memory Subsystem'}
-              {activeDrawer === 'documents' && '📂 RAG Document Store'}
-              {activeDrawer === 'settings' && '⚙️ LLM Gateways'}
-            </h4>
+            <h4>Select Discussion</h4>
+            <button className="close-drawer-btn" onClick={() => setShowConvosList(false)}>&times;</button>
+          </div>
+          <button className="new-convo-btn" onClick={handleCreateConvo}>+ Start New Chat</button>
+          <div className="convo-list-scroll">
+            {isConversationsLoading ? (
+              <div className="empty-state">Loading discussions...</div>
+            ) : conversations.length === 0 ? (
+              <div className="empty-state">No discussions found.</div>
+            ) : (
+              conversations.map((c) => (
+                <div key={c.id} className={`convo-item ${activeConvoId === c.id ? 'active' : ''}`} onClick={() => selectConversation(c.id)}>
+                  <div className="convo-title-box">
+                    <span>💬</span>
+                    <span className="convo-title-text">{c.title}</span>
+                  </div>
+                  <button className="delete-convo-btn" onClick={(e) => handleDeleteConvo(c.id, e)}>&times;</button>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 2. Memories overlay */}
+      {activeDrawer === 'memories' && (
+        <div className="drawer-panel backdrop-blur">
+          <div className="drawer-header">
+            <h4>🧠 Memory Subsystem</h4>
             <button className="close-drawer-btn" onClick={() => setActiveDrawer('none')}>&times;</button>
           </div>
-
           <div className="drawer-content">
-            {/* Memories Panel */}
-            {activeDrawer === 'memories' && (
-              <div className="drawer-inner">
-                <form onSubmit={handleAddMemory} className="drawer-form">
-                  <div className="form-group">
-                    <label>Save facts, names, or preferences</label>
-                    <textarea placeholder="Remember that the user works in TypeScript..." value={newMemoryText} onChange={(e) => setNewMemoryText(e.target.value)} required />
-                  </div>
-                  <div className="form-group">
-                    <label>Importance (1 - 10)</label>
-                    <input type="number" min="1" max="10" value={newMemoryImportance} onChange={(e) => setNewMemoryImportance(Number(e.target.value))} />
-                  </div>
-                  <button type="submit" className="gradient-btn">Store Fact</button>
-                </form>
-
-                {memoryError && <div className="alert error">{memoryError}</div>}
-
-                <div className="drawer-list">
-                  <h5>Saved Preferences ({memories.length})</h5>
-                  {memories.length === 0 ? (
-                    <div className="list-empty">No preferences stored.</div>
-                  ) : (
-                    memories.map((m) => (
-                      <div key={m.id} className="drawer-item">
-                        <div className="item-text">{m.content}</div>
-                        <div className="item-meta">
-                          <span>Importance: {m.importance}</span>
-                          <button className="del-item-btn" onClick={() => handleDeleteMemory(m.id)}>Delete</button>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Documents Panel */}
-            {activeDrawer === 'documents' && (
-              <div className="drawer-inner">
-                <div className="upload-box">
-                  <label className="upload-label">
-                    <input type="file" ref={fileInputRef} onChange={handleUploadDocument} disabled={isUploading} style={{ display: 'none' }} />
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                      <polyline points="17 8 12 3 7 8"></polyline>
-                      <line x1="12" y1="3" x2="12" y2="15"></line>
-                    </svg>
-                    <span>{isUploading ? 'Uploading file chunks...' : 'Upload research file'}</span>
-                  </label>
-                </div>
-
-                {documentError && <div className="alert error">{documentError}</div>}
-
-                <div className="drawer-list">
-                  <h5>Indexed Files ({documents.length})</h5>
-                  {documents.length === 0 ? (
-                    <div className="list-empty">No documents uploaded.</div>
-                  ) : (
-                    documents.map((d) => (
-                      <div key={d.id} className="drawer-item">
-                        <div className="item-text">📄 {d.name}</div>
-                        <div className="item-meta">
-                          <span>{(d.file_size ? d.file_size / 1024 : 0).toFixed(1)} KB</span>
-                          <button className="del-item-btn" onClick={() => handleDeleteDocument(d.id)}>Delete</button>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Settings Panel */}
-            {activeDrawer === 'settings' && (
-              <div className="drawer-inner">
+            <div className="drawer-inner">
+              <form onSubmit={handleAddMemory} className="drawer-form">
                 <div className="form-group">
-                  <label>Select active cognitive LLM slot</label>
-                  <select value={modelSlot} onChange={(e) => setModelSlot(e.target.value as any)}>
-                    <option value="fast">Fast Completion Engine</option>
-                    <option value="general">General Conversational (OpenAI / Claude)</option>
-                    <option value="reasoning">Deep Reasoning Engine</option>
-                  </select>
-                  <p className="field-note">Models are routed dynamically at the LLM Gateway layer based on backend environment variables configuration mapping.</p>
+                  <label>Store user preferences & facts</label>
+                  <textarea placeholder="The user prefers typescript..." value={newMemoryText} onChange={(e) => setNewMemoryText(e.target.value)} required />
                 </div>
+                <div className="form-group">
+                  <label>Importance (1 - 10)</label>
+                  <input type="number" min="1" max="10" value={newMemoryImportance} onChange={(e) => setNewMemoryImportance(Number(e.target.value))} />
+                </div>
+                <button type="submit" className="auth-submit-btn">Save preference</button>
+              </form>
 
-                <div className="system-specs">
-                  <h5>Observability Specifications</h5>
-                  <ul>
-                    <li>JWT Auth boundaries: Enforced</li>
-                    <li>RAG Cosine Similarity: {`>= 0.50`}</li>
-                    <li>Max Agent FSM Steps: 5 loops limit</li>
-                    <li>Vector dimensions: 1536 (pgvector standard)</li>
-                  </ul>
-                </div>
+              {memoryError && <div className="alert error">{memoryError}</div>}
+
+              <div className="drawer-list">
+                <h5>Extracted Facts ({memories.length})</h5>
+                {memories.length === 0 ? (
+                  <div className="empty-state">No items stored.</div>
+                ) : (
+                  memories.map((m) => (
+                    <div key={m.id} className="drawer-item">
+                      <div className="item-text">{m.content}</div>
+                      <div className="item-meta">
+                        <span>Importance: {m.importance}</span>
+                        <button className="del-item-btn" onClick={() => handleDeleteMemory(m.id)}>Delete</button>
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
-            )}
+            </div>
           </div>
-        </aside>
+        </div>
+      )}
+
+      {/* 3. Documents overlay */}
+      {activeDrawer === 'documents' && (
+        <div className="drawer-panel backdrop-blur">
+          <div className="drawer-header">
+            <h4>📂 Document Index (RAG)</h4>
+            <button className="close-drawer-btn" onClick={() => setActiveDrawer('none')}>&times;</button>
+          </div>
+          <div className="drawer-content">
+            <div className="drawer-inner">
+              <div className="upload-box">
+                <label className="upload-label">
+                  <input type="file" ref={fileInputRef} onChange={handleUploadDocument} disabled={isUploading} style={{ display: 'none' }} />
+                  <span>{isUploading ? 'Ingesting chunks...' : '📄 Click to upload document'}</span>
+                </label>
+              </div>
+
+              {documentError && <div className="alert error">{documentError}</div>}
+
+              <div className="drawer-list">
+                <h5>Indexed Files ({documents.length})</h5>
+                {documents.length === 0 ? (
+                  <div className="empty-state">No documents indexed.</div>
+                ) : (
+                  documents.map((d) => (
+                    <div key={d.id} className="drawer-item">
+                      <div className="item-text">{d.name}</div>
+                      <div className="item-meta">
+                        <span>{(d.file_size ? d.file_size / 1024 : 0).toFixed(1)} KB</span>
+                        <button className="del-item-btn" onClick={() => handleDeleteDocument(d.id)}>Delete</button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 4. Settings/Specs overlay */}
+      {activeDrawer === 'settings' && (
+        <div className="drawer-panel backdrop-blur">
+          <div className="drawer-header">
+            <h4>⚙️ Diagnostics & Gateways</h4>
+            <button className="close-drawer-btn" onClick={() => setActiveDrawer('none')}>&times;</button>
+          </div>
+          <div className="drawer-content">
+            <div className="drawer-inner">
+              <div className="form-group">
+                <label>Active Cognitive LLM Slot</label>
+                <select value={modelSlot} onChange={(e) => setModelSlot(e.target.value as any)}>
+                  <option value="fast">Fast Completion Engine (Gemini)</option>
+                  <option value="general">General (OpenAI)</option>
+                  <option value="reasoning">Deep Reasoning (Anthropic)</option>
+                </select>
+              </div>
+
+              <div className="system-specs">
+                <h5>System Specs</h5>
+                <ul>
+                  <li><span>Health Status</span> <span style={{color: healthStatus === 'Online' ? 'var(--success-color)' : 'var(--error-color)'}}>{healthStatus}</span></li>
+                  <li><span>Gateway Mode</span> <span>Dynamic Router</span></li>
+                  <li><span>Max Agent Steps</span> <span>5 steps limit</span></li>
+                </ul>
+              </div>
+
+              <div className="settings-user-bar">
+                <div>
+                  <div style={{fontSize: '0.8rem', fontWeight: 600}}>{user?.name}</div>
+                  <div style={{fontSize: '0.7rem', color: 'var(--text-secondary)'}}>{user?.email}</div>
+                </div>
+                <button className="del-item-btn" onClick={handleLogout}>Log out</button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

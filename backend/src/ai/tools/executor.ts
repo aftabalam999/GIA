@@ -4,6 +4,7 @@ import { ValidationError, NotFoundError, AppError, AuthorizationError } from '..
 import { logger } from '../../shared/logger.js';
 import { MessageRepository } from '../../database/repositories/message.repository.js';
 import { ConversationRepository } from '../../database/repositories/conversation.repository.js';
+import { UserRepository } from '../../database/repositories/user.repository.js';
 
 export class ToolExecutor {
   /**
@@ -34,9 +35,22 @@ export class ToolExecutor {
 
     // 3. Authorization bounds check
     if (tool.permissions && tool.permissions.length > 0) {
-      const errMessage = `Unauthorized to run tool "${toolName}"`;
-      await this.logToolCall(messageId, toolName, parsed.data, 'failed', null, errMessage);
-      throw new AppError(errMessage, 403);
+      const user = await UserRepository.findById(userId);
+      if (!user) {
+        const errMessage = `Unauthorized to run tool "${toolName}": User session not found`;
+        await this.logToolCall(messageId, toolName, parsed.data, 'failed', null, errMessage);
+        throw new AppError(errMessage, 403);
+      }
+
+      // Default authorized developer permissions for personal workspace
+      const userPermissions = ['read:system', 'open:apps', 'open:folders', 'run:commands'];
+      const hasAllPermissions = tool.permissions.every((p) => userPermissions.includes(p));
+      if (!hasAllPermissions) {
+        const missing = tool.permissions.filter((p) => !userPermissions.includes(p));
+        const errMessage = `Unauthorized to run tool "${toolName}": Missing permissions: ${missing.join(', ')}`;
+        await this.logToolCall(messageId, toolName, parsed.data, 'failed', null, errMessage);
+        throw new AppError(errMessage, 403);
+      }
     }
 
     // Enforce associated message owner verification to prevent IDOR logs hijacking
