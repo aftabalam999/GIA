@@ -74,6 +74,9 @@ Available Routes:
    - "get_current_time": Get the current date and time (arguments: {}).
    - "search_memories": Search user memories semantically (arguments: { "query": string }).
    - "list_documents": List all document metadata uploaded (arguments: {}).
+   - "open_url": Opens a specified web browser URL (arguments: { "url": string }).
+   - "open_folder_in_vscode": Opens a specified folder/project on the user's desktop in VS Code (arguments: { "folderName": string }).
+   - "run_project_frontend": Runs the dev frontend script inside the specified project folder (arguments: { "folderName": string, "scriptName": string }).
 5. "multi_step": For complex queries requiring multiple operations (e.g. retrieving documents AND checking the time).
 
 Constraints:

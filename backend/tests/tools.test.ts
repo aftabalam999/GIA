@@ -109,6 +109,7 @@ describe('GIA Tool execution Integration Tests', () => {
         inputSchema: z.object({}),
         permissions: [],
         riskLevel: 'low',
+        operationType: 'read',
         timeoutMs: 100, // short timeout
         async execute() {
           await new Promise((resolve) => setTimeout(resolve, 300));
@@ -130,6 +131,111 @@ describe('GIA Tool execution Integration Tests', () => {
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
       expect(body.error).toContain('timed out');
+    });
+  });
+
+  describe('Secure Desktop Tools Executions', () => {
+    it('should successfully execute open_url with validated schema', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/tools/execute',
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: {
+          toolName: 'open_url',
+          arguments: { url: 'https://youtube.com' },
+        },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.result.openedUrl).toBe('https://youtube.com');
+    });
+
+    it('should fail open_url validation if invalid URL is provided', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/tools/execute',
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: {
+          toolName: 'open_url',
+          arguments: { url: 'not-a-valid-url' },
+        },
+      });
+
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('should throw path traversal error for invalid path structures in open_folder_in_vscode', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/tools/execute',
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: {
+          toolName: 'open_folder_in_vscode',
+          arguments: { folderName: '../../etc/passwd' },
+        },
+      });
+
+      expect(res.statusCode).toBe(200); // Tool fails gracefully
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(false);
+      expect(body.error).toContain('traversal');
+    });
+
+    it('should fail run_project_frontend if folder has invalid scriptName syntax', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/tools/execute',
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: {
+          toolName: 'run_project_frontend',
+          arguments: { folderName: 'GIA-AI', scriptName: 'dev; rm -rf /' },
+        },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(false);
+      expect(body.error).toContain('Invalid script name syntax');
+    });
+
+    it('should return ambiguity options when multiple folders match the query name', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/tools/execute',
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: {
+          toolName: 'open_folder_in_vscode',
+          arguments: { folderName: 'Agency' },
+        },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.result.success).toBe(false);
+      expect(body.result.ambiguity).toBe(true);
+      expect(body.result.options).toContain('MN-Agency');
+      expect(body.result.options).toContain('New MN Agency');
+    });
+
+    it('should successfully run_project_frontend by inspecting package.json when scriptName is not provided', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/tools/execute',
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: {
+          toolName: 'run_project_frontend',
+          arguments: { folderName: 'GIA-AI' },
+        },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.result.success).toBe(true);
+      expect(body.result.scriptRun).toBeDefined();
     });
   });
 
