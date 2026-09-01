@@ -16,22 +16,24 @@ export async function healthRoutes(fastify: FastifyInstance, options: FastifyPlu
   fastify.get('/health/ready', async (request, reply) => {
     try {
       const report = await HealthService.checkDeepHealth();
-      const isReady = report.dependencies.database === 'healthy' && report.dependencies.redis === 'healthy';
+      const isReady = report.dependencies.database === 'healthy' &&
+                      report.dependencies.redis === 'healthy' &&
+                      report.dependencies.python_ai_service === 'healthy';
       
       if (!isReady) {
         return reply.status(503).send({
-          status: 'unhealthy',
+          status: report.status,
           timestamp: new Date().toISOString(),
-          dependencies: {
-            database: report.dependencies.database,
-            redis: report.dependencies.redis,
-          },
+          dependencies: report.dependencies,
+          python_ai_service: report.python_ai_service,
         });
       }
 
       return reply.status(200).send({
         status: 'healthy',
         timestamp: new Date().toISOString(),
+        dependencies: report.dependencies,
+        python_ai_service: report.python_ai_service,
       });
     } catch (err: any) {
       return reply.status(503).send({

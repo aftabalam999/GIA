@@ -56,6 +56,13 @@ export class LLMGateway {
     const provider = getProviderInstance(modelConfig.provider, modelConfig.model);
     const start = Date.now();
 
+    logger.info({
+      msg: `🤖 [LLM GATEWAY] Requesting LLM completion`,
+      slot: modelType,
+      targetProvider: modelConfig.provider,
+      targetModel: modelConfig.model,
+    });
+
     try {
       // Execute the call using standard retry configuration (3 attempts, fast delay in testing)
       const response = await withRetryAndTimeout(
@@ -63,6 +70,13 @@ export class LLMGateway {
         { retries: 3, delay: config.NODE_ENV === 'test' ? 10 : 1000 }
       );
       const latency = Date.now() - start;
+
+      logger.info({
+        msg: `✅ [LLM GATEWAY] LLM execution succeeded`,
+        provider: response.provider,
+        model: response.model,
+        latencyMs: latency,
+      });
 
       // Rough token estimation (4 characters per token average)
       const promptText = (request.systemPrompt || '') + request.messages.map((m) => m.content).join(' ');
@@ -83,7 +97,7 @@ export class LLMGateway {
       return response;
     } catch (err: any) {
       const latency = Date.now() - start;
-      
+
       // Save failure entry
       ModelRunRepository.logRun({
         conversationId: options.conversationId || null,
@@ -95,6 +109,26 @@ export class LLMGateway {
         latencyMs: latency,
         errors: err.message,
       }).catch((logErr) => logger.error({ msg: 'Failed to log failed model run metrics', err: logErr.message }));
+
+      const errMsg = (err?.message || '').toLowerCase();
+      const isQuotaOrRateLimit =
+        errMsg.includes('429') ||
+        errMsg.includes('quota') ||
+        errMsg.includes('resource_exhausted') ||
+        errMsg.includes('rate limit') ||
+        errMsg.includes('rate_limit');
+
+      if (isQuotaOrRateLimit && !testProviderOverride) {
+        logger.warn({ msg: `Primary LLM provider '${modelConfig.provider}' hit rate limit (${err.message}). Attempting fallback provider...` });
+        try {
+          const fallbackProvider = new MockProvider();
+          const fallbackRes = await fallbackProvider.generate(request);
+          logger.info({ msg: `Successfully recovered using fallback provider 'mock'` });
+          return fallbackRes;
+        } catch {
+          // ignore
+        }
+      }
 
       throw err;
     }

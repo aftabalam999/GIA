@@ -1,23 +1,45 @@
+mod mic_capture;
+
+use mic_capture::{MicCaptureResult, MicPermissionResult};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+#[tauri::command]
+fn check_microphone_permission() -> MicPermissionResult {
+    mic_capture::check_permission_internal()
+}
+
+#[tauri::command]
+fn request_microphone_permission() -> MicPermissionResult {
+    mic_capture::request_permission_internal()
+}
+
+#[tauri::command]
+async fn start_microphone_test_capture(duration_secs: Option<u64>) -> Result<MicCaptureResult, String> {
+    let secs = duration_secs.unwrap_or(5);
+    tokio::task::spawn_blocking(move || {
+        mic_capture::start_test_capture_internal(secs)
+    })
+    .await
+    .map_err(|e| format!("Capture task execution error: {}", e))?
+}
+
+#[tauri::command]
+fn stop_microphone_test_capture() {
+    mic_capture::stop_test_capture_internal();
+}
 
 /// Bring the main GIA window into focus, showing and unminimizing it if necessary.
 fn focus_gia_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        // Show if hidden
         let _ = window.show();
-        // Unminimize if minimized
         let _ = window.unminimize();
-        // Bring to front and grab focus
         let _ = window.set_focus();
     }
 }
 
 /// Read the global shortcut string from gia.conf.json (embedded at compile time).
-/// Falls back to "Super+G" if the file is missing or the key is not set.
 fn read_shortcut_from_config() -> String {
-    // Embed the config file at compile time so it ships with the binary.
-    // The user can still override the setting by editing gia.conf.json and rebuilding.
     let raw = include_str!("../gia.conf.json");
     serde_json::from_str::<serde_json::Value>(raw)
         .ok()
@@ -39,7 +61,6 @@ pub fn run() {
             app.global_shortcut().on_shortcut(
                 hotkey.as_str(),
                 move |_app, _shortcut, event| {
-                    // Only act on key press, not release — avoid double-fire
                     if event.state() == ShortcutState::Pressed {
                         focus_gia_window(&handle);
                     }
@@ -48,7 +69,12 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![])
+        .invoke_handler(tauri::generate_handler![
+            check_microphone_permission,
+            request_microphone_permission,
+            start_microphone_test_capture,
+            stop_microphone_test_capture
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

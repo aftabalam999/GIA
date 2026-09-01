@@ -12,7 +12,7 @@ const WORKSPACE_BASE_DIR = process.env.GIA_WORKSPACE_DIR
   ? path.resolve(process.env.GIA_WORKSPACE_DIR)
   : path.join(os.homedir(), 'Desktop');
 
-class ToolRegistry {
+export class ToolRegistry {
   private tools = new Map<string, ToolDefinition<any, any>>();
 
   register(tool: ToolDefinition<any, any>) {
@@ -21,6 +21,14 @@ class ToolRegistry {
 
   get(name: string): ToolDefinition<any, any> | undefined {
     return this.tools.get(name);
+  }
+
+  has(name: string): boolean {
+    return this.tools.has(name);
+  }
+
+  unregister(name: string): boolean {
+    return this.tools.delete(name);
   }
 
   getAll(): ToolDefinition<any, any>[] {

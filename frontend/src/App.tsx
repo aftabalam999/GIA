@@ -1,5 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import * as api from './services/api.js';
+import { VoiceStateMachine, VoiceState } from './services/voiceStateMachine.js';
+import { DesktopAudioPlayer, PlaybackState } from './services/desktopAudioPlayer.js';
+import { AudioRecorderService } from './services/audioRecorder.js';
+import { MicTestModal } from './components/MicTestModal.js';
 import './App.css';
 
 interface MessageExt extends api.Message {
@@ -7,41 +11,7 @@ interface MessageExt extends api.Message {
   streaming?: boolean;
 }
 
-type UIState = 'idle' | 'chatting' | 'thinking' | 'voice_listening' | 'transcribing' | 'executing' | 'error' | 'speaking';
-
-export interface WakeWordResult {
-  detected: boolean;
-  confidence: number;
-  command: string | null;
-}
-
-export class WakeWordDetector {
-  /**
-   * Evaluates text for the GIA wake word.
-   * If detected, returns the confidence score and the extracted command.
-   */
-  static detect(input: string): WakeWordResult {
-    if (!input || !input.trim()) {
-      return { detected: false, confidence: 0.0, command: null };
-    }
-
-    const trimmed = input.trim();
-    const wakeWordPattern = /^(?:hey|hello|hi|ok|okay)?\s*[,.:;]?\s*\bgia\b\s*[,.:;]?\s*(?:please)?\s*[,.:;]?\s*(.*)$/i;
-
-    const match = trimmed.match(wakeWordPattern);
-    if (!match) {
-      return { detected: false, confidence: 0.0, command: null };
-    }
-
-    const command = match[1]?.trim() || '';
-
-    return {
-      detected: true,
-      confidence: 1.0,
-      command: command.length > 0 ? command : null,
-    };
-  }
-}
+type UIState = 'idle' | 'chatting' | 'thinking' | 'executing' | 'error';
 
 export default function App() {
   // Auth state
@@ -64,14 +34,86 @@ export default function App() {
   const [uiState, setUiState] = useState<UIState>('idle');
   const [activeTool, setActiveTool] = useState<string | null>(null);
 
-  // Persistent Voice Session State Model
-  const [voiceSessionActive, setVoiceSessionActive] = useState(false);
-  const [voiceState, setVoiceState] = useState<'VOICE_OFF' | 'VOICE_STARTING' | 'LISTENING' | 'SPEECH_DETECTED' | 'TRANSCRIBING' | 'COMMAND_CHECK' | 'PROCESSING' | 'SPEAKING'>('VOICE_OFF');
-  const [lastTranscribedSegment, setLastTranscribedSegment] = useState('');
-  const [voiceAlert, setVoiceAlert] = useState<string | null>(null);
+  // Continuous Voice Mode State Machine & Desktop Audio Player & Audio Recorder
+  const [voiceState, setVoiceState] = useState<VoiceState>('IDLE');
+  const [playbackState, setPlaybackState] = useState<PlaybackState>('STOPPED');
+  const [isVoiceModeActive, setIsVoiceModeActive] = useState<boolean>(false);
+  const voiceMachineRef = useRef<VoiceStateMachine | null>(null);
+  const audioPlayerRef = useRef<DesktopAudioPlayer | null>(null);
+  const audioRecorderRef = useRef<AudioRecorderService | null>(null);
 
-  const voiceLoopTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const player = new DesktopAudioPlayer({
+      onStateChange: (s) => setPlaybackState(s),
+    });
+    audioPlayerRef.current = player;
+
+    const recorder = new AudioRecorderService({
+      onSpeechStart: () => {
+        voiceMachineRef.current?.handleSpeechStart();
+      },
+      onUtteranceRecorded: (blob) => {
+        voiceMachineRef.current?.processSpeechUtterance(blob);
+      },
+      onError: (err) => setChatError('Recorder error: ' + err),
+    });
+    audioRecorderRef.current = recorder;
+
+    const machine = new VoiceStateMachine({
+      onStateChange: (s) => setVoiceState(s),
+      onTranscript: (txt) => {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Math.random().toString(),
+            role: 'user',
+            content: txt,
+            created_at: new Date().toISOString(),
+          },
+        ]);
+      },
+      onAssistantResponse: (_uMsg, aMsg) => {
+        if (aMsg) {
+          setMessages((prev) => [...prev, aMsg]);
+        }
+      },
+      onError: (err) => setChatError('Voice error: ' + err),
+      onPauseCapture: () => recorder.pause(),
+      onResumeCapture: () => recorder.resume(),
+      fetchTranscribeApi: (blob) => (token ? api.transcribeAudio(token, blob) : Promise.reject('No token')),
+      fetchChatApi: (convoId, txt) => (token ? api.sendMessageAgent(token, convoId, txt) : Promise.reject('No token')),
+      fetchTtsApi: (txt) => (token ? api.synthesizeSpeech(token, txt) : Promise.reject('No token')),
+      playAudioApi: (buf) => player.play(buf),
+    });
+    voiceMachineRef.current = machine;
+
+    return () => {
+      recorder.stop();
+      machine.stopVoiceMode();
+      player.close();
+    };
+  }, [token]);
+
+  async function toggleVoiceMode() {
+    if (!token || !activeConvoId || !voiceMachineRef.current) return;
+
+    if (isVoiceModeActive) {
+      setIsVoiceModeActive(false);
+      audioRecorderRef.current?.stop();
+      await voiceMachineRef.current.stopVoiceMode();
+    } else {
+      setIsVoiceModeActive(true);
+      await voiceMachineRef.current.startVoiceMode(activeConvoId, token);
+      try {
+        await audioRecorderRef.current?.start();
+      } catch (err: any) {
+        setIsVoiceModeActive(false);
+        await voiceMachineRef.current.stopVoiceMode();
+        setChatError('Microphone permission or capture error: ' + err.message);
+      }
+    }
+  }
+
 
   // Loaders & Errors
   const [isConversationsLoading, setIsConversationsLoading] = useState(false);
@@ -102,45 +144,6 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Sync voiceState with uiState
-  useEffect(() => {
-    if (voiceSessionActive) {
-      if (voiceState === 'LISTENING') setUiState('voice_listening');
-      else if (voiceState === 'SPEECH_DETECTED') setUiState('voice_listening');
-      else if (voiceState === 'TRANSCRIBING') setUiState('transcribing');
-      else if (voiceState === 'COMMAND_CHECK') setUiState('transcribing');
-      else if (voiceState === 'PROCESSING') setUiState('thinking');
-      else if (voiceState === 'SPEAKING') setUiState('speaking');
-      else if (voiceState === 'VOICE_OFF') setUiState('idle');
-    }
-  }, [voiceState, voiceSessionActive]);
-
-  // Warm up Web Speech Synthesis voice list to prevent empty voice errors on first trigger
-  useEffect(() => {
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.getVoices();
-      const handleVoicesChanged = () => {
-        const loaded = window.speechSynthesis.getVoices();
-        console.log(`[TTS Diagnostics] voicesupdated: ${loaded.length} voice(s) available system-wide.`);
-      };
-      window.speechSynthesis.addEventListener('voiceschanged', handleVoicesChanged);
-      return () => {
-        window.speechSynthesis.removeEventListener('voiceschanged', handleVoicesChanged);
-      };
-    }
-  }, []);
-
-  // Voice Session Cleanup
-  useEffect(() => {
-    return () => {
-      if (voiceLoopTimerRef.current) {
-        clearTimeout(voiceLoopTimerRef.current);
-      }
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-    };
-  }, []);
 
   // Track Chatting State
   useEffect(() => {
@@ -153,6 +156,13 @@ export default function App() {
     }
   }, [inputMessage]);
 
+  // Microphone Permission Modal State
+  const [showMicModal, setShowMicModal] = useState<boolean>(false);
+  const [showMicTestModal, setShowMicTestModal] = useState<boolean>(false);
+  const [micPermissionStatus, setMicPermissionStatus] = useState<'prompt' | 'granted' | 'rejected'>(
+    (localStorage.getItem('gia_mic_permission') as any) || 'prompt'
+  );
+
   // Fetch profile if token exists
   useEffect(() => {
     if (token) {
@@ -163,12 +173,38 @@ export default function App() {
           loadMemories();
           loadDocuments();
           checkBackendHealth();
+
+          const perm = localStorage.getItem('gia_mic_permission');
+          if (!perm || perm === 'prompt') {
+            setShowMicModal(true);
+          }
         })
         .catch(() => {
           handleLogout();
         });
     }
   }, [token]);
+
+  async function handleGrantMicPermission() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((track) => track.stop());
+      localStorage.setItem('gia_mic_permission', 'granted');
+      setMicPermissionStatus('granted');
+      setShowMicModal(false);
+    } catch (err: any) {
+      localStorage.setItem('gia_mic_permission', 'rejected');
+      setMicPermissionStatus('rejected');
+      setShowMicModal(false);
+      setChatError('Microphone permission request failed: ' + err.message);
+    }
+  }
+
+  function handleRejectMicPermission() {
+    localStorage.setItem('gia_mic_permission', 'rejected');
+    setMicPermissionStatus('rejected');
+    setShowMicModal(false);
+  }
 
   // Health probe
   async function checkBackendHealth() {
@@ -401,231 +437,13 @@ export default function App() {
   // Trigger from Input Composer
   async function handleSendMessage(e: React.FormEvent) {
     e.preventDefault();
-    if (!inputMessage.trim() || ['thinking', 'executing', 'transcribing'].includes(uiState)) return;
+    if (!inputMessage.trim() || ['thinking', 'executing'].includes(uiState)) return;
     const text = inputMessage.trim();
     setInputMessage('');
     await handleSendMessageDirectly(text);
   }
 
-  // Persistent Voice Session Implementation
-  function handleToggleVoiceSession() {
-    if (voiceSessionActive) {
-      handleStopVoiceSession();
-    } else {
-      handleStartVoiceSession();
-    }
-  }
 
-  function handleStartVoiceSession() {
-    setVoiceSessionActive(true);
-    setVoiceAlert(null);
-    setLastTranscribedSegment('');
-    setVoiceState('VOICE_STARTING');
-
-    const startTimer = setTimeout(() => {
-      // 5% chance of simulating a hardware device failure
-      if (Math.random() < 0.05) {
-        setVoiceAlert('Microphone permission denied or device unavailable');
-        setVoiceState('VOICE_OFF');
-        voiceLoopTimerRef.current = setTimeout(() => {
-          handleStopVoiceSession();
-        }, 3000);
-        return;
-      }
-      
-      setVoiceState('LISTENING');
-      startVoiceLoop();
-    }, 1000);
-
-    voiceLoopTimerRef.current = startTimer;
-  }
-
-  function handleStopVoiceSession() {
-    if (voiceLoopTimerRef.current) {
-      clearTimeout(voiceLoopTimerRef.current);
-      voiceLoopTimerRef.current = null;
-    }
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-    }
-    setVoiceSessionActive(false);
-    setVoiceState('VOICE_OFF');
-    setLastTranscribedSegment('');
-    setVoiceAlert(null);
-    setUiState('idle');
-  }
-
-  function startVoiceLoop() {
-    if (voiceLoopTimerRef.current) clearTimeout(voiceLoopTimerRef.current);
-    setVoiceState('LISTENING');
-    setLastTranscribedSegment('');
-
-    // Wait in LISTENING state: automatically trigger a mock speech segment after 5 seconds of silence
-    voiceLoopTimerRef.current = setTimeout(() => {
-      simulateSpeechSegment();
-    }, 5000);
-  }
-
-  function simulateSpeechSegment(customText?: string) {
-    // Pipeline-level guard: Only process audio if we are in LISTENING state
-    // Prevents GIA_AUDIO or concurrent noise from triggering commands during SPEAKING or PROCESSING
-    if (voiceState !== 'LISTENING') {
-      return;
-    }
-
-    if (voiceLoopTimerRef.current) clearTimeout(voiceLoopTimerRef.current);
-    setVoiceState('SPEECH_DETECTED');
-
-    voiceLoopTimerRef.current = setTimeout(() => {
-      setVoiceState('TRANSCRIBING');
-      
-      const triggerTranscriptionError = Math.random() < 0.05; // 5% chance of transient error
-
-      voiceLoopTimerRef.current = setTimeout(() => {
-        if (triggerTranscriptionError && !customText) {
-          setVoiceAlert('Transcription error: Audio too quiet or garbled');
-          // Transient error: wait 2 seconds and resume listening loop
-          voiceLoopTimerRef.current = setTimeout(() => {
-            setVoiceAlert(null);
-            startVoiceLoop();
-          }, 2000);
-          return;
-        }
-
-        let transcribedText = customText;
-        if (!transcribedText) {
-          const segments = [
-            'Hey GIA, what time is it?',
-            'Hey GIA, list my documents',
-            'I should probably drink some water',
-            'Hey GIA, search my preferences for typescript',
-            'What is the forecast for tomorrow?',
-            'Hey GIA, search my memories for my database choice'
-          ];
-          transcribedText = segments[Math.floor(Math.random() * segments.length)];
-        }
-
-        setLastTranscribedSegment(transcribedText);
-        setVoiceState('COMMAND_CHECK');
-
-        // Wake word check gate delay
-        voiceLoopTimerRef.current = setTimeout(() => {
-          const result = WakeWordDetector.detect(transcribedText);
-          
-          if (!result.detected) {
-            setVoiceAlert('No wake word detected. Ignoring speech segment.');
-            voiceLoopTimerRef.current = setTimeout(() => {
-              setVoiceAlert(null);
-              startVoiceLoop();
-            }, 2000);
-          } else {
-            if (result.command) {
-              processVoiceCommand(result.command);
-            } else {
-              setVoiceAlert('GIA is listening...');
-              voiceLoopTimerRef.current = setTimeout(() => {
-                setVoiceAlert(null);
-                startVoiceLoop();
-              }, 2000);
-            }
-          }
-        }, 1500);
-
-      }, 1500);
-    }, 1000);
-  }
-
-  async function processVoiceCommand(command: string) {
-    if (!token || !activeConvoId) {
-      setVoiceAlert('Active conversation required');
-      voiceLoopTimerRef.current = setTimeout(() => handleStopVoiceSession(), 3000);
-      return;
-    }
-
-    setVoiceState('PROCESSING');
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    // Optimistically log voice request
-    const tempUserMsg: MessageExt = {
-      id: Math.random().toString(),
-      role: 'user',
-      content: `🎙️ (Voice Command) "${command}"`,
-      created_at: new Date().toISOString(),
-    };
-    setMessages((prev) => [...prev, tempUserMsg]);
-
-    try {
-      await api.sendMessageAgent(token, activeConvoId, command);
-      if (controller.signal.aborted) return;
-
-      setVoiceState('SPEAKING');
-      const refreshed = await api.getMessages(token, activeConvoId);
-      setMessages(refreshed);
-
-      const lastMsg = refreshed[refreshed.length - 1];
-      const speechText = lastMsg && lastMsg.role === 'assistant' ? lastMsg.content : 'I processed your command.';
-
-      // Clean up markdown formatting for speech synthesis
-      const cleanSpeechText = speechText
-        .replace(/```[\s\S]*?```/g, '') // remove code blocks
-        .replace(/`([^`]+)`/g, '$1')    // remove inline backticks
-        .replace(/[*_#\-+]/g, '')       // remove list markers and headers
-        .trim();
-
-      // Speak response using Web Speech Synthesis API if available
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-        const utterance = new SpeechSynthesisUtterance(cleanSpeechText);
-        
-        // Select an active English voice if available to ensure output is vocalized
-        const voices = window.speechSynthesis.getVoices();
-        if (voices.length > 0) {
-          const enVoice = voices.find(v => v.lang.startsWith('en')) || voices[0];
-          utterance.voice = enVoice;
-        } else {
-          console.warn("[TTS Diagnostics] No voices loaded yet. Attempting standard speech synthesis fallback.");
-        }
-
-        // Transition back to listening after GIA finishes speaking
-        utterance.onend = () => {
-          console.log("[TTS Diagnostics] Speech synthesized successfully.");
-          startVoiceLoop();
-        };
-        utterance.onerror = (e) => {
-          console.error("[TTS Diagnostics] Speech synthesis playback error event:", e);
-          setVoiceAlert("System audio playback issue: system voice engine unavailable.");
-          startVoiceLoop();
-        };
-        
-        window.speechSynthesis.speak(utterance);
-      } else {
-        console.warn("[TTS Diagnostics] SpeechSynthesis API is not supported in this browser runtime.");
-        // Fallback: wait 3.5 seconds and listen again
-        voiceLoopTimerRef.current = setTimeout(() => {
-          startVoiceLoop();
-        }, 3500);
-      }
-
-    } catch (err: any) {
-      if (controller.signal.aborted) return;
-      setVoiceAlert(`System Error: ${err.message || 'Call failed'}`);
-      
-      // Transient error: wait 3 seconds and return to listening
-      voiceLoopTimerRef.current = setTimeout(() => {
-        setVoiceAlert(null);
-        startVoiceLoop();
-      }, 3000);
-    } finally {
-      if (abortControllerRef.current === controller) {
-        abortControllerRef.current = null;
-      }
-    }
-  }
 
   // Subsystem Operations
   async function handleAddMemory(e: React.FormEvent) {
@@ -752,8 +570,6 @@ export default function App() {
                 {uiState === 'idle' && 'Idle'}
                 {uiState === 'chatting' && 'Typing...'}
                 {uiState === 'thinking' && 'Thinking...'}
-                {uiState === 'voice_listening' && 'Listening...'}
-                {uiState === 'transcribing' && 'Transcribing...'}
                 {uiState === 'executing' && `Running ${activeTool}...`}
                 {uiState === 'error' && 'System Error'}
               </span>
@@ -858,205 +674,50 @@ export default function App() {
 
       {/* DETECTED DYNAMIC STATE INTERFACE OVERLAYS */}
       
-      {/* Voice Session Overlay */}
-      {voiceSessionActive && (
-        <div className="voice-active-overlay backdrop-blur">
-          <div className="voice-ripple-container">
-            {voiceState === 'LISTENING' && (
-              <>
-                <span className="voice-ripple" style={{borderColor: 'var(--success-color)'}} />
-                <span className="voice-ripple" style={{borderColor: 'var(--success-color)', animationDelay: '0.6s'}} />
-                <span className="voice-ripple" style={{borderColor: 'var(--success-color)', animationDelay: '1.2s'}} />
-              </>
-            )}
-            {voiceState === 'SPEECH_DETECTED' && (
-              <>
-                <span className="voice-ripple" style={{borderColor: 'var(--warning-color)'}} />
-                <span className="voice-ripple" style={{borderColor: 'var(--warning-color)', animationDelay: '0.6s'}} />
-              </>
-            )}
-            {(voiceState === 'TRANSCRIBING' || voiceState === 'COMMAND_CHECK') && (
-              <>
-                <span className="voice-ripple" style={{borderColor: 'var(--accent-cyan)', animation: 'voiceRipple 1.2s infinite linear'}} />
-              </>
-            )}
-            {voiceState === 'PROCESSING' && (
-              <>
-                <span className="voice-ripple" style={{borderColor: 'var(--accent-purple)', animation: 'voiceRipple 1.5s infinite linear'}} />
-              </>
-            )}
-            {voiceState === 'SPEAKING' && (
-              <>
-                <span className="voice-ripple" style={{borderColor: '#ec4899', animation: 'voiceRipple 1.0s infinite linear'}} />
-                <span className="voice-ripple" style={{borderColor: '#ec4899', animation: 'voiceRipple 2.0s infinite linear', animationDelay: '0.5s'}} />
-              </>
-            )}
-            
-            <div className="voice-mic-core" style={{
-              background: 
-                voiceState === 'LISTENING' ? 'var(--success-color)' :
-                voiceState === 'SPEECH_DETECTED' ? 'var(--warning-color)' :
-                (voiceState === 'TRANSCRIBING' || voiceState === 'COMMAND_CHECK') ? 'var(--accent-cyan)' :
-                voiceState === 'PROCESSING' ? 'var(--accent-purple)' :
-                voiceState === 'SPEAKING' ? '#ec4899' :
-                'var(--text-muted)',
-              boxShadow: 
-                voiceState === 'LISTENING' ? '0 0 25px rgba(16, 185, 129, 0.4)' :
-                voiceState === 'SPEECH_DETECTED' ? '0 0 25px rgba(251, 191, 36, 0.4)' :
-                (voiceState === 'TRANSCRIBING' || voiceState === 'COMMAND_CHECK') ? '0 0 25px rgba(6, 182, 212, 0.4)' :
-                voiceState === 'PROCESSING' ? '0 0 25px rgba(168, 85, 247, 0.4)' :
-                voiceState === 'SPEAKING' ? '0 0 25px rgba(236, 72, 153, 0.4)' :
-                'none'
-            }}>
-              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                <line x1="12" y1="19" x2="12" y2="23"/>
-                <line x1="8" y1="23" x2="16" y2="23"/>
-              </svg>
-            </div>
-          </div>
-
-          <span className="voice-status-text" style={{
-            color: 
-              voiceState === 'LISTENING' ? 'var(--success-color)' :
-              voiceState === 'SPEECH_DETECTED' ? 'var(--warning-color)' :
-              (voiceState === 'TRANSCRIBING' || voiceState === 'COMMAND_CHECK') ? '#a5f3fc' :
-              voiceState === 'PROCESSING' ? '#e9d5ff' :
-              voiceState === 'SPEAKING' ? '#fbcfe8' :
-              '#fff'
-          }}>
-            {voiceState === 'VOICE_STARTING' && 'Connecting to microphone...'}
-            {voiceState === 'LISTENING' && 'Listening for wake word...'}
-            {voiceState === 'SPEECH_DETECTED' && 'Speech detected...'}
-            {voiceState === 'TRANSCRIBING' && 'Transcribing audio...'}
-            {voiceState === 'COMMAND_CHECK' && 'Gating command...'}
-            {voiceState === 'PROCESSING' && 'GIA is thinking...'}
-            {voiceState === 'SPEAKING' && 'GIA speaking...'}
-          </span>
-
-          <span className="voice-substatus" style={{textAlign: 'center', padding: '0 24px', minHeight: '36px'}}>
-            {voiceAlert && <strong style={{color: 'var(--error-color)'}}>{voiceAlert}</strong>}
-            {!voiceAlert && voiceState === 'LISTENING' && 'Say "Hey GIA" followed by a command.'}
-            {!voiceAlert && lastTranscribedSegment && (
-              <>
-                <span style={{color: 'var(--text-secondary)'}}>Heard: </span>
-                <span style={{fontStyle: 'italic', color: '#fff'}}>&ldquo;{lastTranscribedSegment}&rdquo;</span>
-              </>
-            )}
-          </span>
-
-          {/* Test & Simulation Controls */}
-          <div className="voice-simulation-controls" style={{
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '6px',
-            width: '100%',
-            maxWidth: '240px',
-            marginBottom: '20px',
-            background: 'rgba(255,255,255,0.02)',
-            padding: '10px',
-            borderRadius: '12px',
-            border: '1px solid var(--glass-border)'
-          }}>
-            <span style={{fontSize: '0.65rem', color: 'var(--text-secondary)', textTransform: 'uppercase', textAlign: 'center', fontWeight: 600, letterSpacing: '0.5px'}}>Simulation Panel</span>
-            
-            {/* Custom Input for Spoken text simulation */}
-            <div style={{ display: 'flex', gap: '4px', marginBottom: '4px' }}>
-              <input 
-                type="text" 
-                placeholder="Type spoken text to simulate..."
-                id="simulated-speech-input"
-                style={{
-                  flex: 1,
-                  fontSize: '0.7rem',
-                  padding: '4px 6px',
-                  background: 'rgba(0,0,0,0.3)',
-                  border: '1px solid var(--glass-border)',
-                  borderRadius: '6px',
-                  color: '#fff'
-                }}
-                disabled={voiceState !== 'LISTENING'}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    const val = (e.target as HTMLInputElement).value;
-                    if (val.trim()) {
-                      simulateSpeechSegment(val.trim());
-                      (e.target as HTMLInputElement).value = '';
-                    }
-                  }
-                }}
-              />
-              <button
-                type="button"
-                className="stop-voice-btn"
-                style={{ fontSize: '0.65rem', padding: '4px 8px', margin: 0 }}
-                disabled={voiceState !== 'LISTENING'}
-                onClick={() => {
-                  const inputEl = document.getElementById('simulated-speech-input') as HTMLInputElement;
-                  if (inputEl && inputEl.value.trim()) {
-                    simulateSpeechSegment(inputEl.value.trim());
-                    inputEl.value = '';
-                  }
-                }}
-              >
-                Send
-              </button>
-            </div>
-            
-            <button 
-              type="button"
-              className="stop-voice-btn" 
-              style={{fontSize: '0.7rem', padding: '6px'}} 
-              disabled={voiceState !== 'LISTENING'}
-              onClick={() => simulateSpeechSegment('Hey GIA, what time is it?')}
-            >
-              🎙️ Speak command (Wake Word)
-            </button>
-            <button 
-              type="button"
-              className="stop-voice-btn" 
-              style={{fontSize: '0.7rem', padding: '6px'}} 
-              disabled={voiceState !== 'LISTENING'}
-              onClick={() => simulateSpeechSegment('Is it going to rain today?')}
-            >
-              🎙️ Speak chatter (No Wake Word)
-            </button>
-            <button 
-              type="button"
-              className="stop-voice-btn" 
-              style={{fontSize: '0.7rem', padding: '6px', borderColor: 'rgba(244,63,94,0.3)'}} 
-              disabled={voiceState !== 'LISTENING'}
-              onClick={() => {
-                setVoiceAlert('Error: Access to audio device denied');
-                voiceLoopTimerRef.current = setTimeout(() => handleStopVoiceSession(), 3000);
-              }}
-            >
-              ⚠️ Simulate hardware failure
-            </button>
-          </div>
-
-          <button className="stop-voice-btn" style={{background: 'var(--error-color)', borderColor: 'var(--error-color)', padding: '10px 24px'}} onClick={handleStopVoiceSession}>
-            Stop Voice Mode
-          </button>
-        </div>
-      )}
-
       {/* COMPOSER FOOTER BAR */}
-      {activeConvoId && uiState !== 'voice_listening' && (
+      {activeConvoId && (
         <footer className="composer-bar backdrop-blur">
+          {/* Continuous Voice Mode Active State Banner */}
+          {isVoiceModeActive && (
+            <div className={`state-banner voice-banner voice-${voiceState.toLowerCase()}`}>
+              <div className="spinner" />
+              <span>
+                {voiceState === 'STARTING' && '⚙️ Starting voice mode...'}
+                {voiceState === 'LISTENING' && '🎙️ Listening... (Speak now)'}
+                {voiceState === 'SPEECH_DETECTED' && '🗣️ Speech detected'}
+                {voiceState === 'TRANSCRIBING' && '⚡ Transcribing Python STT...'}
+                {voiceState === 'PROCESSING' && '🤖 Orchestrating response...'}
+                {voiceState === 'SYNTHESIZING' && '🔊 Synthesizing Python TTS...'}
+                {voiceState === 'PLAYING' && '🔊 GIA speaking... 🔇 (Mic muted - Feedback blocked)'}
+                {voiceState === 'STOPPING' && '⏹️ Stopping voice mode...'}
+              </span>
+
+              <div className="voice-controls-group">
+                {voiceState === 'PLAYING' && (
+                  <button
+                    type="button"
+                    className="pause-voice-btn"
+                    onClick={() => {
+                      if (playbackState === 'PLAYING') audioPlayerRef.current?.pause();
+                      else if (playbackState === 'PAUSED') audioPlayerRef.current?.resume();
+                    }}
+                  >
+                    {playbackState === 'PAUSED' ? '▶️ Resume' : '⏸️ Pause'}
+                  </button>
+                )}
+
+                <button type="button" className="stop-voice-btn" onClick={toggleVoiceMode}>
+                  ⏹️ Stop Voice Mode
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Inline Active State Banners */}
           {uiState === 'executing' && (
             <div className="state-banner executing">
               <div className="spinner" />
               <span>🔧 Executing tool: <strong>{activeTool}</strong></span>
-            </div>
-          )}
-          
-          {uiState === 'transcribing' && (
-            <div className="state-banner transcribing">
-              <div className="spinner" />
-              <span>🎙️ Transcribing voice note...</span>
             </div>
           )}
 
@@ -1076,29 +737,27 @@ export default function App() {
 
           <form onSubmit={handleSendMessage} className="composer-form">
             <div className="composer-row">
-              {/* Voice Trigger Microphone */}
-              <button 
-                type="button" 
-                className="mic-btn" 
-                onClick={handleToggleVoiceSession}
-                disabled={['thinking', 'executing', 'transcribing'].includes(uiState)}
-                title="Voice input"
-              >
-                🎙️
-              </button>
-
               <input 
                 type="text" 
-                placeholder="Ask GIA anything..." 
+                placeholder={isVoiceModeActive ? "Continuous Voice Mode active..." : "Ask GIA anything..."} 
                 value={inputMessage} 
                 onChange={(e) => setInputMessage(e.target.value)} 
-                disabled={['thinking', 'executing', 'transcribing'].includes(uiState)} 
+                disabled={['thinking', 'executing'].includes(uiState) || isVoiceModeActive} 
               />
+
+              <button
+                type="button"
+                className={`voice-mode-toggle-btn ${isVoiceModeActive ? 'active' : ''}`}
+                onClick={toggleVoiceMode}
+                title={isVoiceModeActive ? "Stop Voice Mode" : "Start Continuous Voice Mode"}
+              >
+                🎙️ {isVoiceModeActive ? 'ON' : 'OFF'}
+              </button>
 
               <button 
                 type="submit" 
                 className="send-btn" 
-                disabled={!inputMessage.trim() || ['thinking', 'executing', 'transcribing'].includes(uiState)}
+                disabled={!inputMessage.trim() || ['thinking', 'executing'].includes(uiState) || isVoiceModeActive}
               >
                 ➔
               </button>
@@ -1262,9 +921,18 @@ export default function App() {
                 <h5>System Specs</h5>
                 <ul>
                   <li><span>Health Status</span> <span style={{color: healthStatus === 'Online' ? 'var(--success-color)' : 'var(--error-color)'}}>{healthStatus}</span></li>
+                  <li><span>Mic Permission</span> <span style={{textTransform: 'capitalize'}}>{micPermissionStatus}</span></li>
                   <li><span>Gateway Mode</span> <span>Dynamic Router</span></li>
                   <li><span>Max Agent Steps</span> <span>5 steps limit</span></li>
                 </ul>
+                <button
+                  type="button"
+                  className="btn-grant-access"
+                  style={{ marginTop: '12px', fontSize: '0.8rem', padding: '8px 12px' }}
+                  onClick={() => setShowMicTestModal(true)}
+                >
+                  🎙️ Run Native Microphone Capture Test
+                </button>
               </div>
 
               <div className="settings-user-bar">
@@ -1274,6 +942,30 @@ export default function App() {
                 </div>
                 <button className="del-item-btn" onClick={handleLogout}>Log out</button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* NATIVE MICROPHONE BOUNDARY TEST MODAL */}
+      <MicTestModal isOpen={showMicTestModal} onClose={() => setShowMicTestModal(false)} />
+
+      {/* MICROPHONE ACCESS PERMISSION MODAL */}
+      {showMicModal && (
+        <div className="modal-overlay">
+          <div className="mic-modal-card backdrop-blur">
+            <div className="mic-icon-wrapper">🎙️</div>
+            <h3>Microphone Access Required</h3>
+            <p>
+              GIA Assistant requires desktop microphone access to enable continuous voice interaction, speech-to-text recognition, and hands-free control.
+            </p>
+            <div className="mic-modal-actions">
+              <button type="button" className="btn-grant-access" onClick={handleGrantMicPermission}>
+                Give Access
+              </button>
+              <button type="button" className="btn-reject-access" onClick={handleRejectMicPermission}>
+                Reject
+              </button>
             </div>
           </div>
         </div>

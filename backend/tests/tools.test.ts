@@ -8,12 +8,14 @@ import { toolRoutes } from '../src/api/routes/tools.js';
 import { authRoutes } from '../src/api/routes/auth.js';
 import { errorHandler } from '../src/api/middleware/errorHandler.js';
 import { initializeDatabase, pool, query } from '../src/database/client.js';
-import { registry } from '../src/ai/tools/registry.js';
+import { registry, ToolRegistry } from '../src/ai/tools/registry.js';
+import { ToolExecutor } from '../src/ai/tools/executor.js';
+import { ToolDefinition, ToolResult } from '../src/ai/tools/tool.interface.js';
 import { Agent } from '../src/ai/orchestrator/agent.js';
 import { setTestProvider } from '../src/ai/router/index.js';
 import { MockProvider } from '../src/ai/providers/mock.provider.js';
 
-describe('GIA Tool execution Integration Tests', () => {
+describe('GIA Tool execution Integration Tests (Phase 16)', () => {
   const app = Fastify();
   let userToken: string;
   let userId: string;
@@ -45,6 +47,39 @@ describe('GIA Tool execution Integration Tests', () => {
     setTestProvider(null);
     await query('DELETE FROM users');
     await pool.end();
+  });
+
+  describe('Modular Tool Architecture (Tool, ToolDefinition, ToolRegistry, ToolExecutor, ToolResult)', () => {
+    it('should allow registering, fetching, checking, and unregistering tools in ToolRegistry', () => {
+      const customRegistry = new ToolRegistry();
+      const customTool: ToolDefinition = {
+        name: 'custom_test_tool',
+        description: 'A custom test tool for registry verification',
+        inputSchema: z.object({ value: z.string() }),
+        permissions: ['read:system'],
+        riskLevel: 'low',
+        operationType: 'read',
+        timeoutMs: 3000,
+        errorBehavior: 'graceful_fallback',
+        async execute(args) {
+          return { echo: args.value };
+        },
+      };
+
+      customRegistry.register(customTool);
+      expect(customRegistry.has('custom_test_tool')).toBe(true);
+      expect(customRegistry.get('custom_test_tool')?.name).toBe('custom_test_tool');
+      expect(customRegistry.getAll().length).toBe(1);
+
+      customRegistry.unregister('custom_test_tool');
+      expect(customRegistry.has('custom_test_tool')).toBe(false);
+    });
+
+    it('should execute tool via ToolExecutor and return structured ToolResult', async () => {
+      const res: ToolResult = await ToolExecutor.executeTool(userId, 'get_current_time', {});
+      expect(res.success).toBe(true);
+      expect(res.result.currentTime).toBeDefined();
+    });
   });
 
   describe('Direct Tool Executions', () => {
