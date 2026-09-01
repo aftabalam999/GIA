@@ -6,7 +6,7 @@ export class GeminiProvider implements LLMProvider {
   private apiKey: string;
   private defaultModel: string;
 
-  constructor(apiKey: string, defaultModel = 'gemini-2.0-flash') {
+  constructor(apiKey: string, defaultModel = 'gemini-2.5-flash-preview-tts') {
     this.apiKey = apiKey;
     this.defaultModel = defaultModel;
   }
@@ -35,6 +35,10 @@ export class GeminiProvider implements LLMProvider {
     }
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.defaultModel}:generateContent?key=${this.apiKey}`;
+    logger.info({
+      msg: '🌐 [GEMINI API] Hitting Google Gemini Generative Language API',
+      model: this.defaultModel,
+    });
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

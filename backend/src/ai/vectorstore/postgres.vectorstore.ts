@@ -18,18 +18,38 @@ export class PostgresVectorStore implements VectorStore {
     userId: string,
     embedding: number[],
     limit = 5,
-    threshold = 0.5
+    threshold = 0.5,
+    category?: string
   ): Promise<VectorSearchResult[]> {
     const vectorStr = `[${embedding.join(',')}]`;
-    const sql = `
-      SELECT id, content, type, metadata, (1 - (embedding <=> $1::vector)) as score
-      FROM memories
-      WHERE user_id = $2 
-        AND embedding IS NOT NULL 
-        AND (1 - (embedding <=> $1::vector)) >= $3
-      ORDER BY score DESC
-      LIMIT $4
-    `;
+    
+    let sql: string;
+    let params: any[];
+
+    if (category) {
+      sql = `
+        SELECT id, content, type, metadata, (1 - (embedding <=> $1::vector)) as score
+        FROM memories
+        WHERE user_id = $2 
+          AND embedding IS NOT NULL 
+          AND (1 - (embedding <=> $1::vector)) >= $3
+          AND (type = $5 OR (metadata->>'category') = $5)
+        ORDER BY score DESC
+        LIMIT $4
+      `;
+      params = [vectorStr, userId, threshold, limit, category];
+    } else {
+      sql = `
+        SELECT id, content, type, metadata, (1 - (embedding <=> $1::vector)) as score
+        FROM memories
+        WHERE user_id = $2 
+          AND embedding IS NOT NULL 
+          AND (1 - (embedding <=> $1::vector)) >= $3
+        ORDER BY score DESC
+        LIMIT $4
+      `;
+      params = [vectorStr, userId, threshold, limit];
+    }
 
     try {
       const res = await query<{
@@ -38,7 +58,7 @@ export class PostgresVectorStore implements VectorStore {
         type: string;
         metadata: any;
         score: number;
-      }>(sql, [vectorStr, userId, threshold, limit]);
+      }>(sql, params);
 
       return res.rows.map((row) => ({
         id: row.id,
@@ -48,7 +68,7 @@ export class PostgresVectorStore implements VectorStore {
         metadata: row.metadata,
       }));
     } catch (err: any) {
-      logger.error({ msg: 'PostgresVectorStore similarity query failed', userId, err: err.message });
+      logger.error({ msg: 'PostgresVectorStore similarity query failed', userId, category, err: err.message });
       throw new DatabaseError(`Vector search failed: ${err.message}`, err);
     }
   }

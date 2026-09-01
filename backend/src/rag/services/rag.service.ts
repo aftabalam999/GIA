@@ -8,9 +8,12 @@ import { ContextBuilder } from '../../ai/orchestrator/contextBuilder.js';
 import { logger } from '../../shared/logger.js';
 import { AuthorizationError, NotFoundError } from '../../shared/errors.js';
 
+import { aiServiceClient } from '../../ai/ml-client/ai-service.client.js';
+
 export class RAGService {
   /**
    * Retrieves matching documents and preferences per tenant.
+   * Document chunks are retrieved via PostgreSQL pgvector search and reranked via Python Reranker Service.
    */
   static async queryAndRetrieve(
     userId: string,
@@ -22,13 +25,31 @@ export class RAGService {
       const embeddingProvider = getEmbeddingProvider();
       const embedding = await embeddingProvider.embed(queryText);
 
-      // Search document chunks semantically
-      const chunks = await DocumentChunkRepository.searchSimilarChunks(userId, embedding, limit, threshold);
+      // Search document chunks semantically in PostgreSQL + pgvector
+      const candidateChunks = await DocumentChunkRepository.searchSimilarChunks(userId, embedding, limit * 2, threshold);
+
+      let finalChunks = candidateChunks;
+
+      // Execute Python Reranker Service if candidate chunks exist
+      if (candidateChunks.length > 1) {
+        try {
+          const docTexts = candidateChunks.map((c) => c.content);
+          const rerankRes = await aiServiceClient.rerank(queryText, docTexts, limit);
+          if (rerankRes.results && rerankRes.results.length > 0) {
+            finalChunks = rerankRes.results.map((r) => candidateChunks[r.index]).filter(Boolean);
+          }
+        } catch (rerankErr: any) {
+          logger.warn({ msg: 'Python Reranker Service call failed; preserving pgvector order', err: rerankErr.message });
+          finalChunks = candidateChunks.slice(0, limit);
+        }
+      } else {
+        finalChunks = candidateChunks.slice(0, limit);
+      }
 
       // Search user preference memories semantically
       const memories = await MemoryService.searchMemoriesSemantic(userId, queryText, limit, threshold);
 
-      return { chunks, memories };
+      return { chunks: finalChunks, memories };
     } catch (err: any) {
       logger.warn({ msg: 'RAG retrieval step failed. Falling back to general generation', err: err.message });
       return { chunks: [], memories: [] };

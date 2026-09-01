@@ -15,9 +15,12 @@ const configSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   GOOGLE_AI_API_KEY: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().optional(),
+  INTERNAL_API_KEY: z.string().default('gia_internal_secret_key_987654321'),
   CORS_ORIGIN: z.string().optional(),
   REDIS_URL: z.string().default('redis://localhost:6379'),
   SESSION_TTL_SECONDS: z.coerce.number().default(604800),
+  AI_SERVICE_URL: z.string().default('http://127.0.0.1:8001'),
+  AI_SERVICE_TIMEOUT_MS: z.coerce.number().default(30000),
 });
 
 const parsed = configSchema.safeParse(process.env);

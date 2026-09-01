@@ -19,6 +19,9 @@ import { documentRoutes } from './api/routes/documents.js';
 import { toolRoutes } from './api/routes/tools.js';
 import { agentRoutes } from './api/routes/agent.js';
 
+import fastifyMultipart from '@fastify/multipart';
+import { voiceRoutes } from './api/routes/voice.js';
+
 const fastify = Fastify({
   logger: false, // Custom logger handled separately
   genReqId: () => crypto.randomUUID(),
@@ -28,6 +31,13 @@ const fastify = Fastify({
 
 // Configure custom error handler
 fastify.setErrorHandler(errorHandler);
+
+// Register Multipart Plugin for audio file uploads
+await fastify.register(fastifyMultipart, {
+  limits: {
+    fileSize: 25 * 1024 * 1024, // 25MB max audio file size
+  },
+});
 
 // Enable CORS
 await fastify.register(cors, {
@@ -132,6 +142,7 @@ await fastify.register(memoryRoutes, { prefix: '/api/v1' });
 await fastify.register(documentRoutes, { prefix: '/api/v1' });
 await fastify.register(toolRoutes, { prefix: '/api/v1' });
 await fastify.register(agentRoutes, { prefix: '/api/v1' });
+await fastify.register(voiceRoutes, { prefix: '/api/v1' });
 
 async function start() {
   try {

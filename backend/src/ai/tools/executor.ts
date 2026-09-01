@@ -6,6 +6,8 @@ import { MessageRepository } from '../../database/repositories/message.repositor
 import { ConversationRepository } from '../../database/repositories/conversation.repository.js';
 import { UserRepository } from '../../database/repositories/user.repository.js';
 
+import { ToolResult } from './tool.interface.js';
+
 export class ToolExecutor {
   /**
    * Validates tool input, checks authorizations, enforces execution timeouts,
@@ -16,7 +18,7 @@ export class ToolExecutor {
     toolName: string,
     rawArgs: any,
     messageId: string | null = null
-  ): Promise<{ success: boolean; result?: any; error?: string }> {
+  ): Promise<ToolResult> {
     // 1. Fetch tool definition
     const tool = registry.get(toolName);
     if (!tool) {

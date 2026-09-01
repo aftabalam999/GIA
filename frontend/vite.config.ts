@@ -6,7 +6,7 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
-  const port = env.PORT ? parseInt(env.PORT) : 1420;
+  const port = env.VITE_PORT ? parseInt(env.VITE_PORT) : 1420;
 
   return {
     plugins: [react()],

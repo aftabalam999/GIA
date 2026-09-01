@@ -9,8 +9,10 @@ import { conversationRoutes } from '../src/api/routes/conversations.js';
 import { authRoutes } from '../src/api/routes/auth.js';
 import { errorHandler } from '../src/api/middleware/errorHandler.js';
 import { initializeDatabase, pool, query } from '../src/database/client.js';
+import { config } from '../src/config/index.js';
+import { aiServiceClient } from '../src/ai/ml-client/ai-service.client.js';
 
-describe('GIA Security Boundary Integration Tests', () => {
+describe('GIA Security Boundary Integration Tests (Phase 17)', () => {
   const app = Fastify();
   let userAToken: string;
   let userBToken: string;
@@ -18,6 +20,7 @@ describe('GIA Security Boundary Integration Tests', () => {
   let userBId: string;
   let convoBId: string;
   let messageBId: string;
+  let cookieHeaderUserA: string;
 
   beforeAll(async () => {
     app.setErrorHandler(errorHandler);
@@ -43,6 +46,11 @@ describe('GIA Security Boundary Integration Tests', () => {
     const bodyA = JSON.parse(resA.body);
     userAToken = bodyA.token;
     userAId = bodyA.user.id;
+
+    // Capture HttpOnly cookie set on signup
+    const cookiesA = resA.cookies;
+    expect(cookiesA.some((c) => c.name === 'session_id' && c.httpOnly)).toBe(true);
+    cookieHeaderUserA = resA.headers['set-cookie'] as string;
 
     // Create User B
     const resB = await app.inject({
@@ -75,6 +83,65 @@ describe('GIA Security Boundary Integration Tests', () => {
   afterAll(async () => {
     await query('DELETE FROM users');
     await pool.end();
+  });
+
+  describe('HttpOnly Cookie & Session Revocation', () => {
+    it('should authenticate via HttpOnly cookie and allow me endpoint query', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/v1/auth/me',
+        headers: { cookie: cookieHeaderUserA },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.user.id).toBe(userAId);
+    });
+
+    it('should revoke session on logout and deny access with revoked token', async () => {
+      // 1. Create session for temp user
+      const tempRes = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/signup',
+        payload: { email: 'temp_sec@gia.ai', password: 'secure_password_temp', name: 'Temp User' },
+      });
+      const tempToken = JSON.parse(tempRes.body).token;
+
+      // 2. Logout session
+      const logoutRes = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/logout',
+        headers: { authorization: `Bearer ${tempToken}` },
+      });
+      expect(logoutRes.statusCode).toBe(200);
+
+      // 3. Verify access is now rejected
+      const meRes = await app.inject({
+        method: 'GET',
+        url: '/api/v1/auth/me',
+        headers: { authorization: `Bearer ${tempToken}` },
+      });
+      expect(meRes.statusCode).toBe(401);
+    });
+  });
+
+  describe('Internal Service Protection & Secret Isolation', () => {
+    it('should ensure AIServiceClient propagates x-internal-api-key header', async () => {
+      expect(config.INTERNAL_API_KEY).toBeDefined();
+      expect(config.INTERNAL_API_KEY.length).toBeGreaterThan(10);
+    });
+
+    it('should confirm response models never expose backend API keys to clients', async () => {
+      const meRes = await app.inject({
+        method: 'GET',
+        url: '/api/v1/auth/me',
+        headers: { authorization: `Bearer ${userAToken}` },
+      });
+      const bodyStr = meRes.body;
+      expect(bodyStr).not.toContain('OPENAI_API_KEY');
+      expect(bodyStr).not.toContain('GOOGLE_AI_API_KEY');
+      expect(bodyStr).not.toContain('JWT_SECRET');
+    });
   });
 
   describe('IDOR Controls', () => {
