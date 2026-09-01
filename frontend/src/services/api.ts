@@ -48,16 +48,21 @@ async function apiRequest(path: string, method: string, token?: string, body?: a
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const response = await fetch(`${BACKEND_URL}${path}`, {
-    method,
-    headers,
-    credentials: 'include',
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${BACKEND_URL}${path}`, {
+      method,
+      headers,
+      credentials: 'include',
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (err: any) {
+    throw new Error(`Unable to connect to backend service at ${BACKEND_URL}. Please ensure backend server is running.`);
+  }
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.error?.message || `Request failed with status ${response.status}`);
+    throw new Error(data?.error?.message || data?.message || `Request failed with status ${response.status}`);
   }
   return data;
 }
@@ -236,3 +241,59 @@ export async function fetchHealthStatus(): Promise<HealthResponse> {
   }
   return response.json();
 }
+
+// VOICE API ENDPOINTS
+export async function transcribeAudio(token: string, audioBlob: Blob | Buffer): Promise<any> {
+  const formData = new FormData();
+  formData.append('file', audioBlob as Blob, 'recording.wav');
+
+  const response = await fetch(`${BACKEND_URL}/api/v1/voice/transcribe`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error?.message || 'STT transcription failed');
+  }
+  return data.data || data;
+}
+
+export async function synthesizeSpeech(token: string, text: string): Promise<ArrayBuffer> {
+  const response = await fetch(`${BACKEND_URL}/api/v1/voice/tts`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ text }),
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err?.error?.message || 'TTS synthesis failed');
+  }
+
+  return response.arrayBuffer();
+}
+
+export async function sendVoiceMessage(token: string, conversationId: string, audioBlob: Blob | Buffer): Promise<any> {
+  const formData = new FormData();
+  formData.append('file', audioBlob as Blob, 'voice_query.wav');
+  formData.append('conversationId', conversationId);
+
+  const response = await fetch(`${BACKEND_URL}/api/v1/conversations/${conversationId}/messages/voice`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error?.message || 'Voice orchestration failed');
+  }
+  return data;
+}
+
+

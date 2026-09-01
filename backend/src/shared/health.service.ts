@@ -4,6 +4,9 @@ import { redis } from './redis.js';
 import { ROUTER_CONFIGS } from '../ai/router/config.js';
 import { logger } from './logger.js';
 
+import { aiServiceClient } from '../ai/ml-client/ai-service.client.js';
+import { DeepReadinessProbeResult } from '../ai/ml-client/ai-service.types.js';
+
 export interface HealthReport {
   status: 'healthy' | 'degraded' | 'unhealthy';
   timestamp: string;
@@ -11,12 +14,15 @@ export interface HealthReport {
   dependencies: {
     database: 'healthy' | 'unhealthy';
     redis: 'healthy' | 'unhealthy';
+    python_ai_service: 'healthy' | 'degraded' | 'unhealthy';
     llm: 'healthy' | 'unhealthy' | 'unconfigured';
     embeddings: 'healthy' | 'unhealthy' | 'unconfigured';
   };
+  python_ai_service?: DeepReadinessProbeResult;
   latency: {
     database: number;
     redis: number;
+    python_ai_service?: number;
     llm?: number;
     embeddings?: number;
   };
@@ -25,10 +31,13 @@ export interface HealthReport {
 export const healthTestOverrides = {
   databaseHealthy: null as boolean | null,
   redisHealthy: null as boolean | null,
+  pythonAiHealthy: null as boolean | null,
+  pythonAiReady: null as boolean | null,
   llmHealthy: null as boolean | null,
   embeddingsHealthy: null as boolean | null,
   databaseLatency: null as number | null,
   redisLatency: null as number | null,
+  pythonAiLatency: null as number | null,
   llmLatency: null as number | null,
   embeddingsLatency: null as number | null,
 };
@@ -42,10 +51,13 @@ export class HealthService {
   static resetOverrides() {
     healthTestOverrides.databaseHealthy = null;
     healthTestOverrides.redisHealthy = null;
+    healthTestOverrides.pythonAiHealthy = null;
+    healthTestOverrides.pythonAiReady = null;
     healthTestOverrides.llmHealthy = null;
     healthTestOverrides.embeddingsHealthy = null;
     healthTestOverrides.databaseLatency = null;
     healthTestOverrides.redisLatency = null;
+    healthTestOverrides.pythonAiLatency = null;
     healthTestOverrides.llmLatency = null;
     healthTestOverrides.embeddingsLatency = null;
   }
@@ -61,6 +73,7 @@ export class HealthService {
       dependencies: {
         database: 'unhealthy',
         redis: 'unhealthy',
+        python_ai_service: 'unhealthy',
         llm: 'unconfigured',
         embeddings: 'unconfigured',
       },
@@ -100,7 +113,45 @@ export class HealthService {
       logger.error({ msg: 'Health probe Redis check error', err: err.message });
     }
 
-    // 3. Probe LLM API
+    // 3. Probe Python AI Service
+    const pyStart = Date.now();
+    try {
+      if (healthTestOverrides.pythonAiHealthy !== null) {
+        const isPyOk = healthTestOverrides.pythonAiHealthy;
+        const isPyReady = healthTestOverrides.pythonAiReady ?? isPyOk;
+        report.dependencies.python_ai_service = isPyOk ? (isPyReady ? 'healthy' : 'degraded') : 'unhealthy';
+        report.python_ai_service = {
+          reachable: isPyOk,
+          healthy: isPyOk,
+          ready: isPyReady,
+          subsystems: { audio_processor: true, vad: true, stt: isPyReady, tts: isPyReady, embedding: true, reranker: true },
+        };
+        report.latency.python_ai_service = healthTestOverrides.pythonAiLatency ?? (Date.now() - pyStart);
+      } else {
+        const pyResult = await aiServiceClient.checkDeepReadiness({ timeoutMs: 3000 });
+        report.python_ai_service = pyResult;
+        if (!pyResult.reachable || !pyResult.healthy) {
+          report.dependencies.python_ai_service = 'unhealthy';
+        } else if (!pyResult.ready) {
+          report.dependencies.python_ai_service = 'degraded';
+        } else {
+          report.dependencies.python_ai_service = 'healthy';
+        }
+        report.latency.python_ai_service = Date.now() - pyStart;
+      }
+    } catch (err: any) {
+      report.dependencies.python_ai_service = 'unhealthy';
+      report.python_ai_service = {
+        reachable: false,
+        healthy: false,
+        ready: false,
+        subsystems: { audio_processor: false, vad: false, stt: false, tts: false, embedding: false, reranker: false },
+        error: err.message,
+      };
+      logger.error({ msg: 'Health probe Python AI service check error', err: err.message });
+    }
+
+    // 4. Probe LLM API
     const llmProvider = ROUTER_CONFIGS.general.provider;
     const llmStart = Date.now();
     if (healthTestOverrides.llmHealthy !== null) {
@@ -122,7 +173,7 @@ export class HealthService {
       }
     }
 
-    // 4. Probe Embeddings API
+    // 5. Probe Embeddings API
     const hasOpenAIKey = !!config.OPENAI_API_KEY;
     const embStart = Date.now();
     if (healthTestOverrides.embeddingsHealthy !== null) {
@@ -144,14 +195,16 @@ export class HealthService {
       }
     }
 
-    // 5. Classify Overall Status
+    // 6. Classify Overall Status
     const isCoreHealthy = report.dependencies.database === 'healthy' && report.dependencies.redis === 'healthy';
-    if (!isCoreHealthy) {
+    if (!isCoreHealthy || report.dependencies.python_ai_service === 'unhealthy') {
       report.status = 'unhealthy';
     } else {
+      const isPyReady = report.dependencies.python_ai_service === 'healthy';
       const isLlmHealthy = report.dependencies.llm === 'healthy' || report.dependencies.llm === 'unconfigured';
       const isEmbHealthy = report.dependencies.embeddings === 'healthy' || report.dependencies.embeddings === 'unconfigured';
-      if (!isLlmHealthy || !isEmbHealthy) {
+
+      if (!isPyReady || !isLlmHealthy || !isEmbHealthy) {
         report.status = 'degraded';
       } else {
         report.status = 'healthy';

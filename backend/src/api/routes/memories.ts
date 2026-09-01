@@ -52,10 +52,15 @@ export async function memoryRoutes(fastify: FastifyInstance, options: FastifyPlu
     });
   });
 
-  // GET /api/v1/memories
+  // GET /api/v1/memories (Supports ?category=short_term | long_term_semantic | episodic)
   fastify.get('/memories', async (request, reply) => {
     const userId = request.user.id;
-    const memories = await MemoryService.searchMemories(userId, ''); // empty query gets all
+    const { category, type } = request.query as { category?: string; type?: string };
+    const targetCategory = category || type;
+
+    const memories = targetCategory
+      ? await MemoryService.getMemoriesByCategory(userId, targetCategory)
+      : await MemoryService.searchMemories(userId, ''); // empty query gets all
 
     return reply.status(200).send({
       success: true,
@@ -63,14 +68,15 @@ export async function memoryRoutes(fastify: FastifyInstance, options: FastifyPlu
     });
   });
 
-  // GET /api/v1/memories/search
+  // GET /api/v1/memories/search (Supports ?category=...)
   fastify.get('/memories/search', async (request, reply) => {
     const userId = request.user.id;
-    const { q, semantic, threshold, limit } = request.query as {
+    const { q, semantic, threshold, limit, category } = request.query as {
       q?: string;
       semantic?: string;
       threshold?: string;
       limit?: string;
+      category?: string;
     };
     if (!q) {
       throw new ValidationError('Query parameter "q" is required for search');
@@ -80,9 +86,9 @@ export async function memoryRoutes(fastify: FastifyInstance, options: FastifyPlu
     if (semantic === 'true') {
       const limitNum = limit ? parseInt(limit, 10) : 5;
       const thresholdNum = threshold ? parseFloat(threshold) : 0.5;
-      memories = await MemoryService.searchMemoriesSemantic(userId, q, limitNum, thresholdNum);
+      memories = await MemoryService.searchMemoriesSemantic(userId, q, limitNum, thresholdNum, category);
     } else {
-      memories = await MemoryService.searchMemories(userId, q);
+      memories = await MemoryService.searchMemories(userId, q, category);
     }
 
     return reply.status(200).send({

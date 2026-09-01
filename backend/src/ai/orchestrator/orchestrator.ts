@@ -8,11 +8,13 @@ import { ConversationRepository } from '../../database/repositories/conversation
 import { AuthorizationError, NotFoundError } from '../../shared/errors.js';
 import { logger } from '../../shared/logger.js';
 import { AgentRouter } from './router.js';
+import { NormalizedUserInput, normalizeUserInput } from './input.model.js';
 
 export interface AgentState {
   conversationId: string;
   userId: string;
   inputQuery: string;
+  inputModel: NormalizedUserInput;
   currentNode: 'planning' | 'retrieval' | 'execution' | 'responding' | 'error' | 'done';
   retrievedContext: {
     chunks: any[];
@@ -29,17 +31,17 @@ export interface AgentState {
 export class AgentOrchestrator {
   /**
    * Operates GIA's Finite State Machine (FSM) orchestrator.
-   * Manages explicit state definitions, logs node executions and transitions to agent_runs,
-   * limits maximum steps, maps tool execution results, and yields final responses.
+   * Accepts text or voice input via NormalizedUserInput model and routes through unified state transitions.
    */
   static async run(
     userId: string,
     conversationId: string,
-    queryText: string
+    inputQuery: string | NormalizedUserInput,
+    options?: { requestId?: string }
   ): Promise<{ userMessage: Message; assistantMessage: Message; runId: string }> {
     const AGENT_TIMEOUT_MS = 60_000; // 60 second wall-clock deadline
 
-    const runPromise = this._runInternal(userId, conversationId, queryText);
+    const runPromise = this._runInternal(userId, conversationId, inputQuery, options);
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(
         () => reject(new Error('Agent execution timed out after 60 seconds')),
@@ -56,7 +58,8 @@ export class AgentOrchestrator {
   private static async _runInternal(
     userId: string,
     conversationId: string,
-    queryText: string
+    inputQuery: string | NormalizedUserInput,
+    options?: { requestId?: string }
   ): Promise<{ userMessage: Message; assistantMessage: Message; runId: string }> {
     // 1. Verify ownership
     const convo = await ConversationRepository.findById(conversationId);
@@ -67,11 +70,24 @@ export class AgentOrchestrator {
       throw new AuthorizationError('Access denied to this conversation');
     }
 
+    // Normalize text or voice input into structured model
+    const inputModel = normalizeUserInput(inputQuery, userId, conversationId, options);
+
+    logger.info({
+      msg: 'Agent orchestrator processing input',
+      inputType: inputModel.inputType,
+      requestId: inputModel.requestId,
+      conversationId,
+      userId,
+      contentLength: inputModel.content.length,
+    });
+
     // 2. Initialize state machine variables
     const state: AgentState = {
       conversationId,
       userId,
-      inputQuery: queryText,
+      inputQuery: inputModel.content,
+      inputModel,
       currentNode: 'planning',
       retrievedContext: { chunks: [], memories: [] },
       toolCalls: [],
@@ -80,8 +96,18 @@ export class AgentOrchestrator {
       stepsHistory: [],
     };
 
-    // Save initial user message
-    const userMessage = await MessageRepository.create(conversationId, 'user', queryText);
+    // Save initial user message with metadata
+    const userMessage = await MessageRepository.create(
+      conversationId,
+      'user',
+      inputModel.content,
+      {
+        inputType: inputModel.inputType,
+        requestId: inputModel.requestId,
+        timestamp: inputModel.timestamp,
+        ...(inputModel.metadata || {}),
+      }
+    );
 
     // Create database observability run log
     const runId = await this.createAgentRun(conversationId, 'running');

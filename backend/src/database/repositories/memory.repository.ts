@@ -58,6 +58,17 @@ export class MemoryRepository {
     return res.rows;
   }
 
+  static async findByType(userId: string, type: string): Promise<Memory[]> {
+    const sql = `
+      SELECT id, user_id, type, content, importance, confidence, metadata, created_at, updated_at
+      FROM memories
+      WHERE user_id = $1 AND (type = $2 OR (metadata->>'category') = $2)
+      ORDER BY importance DESC, created_at DESC
+    `;
+    const res = await query<Memory>(sql, [userId, type]);
+    return res.rows;
+  }
+
   static async delete(id: string): Promise<boolean> {
     const sql = `
       DELETE FROM memories
@@ -111,7 +122,18 @@ export class MemoryRepository {
     return res.rows.length ? res.rows[0] : null;
   }
 
-  static async search(userId: string, queryText: string): Promise<Memory[]> {
+  static async search(userId: string, queryText: string, type?: string): Promise<Memory[]> {
+    if (type) {
+      const sql = `
+        SELECT id, user_id, type, content, importance, confidence, metadata, created_at, updated_at
+        FROM memories
+        WHERE user_id = $1 AND content ILIKE $2 AND (type = $3 OR (metadata->>'category') = $3)
+        ORDER BY importance DESC, created_at DESC
+      `;
+      const res = await query<Memory>(sql, [userId, `%${queryText}%`, type]);
+      return res.rows;
+    }
+
     const sql = `
       SELECT id, user_id, type, content, importance, confidence, metadata, created_at, updated_at
       FROM memories
