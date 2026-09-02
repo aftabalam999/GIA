@@ -62,18 +62,25 @@ export class MockProvider implements LLMProvider {
     };
   }
 
-  async *stream(request: LLMRequest): AsyncIterable<LLMChunk> {
+  async *stream(request: LLMRequest, signal?: AbortSignal): AsyncIterable<LLMChunk> {
     const lastUserMessage = request.messages[request.messages.length - 1]?.content || '';
 
     if (this.shouldFail || lastUserMessage === 'fail_stream') {
       throw new Error('Simulated LLM stream failure');
     }
 
+    if (signal?.aborted) {
+      const err = new Error('Operation aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
+
     const responseText = `[Mock Stream Response] Echo: "${lastUserMessage}"`;
-    // Split by character or word. Split by character is standard for fast updates
     for (let i = 0; i < responseText.length; i++) {
+      if (signal?.aborted) {
+        break;
+      }
       yield { content: responseText[i] };
-      // Simulated small delay
       await new Promise((res) => setTimeout(res, 5));
     }
   }

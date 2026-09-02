@@ -10,6 +10,7 @@ export interface RoutingDecision {
   requires_rag: boolean;
   requires_tool: boolean;
   tool: { name: string; args: any } | null;
+  deterministic?: boolean;
 }
 
 export const SAFE_FALLBACK_ROUTE: RoutingDecision = {
@@ -34,6 +35,34 @@ export class AgentRouter {
     routerTestOverrides.shouldFail = false;
   }
 
+  private static matchDeterministicLocalCommand(queryText: string): RoutingDecision | null {
+    if (!queryText || typeof queryText !== 'string') return null;
+    const trimmed = queryText.trim();
+
+    // Check for VS Code local launch commands
+    // Matches: "open VS Code", "open vscode", "launch VS Code", "launch vscode", "open <folder> in VS Code", etc.
+    const vscodePattern = /^(?:open|launch)\s+(?:(.*?)\s+in\s+)?(?:vs\s*code|vscode)$/i;
+    const match = trimmed.match(vscodePattern);
+
+    if (match) {
+      const folderArg = match[1] ? match[1].trim() : 'GIA-AI';
+      return {
+        route: 'tool',
+        reason: 'Matched deterministic local desktop VS Code command.',
+        requires_memory: false,
+        requires_rag: false,
+        requires_tool: true,
+        tool: {
+          name: 'open_folder_in_vscode',
+          args: { folderName: folderArg || 'GIA-AI' },
+        },
+        deterministic: true,
+      };
+    }
+
+    return null;
+  }
+
   static async route(queryText: string, userId: string): Promise<RoutingDecision> {
     const start = Date.now();
 
@@ -52,7 +81,18 @@ export class AgentRouter {
       return isValid ? routerTestOverrides.mockDecision : SAFE_FALLBACK_ROUTE;
     }
 
-    // 2. Perform Routing LLM Call
+    // 2. Deterministic local command detection (bypasses LLM)
+    const localMatch = this.matchDeterministicLocalCommand(queryText);
+    if (localMatch) {
+      logger.info({
+        msg: 'Deterministic local command matched, bypassing LLM router',
+        queryText,
+        tool: localMatch.tool?.name,
+      });
+      return localMatch;
+    }
+
+    // 3. Perform Routing LLM Call
     try {
       const systemPrompt = `You are the Routing Router for GIA, a personal intelligent assistant.
 Your task is to analyze the user's input query and determine the most appropriate routing path.

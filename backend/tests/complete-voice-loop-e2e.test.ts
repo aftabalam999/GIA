@@ -99,8 +99,8 @@ describe('GIA Phase 11: Complete Voice Loop E2E Verification Suite', () => {
   it('should verify the 10-step complete voice loop sequence across multi-turn utterances', async () => {
     // Mock STT / Fastify / Orchestrator / TTS API implementations
     const mockTranscribeApi = vi.fn()
-      .mockResolvedValueOnce({ text: 'What time is it in Tokyo?' })
-      .mockResolvedValueOnce({ text: 'What are my stored memories?' });
+      .mockResolvedValueOnce({ text: 'Afiya What time is it in Tokyo?' })
+      .mockResolvedValueOnce({ text: 'Hey Afiya What are my stored memories?' });
 
     const mockChatApi = vi.fn().mockImplementation(async (convoId: string, text: string) => {
       // Create NormalizedUserInput model matching Fastify voice contract
@@ -140,7 +140,7 @@ describe('GIA Phase 11: Complete Voice Loop E2E Verification Suite', () => {
     });
 
     // 1. Enable Voice Mode (VOICE_MODE = ON)
-    await vsm.startVoiceMode(testConvoId, 'jwt-token-123');
+    await vsm.startVoiceMode(testConvoId, 'jwt-token-123', false);
     expect(vsm.isVoiceModeOn).toBe(true);
     expect(vsm.state).toBe('LISTENING');
 

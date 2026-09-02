@@ -4,6 +4,7 @@ import {
   stopNativeMicrophoneTestCapture,
   base64ToBlob,
 } from './tauriMicrophone.js';
+import { voiceLatencyTracker } from './voiceLatencyTracker.js';
 
 export interface AudioRecorderCallbacks {
   onSpeechStart?: () => void;
@@ -50,8 +51,9 @@ export class AudioRecorderService {
       });
 
       // Setup Web Audio API AnalyserNode for volume VAD
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const AudioCtx = (typeof window !== 'undefined' ? (window.AudioContext || (window as any).webkitAudioContext) : null) || (globalThis as any).AudioContext;
       this.audioContext = new AudioCtx();
+      if (!this.audioContext) return;
       const source = this.audioContext.createMediaStreamSource(this.mediaStream);
       this.analyser = this.audioContext.createAnalyser();
       this.analyser.fftSize = 512;
@@ -77,7 +79,7 @@ export class AudioRecorderService {
         if (this.audioChunks.length > 0) {
           const audioBlob = new Blob(this.audioChunks, { type: mimeType });
           this.audioChunks = [];
-          if (this.callbacks.onUtteranceRecorded && this.isRecording) {
+          if (this.callbacks.onUtteranceRecorded && this.isRecording && !this.isPaused) {
             this.callbacks.onUtteranceRecorded(audioBlob);
           }
         }
@@ -150,6 +152,13 @@ export class AudioRecorderService {
   private monitorVolume() {
     if (!this.isRecording || !this.analyser) return;
 
+    if (this.isPaused) {
+      this.isSpeaking = false;
+      this.silenceStartTime = null;
+      this.animFrameId = requestAnimationFrame(() => this.monitorVolume());
+      return;
+    }
+
     const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
     this.analyser.getByteFrequencyData(dataArray);
 
@@ -166,6 +175,8 @@ export class AudioRecorderService {
     if (rms > this.VOLUME_THRESHOLD) {
       if (!this.isSpeaking) {
         this.isSpeaking = true;
+        voiceLatencyTracker.startUtterance();
+        voiceLatencyTracker.record('micSpeechStart');
         if (this.callbacks.onSpeechStart) {
           this.callbacks.onSpeechStart();
         }
@@ -178,6 +189,7 @@ export class AudioRecorderService {
         // Speech ended -> stop slice to emit Blob and start new recorder slice for continuous listening
         this.isSpeaking = false;
         this.silenceStartTime = null;
+        voiceLatencyTracker.record('micSpeechEnd');
 
         if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
           this.mediaRecorder.stop();
@@ -189,7 +201,7 @@ export class AudioRecorderService {
                 if (e.data.size > 0) this.audioChunks.push(e.data);
               };
               this.mediaRecorder.onstop = () => {
-                if (this.audioChunks.length > 0 && this.callbacks.onUtteranceRecorded && this.isRecording) {
+                if (this.audioChunks.length > 0 && this.callbacks.onUtteranceRecorded && this.isRecording && !this.isPaused) {
                   const audioBlob = new Blob(this.audioChunks);
                   this.audioChunks = [];
                   this.callbacks.onUtteranceRecorded(audioBlob);

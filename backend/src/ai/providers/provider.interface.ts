@@ -22,5 +22,5 @@ export interface LLMChunk {
 
 export interface LLMProvider {
   generate(request: LLMRequest, signal?: AbortSignal): Promise<LLMResponse>;
-  stream(request: LLMRequest): AsyncIterable<LLMChunk>;
+  stream(request: LLMRequest, signal?: AbortSignal): AsyncIterable<LLMChunk>;
 }

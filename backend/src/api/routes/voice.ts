@@ -3,6 +3,7 @@ import { authenticate } from '../middleware/auth.js';
 import { aiServiceClient } from '../../ai/ml-client/ai-service.client.js';
 import { AgentOrchestrator } from '../../ai/orchestrator/orchestrator.js';
 import { NormalizedUserInput } from '../../ai/orchestrator/input.model.js';
+import { WakeWordDetector } from '../../shared/wakeword.js';
 import {
   AIServiceUnavailableError,
   AIServiceTimeoutError,
@@ -170,10 +171,22 @@ export async function voiceRoutes(fastify: FastifyInstance) {
         correlationId,
       });
 
-      // 2. Build NormalizedUserInput structure for voice
+      // Wake-word activation filter: enforce strong activation phrase requirement
+      const wakeWordResult = WakeWordDetector.detect(transcription.text);
+      if (!wakeWordResult.detected || !wakeWordResult.command || wakeWordResult.command.trim().length === 0) {
+        return reply.status(200).send({
+          success: true,
+          userMessage: null,
+          assistantMessage: null,
+          ignored: true,
+          reason: 'No wake-word activation phrase detected or command empty',
+        });
+      }
+
+      // 2. Build NormalizedUserInput structure for voice with activation phrase stripped
       const normalizedVoiceInput: NormalizedUserInput = {
         inputType: 'voice',
-        content: transcription.text,
+        content: wakeWordResult.command,
         userId,
         conversationId,
         requestId,

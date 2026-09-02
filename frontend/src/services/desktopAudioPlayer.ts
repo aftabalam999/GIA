@@ -21,6 +21,8 @@ export class DesktopAudioPlayer {
   private _startTime: number = 0;
   private _pauseOffset: number = 0;
   private _isPlaying: boolean = false;
+  private _playPromiseResolve: (() => void) | null = null;
+  private _playPromiseReject: ((err: Error) => void) | null = null;
 
   constructor(callbacks: DesktopAudioPlayerCallbacks = {}) {
     this._callbacks = callbacks;
@@ -46,6 +48,24 @@ export class DesktopAudioPlayer {
     }
   }
 
+  private _resolveActivePromise(): void {
+    if (this._playPromiseResolve) {
+      const resolve = this._playPromiseResolve;
+      this._playPromiseResolve = null;
+      this._playPromiseReject = null;
+      resolve();
+    }
+  }
+
+  private _rejectActivePromise(err: Error): void {
+    if (this._playPromiseReject) {
+      const reject = this._playPromiseReject;
+      this._playPromiseResolve = null;
+      this._playPromiseReject = null;
+      reject(err);
+    }
+  }
+
   /**
    * Initializes or returns active Web Audio API AudioContext.
    */
@@ -65,31 +85,48 @@ export class DesktopAudioPlayer {
 
   /**
    * Decodes binary audio data (WAV/MP3) and begins playback.
+   * Returns a Promise that resolves when playback completes (sourceNode.onended or stop/pause).
    */
   public async play(audioData: ArrayBuffer | Buffer): Promise<void> {
+    this.stop(); // Stop any active playback first & resolve previous promise if any
+
+    const ctx = this.getOrCreateAudioContext();
+    
+    // Convert Buffer to ArrayBuffer if needed
+    let bufferToDecode: ArrayBuffer;
+    if (typeof Buffer !== 'undefined' && Buffer.isBuffer(audioData)) {
+      bufferToDecode = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength) as ArrayBuffer;
+    } else {
+      bufferToDecode = audioData as ArrayBuffer;
+    }
+
     try {
-      this.stop(); // Stop any active playback first
-
-      const ctx = this.getOrCreateAudioContext();
-      
-      // Convert Buffer to ArrayBuffer if needed
-      let bufferToDecode: ArrayBuffer;
-      if (typeof Buffer !== 'undefined' && Buffer.isBuffer(audioData)) {
-        bufferToDecode = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength) as ArrayBuffer;
-      } else {
-        bufferToDecode = audioData as ArrayBuffer;
-      }
-
       this._audioBuffer = await ctx.decodeAudioData(bufferToDecode.slice(0));
-      this._pauseOffset = 0;
-      this._startSourceNode(0);
     } catch (err: any) {
       this.setState('ERROR');
       if (this._callbacks.onError) {
         this._callbacks.onError('Audio playback failed: ' + (err.message || String(err)));
       }
       this.setState('STOPPED');
+      throw err;
     }
+
+    this._pauseOffset = 0;
+
+    return new Promise<void>((resolve, reject) => {
+      this._playPromiseResolve = resolve;
+      this._playPromiseReject = reject;
+      try {
+        this._startSourceNode(0);
+      } catch (err: any) {
+        this.setState('ERROR');
+        if (this._callbacks.onError) {
+          this._callbacks.onError('Audio playback failed: ' + (err.message || String(err)));
+        }
+        this.setState('STOPPED');
+        this._rejectActivePromise(err);
+      }
+    });
   }
 
   private _startSourceNode(offset: number): void {
@@ -102,6 +139,9 @@ export class DesktopAudioPlayer {
     this._startTime = this._audioContext.currentTime - offset;
 
     this._sourceNode.onended = () => {
+      if (this._sourceNode) {
+        this._sourceNode.onended = null;
+      }
       if (this._state === 'PLAYING') {
         this._isPlaying = false;
         this.setState('STOPPED');
@@ -109,6 +149,7 @@ export class DesktopAudioPlayer {
           this._callbacks.onEnded();
         }
       }
+      this._resolveActivePromise();
     };
 
     this._sourceNode.start(0, offset);
@@ -130,6 +171,7 @@ export class DesktopAudioPlayer {
       this._sourceNode = null;
       this._isPlaying = false;
       this.setState('PAUSED');
+      this._resolveActivePromise();
     } catch (err: any) {
       this.setState('ERROR');
       if (this._callbacks.onError) {
@@ -158,7 +200,7 @@ export class DesktopAudioPlayer {
    * Halts speech audio playback immediately and disposes nodes.
    */
   public stop(): void {
-    if (this._state === 'STOPPED') return;
+    if (this._state === 'STOPPED' && !this._playPromiseResolve) return;
 
     this.setState('STOPPING');
 
@@ -177,6 +219,7 @@ export class DesktopAudioPlayer {
     this._pauseOffset = 0;
     this._isPlaying = false;
     this.setState('STOPPED');
+    this._resolveActivePromise();
   }
 
   /**

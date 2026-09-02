@@ -1,24 +1,27 @@
 export interface ModelConfig {
-  provider: 'openai' | 'gemini' | 'anthropic' | 'mock';
+  provider: 'gemini' | 'mock';
   model: string;
 }
 
 export type ModelType = 'fast' | 'general' | 'reasoning';
 
 /**
- * Global mappings associating semantic model aliases to provider-specific targets.
+ * Centralized model configuration for Afiya.
+ * Google Gemini is the single source of conversational intelligence across all model slots.
  */
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.6-flash';
+
 export const ROUTER_CONFIGS: Record<ModelType, ModelConfig> = {
   fast: {
     provider: 'gemini',
-    model: 'gemini-3.6-flash',
+    model: DEFAULT_GEMINI_MODEL,
   },
   general: {
     provider: 'gemini',
-    model: 'gemini-3.6-flash', // switched from openai: no credits
+    model: DEFAULT_GEMINI_MODEL,
   },
   reasoning: {
-    provider: 'anthropic',
-    model: 'claude-3-5-sonnet-20241022',
+    provider: 'gemini',
+    model: DEFAULT_GEMINI_MODEL,
   },
 };

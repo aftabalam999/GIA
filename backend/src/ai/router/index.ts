@@ -1,9 +1,7 @@
 import { config } from '../../config/index.js';
 import { LLMProvider, LLMRequest, LLMResponse, LLMChunk } from '../providers/provider.interface.js';
 import { MockProvider } from '../providers/mock.provider.js';
-import { OpenAIProvider } from '../providers/openai.provider.js';
 import { GeminiProvider } from '../providers/gemini.provider.js';
-import { AnthropicProvider } from '../providers/anthropic.provider.js';
 import { ModelRunRepository } from '../../database/repositories/modelRun.repository.js';
 import { logger } from '../../shared/logger.js';
 import { ROUTER_CONFIGS, ModelType } from './config.js';
@@ -12,7 +10,7 @@ import { withRetryAndTimeout } from '../../shared/retry.js';
 let testProviderOverride: LLMProvider | null = null;
 
 /**
- * Instantiates the appropriate LLM provider based on config mapping.
+ * Instantiates GeminiProvider as Afiya's single source of conversational intelligence.
  */
 export function getProviderInstance(providerName: string, modelName: string): LLMProvider {
   if (testProviderOverride) return testProviderOverride;
@@ -21,16 +19,8 @@ export function getProviderInstance(providerName: string, modelName: string): LL
     return new MockProvider();
   }
 
-  switch (providerName) {
-    case 'openai':
-      return new OpenAIProvider(config.OPENAI_API_KEY || '', modelName);
-    case 'gemini':
-      return new GeminiProvider(config.GOOGLE_AI_API_KEY || '', modelName);
-    case 'anthropic':
-      return new AnthropicProvider(config.ANTHROPIC_API_KEY || '', modelName);
-    default:
-      return new MockProvider();
-  }
+  // Gemini is the single conversational AI provider
+  return new GeminiProvider(config.GOOGLE_AI_API_KEY || '', modelName);
 }
 
 /**
@@ -118,7 +108,7 @@ export class LLMGateway {
         errMsg.includes('rate limit') ||
         errMsg.includes('rate_limit');
 
-      if (isQuotaOrRateLimit && !testProviderOverride) {
+      if (isQuotaOrRateLimit && !testProviderOverride && config.NODE_ENV === 'test') {
         logger.warn({ msg: `Primary LLM provider '${modelConfig.provider}' hit rate limit (${err.message}). Attempting fallback provider...` });
         try {
           const fallbackProvider = new MockProvider();
@@ -134,7 +124,11 @@ export class LLMGateway {
     }
   }
 
-  static async *stream(request: LLMRequest, options: GatewayOptions = {}): AsyncIterable<LLMChunk> {
+  static async *stream(
+    request: LLMRequest,
+    options: GatewayOptions = {},
+    signal?: AbortSignal
+  ): AsyncIterable<LLMChunk> {
     const modelType = options.modelType ?? 'general';
     const modelConfig = ROUTER_CONFIGS[modelType];
     const provider = getProviderInstance(modelConfig.provider, modelConfig.model);
@@ -142,8 +136,9 @@ export class LLMGateway {
     let fullText = '';
 
     try {
-      const stream = provider.stream(request);
+      const stream = provider.stream(request, signal);
       for await (const chunk of stream) {
+        if (signal?.aborted) break;
         fullText += chunk.content;
         yield chunk;
       }

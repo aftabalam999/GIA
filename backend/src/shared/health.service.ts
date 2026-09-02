@@ -215,19 +215,8 @@ export class HealthService {
   }
 
   private static async probeLLMProvider(provider: string): Promise<'healthy' | 'unhealthy' | 'unconfigured'> {
-    switch (provider) {
-      case 'openai':
-        if (!config.OPENAI_API_KEY) return 'unconfigured';
-        return this.probeOpenAI(config.OPENAI_API_KEY);
-      case 'gemini':
-        if (!config.GOOGLE_AI_API_KEY) return 'unconfigured';
-        return this.probeGemini(config.GOOGLE_AI_API_KEY);
-      case 'anthropic':
-        if (!config.ANTHROPIC_API_KEY) return 'unconfigured';
-        return this.probeAnthropic(config.ANTHROPIC_API_KEY);
-      default:
-        return 'unconfigured';
-    }
+    if (!config.GOOGLE_AI_API_KEY) return 'unconfigured';
+    return this.probeGemini(config.GOOGLE_AI_API_KEY);
   }
 
   private static async probeOpenAI(apiKey: string): Promise<'healthy' | 'unhealthy'> {

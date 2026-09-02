@@ -6,7 +6,7 @@ export class GeminiProvider implements LLMProvider {
   private apiKey: string;
   private defaultModel: string;
 
-  constructor(apiKey: string, defaultModel = 'gemini-2.5-flash-preview-tts') {
+  constructor(apiKey: string, defaultModel = 'gemini-3.6-flash') {
     this.apiKey = apiKey;
     this.defaultModel = defaultModel;
   }
@@ -61,7 +61,13 @@ export class GeminiProvider implements LLMProvider {
     };
   }
 
-  async *stream(request: LLMRequest): AsyncIterable<LLMChunk> {
+  async *stream(request: LLMRequest, signal?: AbortSignal): AsyncIterable<LLMChunk> {
+    if (signal?.aborted) {
+      const err = new Error('Operation aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
+
     const contents = request.messages.map((m) => {
       const role = m.role === 'assistant' ? 'model' : 'user';
       return {
@@ -77,11 +83,17 @@ export class GeminiProvider implements LLMProvider {
       };
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.defaultModel}:streamGenerateContent?key=${this.apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.defaultModel}:streamGenerateContent?alt=sse&key=${this.apiKey}`;
+    logger.info({
+      msg: '🌐 [GEMINI API STREAM] Streaming content from Google Gemini Generative Language API',
+      model: this.defaultModel,
+    });
+
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal,
     });
 
     if (!response.ok) {
@@ -95,20 +107,26 @@ export class GeminiProvider implements LLMProvider {
     }
 
     for await (const chunk of bodyStream) {
+      if (signal?.aborted) {
+        break;
+      }
       const text = new TextDecoder('utf-8').decode(chunk as any);
       try {
-        // Strip array wrappers if present
-        const cleanText = text.trim().replace(/^\[/, '').replace(/\]$/, '').trim();
-        if (!cleanText) continue;
+        const lines = text.split('\n');
+        for (const line of lines) {
+          if (signal?.aborted) break;
+          const trimmed = line.trim();
+          if (!trimmed) continue;
 
-        const objects = cleanText.split('\n');
-        for (const obj of objects) {
-          const trimmedObj = obj.trim();
-          if (!trimmedObj) continue;
+          let jsonStr = trimmed;
+          if (trimmed.startsWith('data:')) {
+            jsonStr = trimmed.slice(5).trim();
+          } else {
+            jsonStr = trimmed.replace(/^\[/, '').replace(/\]$/, '').replace(/^,/, '').trim();
+          }
+          if (!jsonStr || jsonStr === '[DONE]') continue;
 
-          // Strip comma prefix if streaming inside array
-          const cleanObj = trimmedObj.replace(/^,/, '').trim();
-          const data = JSON.parse(cleanObj);
+          const data = JSON.parse(jsonStr);
           const chunkText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
           if (chunkText) {
             yield { content: chunkText };

@@ -26,6 +26,7 @@ export interface AgentState {
   maxSteps: number;
   stepsHistory: Array<{ node: string; timestamp: string }>;
   error?: string;
+  deterministic?: boolean;
 }
 
 export class AgentOrchestrator {
@@ -195,6 +196,9 @@ export class AgentOrchestrator {
 
   private static async planningNode(state: AgentState): Promise<void> {
     const decision = await AgentRouter.route(state.inputQuery, state.userId);
+    if (decision.deterministic) {
+      state.deterministic = true;
+    }
 
     // Apply the parsed routing decision
     if (decision.route === 'tool' && decision.tool) {
@@ -269,6 +273,28 @@ export class AgentOrchestrator {
   }
 
   private static async respondingNode(state: AgentState): Promise<void> {
+    // 1. Deterministic response bypass (bypasses LLM output synthesis)
+    if (state.deterministic) {
+      const executedTool = state.toolCalls[0];
+      if (executedTool) {
+        if (executedTool.error) {
+          state.finalResponse = `Failed to execute local command: ${executedTool.error}`;
+        } else if (executedTool.result?.error) {
+          state.finalResponse = `Failed to execute local command: ${executedTool.result.error}`;
+        } else if (executedTool.result?.folderOpened) {
+          state.finalResponse = `VS Code opened successfully for "${executedTool.result.folderOpened}".`;
+        } else if (executedTool.result?.message) {
+          state.finalResponse = executedTool.result.message;
+        } else {
+          state.finalResponse = `Local command "${executedTool.name}" executed successfully.`;
+        }
+      } else {
+        state.finalResponse = 'Local command processed successfully.';
+      }
+      state.currentNode = 'done';
+      return;
+    }
+
     let retrievedText = '';
 
     if (state.retrievedContext.memories.length > 0) {

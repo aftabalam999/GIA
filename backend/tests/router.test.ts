@@ -55,6 +55,60 @@ describe('GIA Agent Router & Policy Validation Tests', () => {
   });
 
   describe('AgentRouter.route() Direct Unit Tests', () => {
+    it('should deterministically route "open VS Code" to open_folder_in_vscode without calling Gemini LLM', async () => {
+      const decision = await AgentRouter.route('open VS Code', 'test-user-id');
+      expect(decision.route).toBe('tool');
+      expect(decision.requires_tool).toBe(true);
+      expect(decision.tool?.name).toBe('open_folder_in_vscode');
+      expect(decision.deterministic).toBe(true);
+    });
+
+    it('should deterministically route "open vscode" to open_folder_in_vscode without calling Gemini LLM', async () => {
+      const decision = await AgentRouter.route('open vscode', 'test-user-id');
+      expect(decision.route).toBe('tool');
+      expect(decision.requires_tool).toBe(true);
+      expect(decision.tool?.name).toBe('open_folder_in_vscode');
+      expect(decision.deterministic).toBe(true);
+    });
+
+    it('should deterministically route "launch VS Code" to open_folder_in_vscode without calling Gemini LLM', async () => {
+      const decision = await AgentRouter.route('launch VS Code', 'test-user-id');
+      expect(decision.route).toBe('tool');
+      expect(decision.requires_tool).toBe(true);
+      expect(decision.tool?.name).toBe('open_folder_in_vscode');
+      expect(decision.deterministic).toBe(true);
+    });
+
+    it('should not match deterministic local router for general questions like "Explain recursion in JavaScript"', async () => {
+      mockProvider.responseContent = JSON.stringify({
+        route: 'direct_response',
+        reason: 'General explanation',
+        requires_memory: false,
+        requires_rag: false,
+        requires_tool: false,
+        tool: null,
+      });
+
+      const decision = await AgentRouter.route('Explain recursion in JavaScript', 'test-user-id');
+      expect(decision.deterministic).toBeUndefined();
+      expect(decision.route).toBe('direct_response');
+    });
+
+    it('should not match deterministic local router for questions mentioning VS Code like "Can you help me with VS Code?"', async () => {
+      mockProvider.responseContent = JSON.stringify({
+        route: 'direct_response',
+        reason: 'General conversation about VS Code',
+        requires_memory: false,
+        requires_rag: false,
+        requires_tool: false,
+        tool: null,
+      });
+
+      const decision = await AgentRouter.route('Can you help me with VS Code?', 'test-user-id');
+      expect(decision.deterministic).toBeUndefined();
+      expect(decision.route).toBe('direct_response');
+    });
+
     it('should route to direct_response for conversational queries', async () => {
       mockProvider.responseContent = JSON.stringify({
         route: 'direct_response',
@@ -221,7 +275,7 @@ describe('GIA Agent Router & Policy Validation Tests', () => {
       await app.register(agentRoutes, { prefix: '/api/v1' });
 
       await initializeDatabase();
-      await query('DELETE FROM users');
+      await query("DELETE FROM users WHERE email = 'router_test@gia.ai'");
 
       const signupRes = await app.inject({
         method: 'POST',
@@ -240,8 +294,7 @@ describe('GIA Agent Router & Policy Validation Tests', () => {
     });
 
     afterAll(async () => {
-      await query('DELETE FROM users');
-      await pool.end();
+      await query("DELETE FROM users WHERE email = 'router_test@gia.ai'");
     });
 
     it('should execute tool node when router returns tool decision', async () => {

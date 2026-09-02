@@ -6,7 +6,7 @@ export interface WakeWordResult {
 
 export class WakeWordDetector {
   /**
-   * Evaluates text for the GIA wake word.
+   * Evaluates text for the Afiya wake word.
    * If detected, returns the confidence score and the extracted command.
    */
   static detect(input: string): WakeWordResult {
@@ -16,9 +16,9 @@ export class WakeWordDetector {
 
     const trimmed = input.trim();
 
-    // Word boundary checks to avoid partial matches (e.g. "giant", "plagiarize")
+    // Word boundary checks to avoid partial matches (e.g. "afiyat", "plagiarize")
     // Captures optional greetings, punctuation delimiters, and politeness tokens
-    const wakeWordPattern = /^(?:hey|hello|hi|ok|okay)?\s*[,.:;]?\s*\bgia\b\s*[,.:;]?\s*(?:please)?\s*[,.:;]?\s*(.*)$/i;
+    const wakeWordPattern = /^(?:hey|hello|hi|ok|okay|yo)?\s*[,.:;!-]?\s*\bafiya\b\s*[,.:;!-]?\s*(?:please)?\s*[,.:;!-]?\s*(.*)$/i;
 
     const match = trimmed.match(wakeWordPattern);
     if (!match) {

@@ -148,11 +148,11 @@ describe('GIA Phase 7: STT + AI Orchestrator Integration Suite', () => {
   describe('End-to-End Fastify Voice Orchestration Endpoint', () => {
     it('POST /api/v1/conversations/:id/messages/voice should process audio, transcribe, and run orchestrator', async () => {
       const mockTranscription = {
-        text: 'What is the current time?',
-        language: 'en',
-        confidence: 0.98,
+        text: 'Afiya What is the current time?',
         duration: 1.5,
-        segments: [{ start: 0, end: 1.5, text: 'What is the current time?', confidence: 0.98 }],
+        confidence: 0.98,
+        language: 'en',
+        segments: [{ start: 0, end: 1.5, text: 'Afiya What is the current time?', confidence: 0.98 }],
         processing_time: 0.1,
       };
 
@@ -183,7 +183,7 @@ describe('GIA Phase 7: STT + AI Orchestrator Integration Suite', () => {
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(true);
-      expect(body.transcription.text).toBe('What is the current time?');
+      expect(body.transcription.text).toBe('Afiya What is the current time?');
       expect(body.userMessage.content).toBe('What is the current time?');
       expect(body.assistantMessage.content).toBeDefined();
       expect(body.runId).toBeDefined();
