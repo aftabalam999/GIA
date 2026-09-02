@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { VoiceStateMachine } from './voiceStateMachine.js';
 
 describe('VoiceStateMachine Command Session & State Guard Tests', () => {
-  it('should enforce wake-word outside session, allow continuous dialogue in active session, and return to wake-word listening on silence', async () => {
+  it('should process continuous dialogue directly in Voice Mode without wake words', async () => {
     const processedCommands: string[] = [];
     const mockTranscribe = vi.fn();
     const mockChat = vi.fn().mockImplementation((_convoId, text) => {
@@ -16,43 +16,34 @@ describe('VoiceStateMachine Command Session & State Guard Tests', () => {
     });
 
     await vsm.startVoiceMode('convo-1', 'token-1', false);
-    expect(vsm.isSessionActive).toBe(false);
+    expect(vsm.isVoiceModeOn).toBe(true);
 
-    // 1. Outside active session: "open VS Code" without wake word -> IGNORED
+    // 1. First spoken command: "open VS Code" -> PROCESSED DIRECTLY
     mockTranscribe.mockResolvedValueOnce({ text: 'open VS Code' });
     await vsm.processSpeechUtterance(new Uint8Array([1]) as any);
-    expect(processedCommands).toEqual([]);
-    expect(vsm.isSessionActive).toBe(false);
-
-    // 2. Wake phrase + command: "Afiya open VS Code" -> ENTERS SESSION & EXECUTES
-    mockTranscribe.mockResolvedValueOnce({ text: 'Afiya open VS Code' });
-    await vsm.processSpeechUtterance(new Uint8Array([2]) as any);
     expect(processedCommands).toEqual(['open VS Code']);
-    expect(vsm.isSessionActive).toBe(true);
 
-    // 3. Follow-up sentence in active session: "create a new file" -> EXECUTES WITHOUT WAKE WORD
+    // 2. Second spoken command: "create a new file" -> PROCESSED DIRECTLY
     mockTranscribe.mockResolvedValueOnce({ text: 'create a new file' });
-    await vsm.processSpeechUtterance(new Uint8Array([3]) as any);
+    await vsm.processSpeechUtterance(new Uint8Array([2]) as any);
     expect(processedCommands).toEqual(['open VS Code', 'create a new file']);
-    expect(vsm.isSessionActive).toBe(true);
 
-    // 4. Silence / empty transcript -> RESETS ACTIVE SESSION
+    // 3. Silence / empty transcript -> Cleanly stays in LISTENING state
     mockTranscribe.mockResolvedValueOnce({ text: '' });
-    await vsm.processSpeechUtterance(new Uint8Array([4]) as any);
-    expect(vsm.isSessionActive).toBe(false);
+    await vsm.processSpeechUtterance(new Uint8Array([3]) as any);
+    expect(vsm.state).toBe('LISTENING');
 
-    // 5. Outside active session again: "search React" without wake word -> IGNORED
+    // 4. Follow-up spoken command: "search React" -> PROCESSED DIRECTLY
     mockTranscribe.mockResolvedValueOnce({ text: 'search React' });
-    await vsm.processSpeechUtterance(new Uint8Array([5]) as any);
-    expect(processedCommands).toEqual(['open VS Code', 'create a new file']); // unchanged!
-    expect(vsm.isSessionActive).toBe(false);
+    await vsm.processSpeechUtterance(new Uint8Array([4]) as any);
+    expect(processedCommands).toEqual(['open VS Code', 'create a new file', 'search React']);
   });
 
   it('should ignore incoming audio events during non-listening states (TRANSCRIBING, PROCESSING, SYNTHESIZING, PLAYING)', async () => {
     let playResolver: (() => void) | null = null;
 
     const mockTranscribe = vi.fn().mockImplementation(async () => {
-      return { text: 'Afiya hello' };
+      return { text: 'hello Afiya' };
     });
 
     const mockChat = vi.fn().mockImplementation(async () => {

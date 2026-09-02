@@ -11,6 +11,10 @@ export interface VoiceLatencyTimestamps {
   completeResponsePlayback?: number;
 }
 
+/**
+ * VoiceLatencyTracker records high-resolution pipeline timestamps T0..T7 and derived interval metrics.
+ * Outputs clean structured logs with elapsed milliseconds relative to speech-end (+Xms).
+ */
 export class VoiceLatencyTracker {
   private timestamps: VoiceLatencyTimestamps = {};
   private active = false;
@@ -20,16 +24,30 @@ export class VoiceLatencyTracker {
       micSpeechStart: time,
     };
     this.active = true;
+    console.log('[VOICE] speech-start');
   }
 
   public record(event: keyof VoiceLatencyTimestamps, time = Date.now()): void {
     if (!this.active) return;
     if (event === 'micSpeechStart') {
       this.timestamps.micSpeechStart = time;
+      console.log('[VOICE] speech-start');
       return;
     }
     if (this.timestamps[event] === undefined) {
       this.timestamps[event] = time;
+
+      const ref = this.timestamps.micSpeechEnd || this.timestamps.micSpeechStart || time;
+      const elapsed = Math.max(0, time - ref);
+
+      if (event === 'micSpeechEnd') console.log(`[VOICE] speech-end       +0ms`);
+      else if (event === 'sttFinalTranscript') console.log(`[VOICE] turn-finalized   +${elapsed}ms`);
+      else if (event === 'geminiRequestStart') console.log(`[VOICE] gemini-input-sent +${elapsed}ms`);
+      else if (event === 'firstGeminiTextChunk') console.log(`[VOICE] first-text-chunk +${elapsed}ms`);
+      else if (event === 'firstSpeechReadyChunk') console.log(`[VOICE] first-speech-chunk +${elapsed}ms`);
+      else if (event === 'firstTtsAudioReceived') console.log(`[VOICE] first-audio-chunk +${elapsed}ms`);
+      else if (event === 'firstAudioPlayback') console.log(`[VOICE] playback-start   +${elapsed}ms`);
+      else if (event === 'completeResponsePlayback') console.log(`[VOICE] playback-end     +${elapsed}ms`);
     }
   }
 
@@ -48,24 +66,22 @@ export class VoiceLatencyTracker {
 
     const report = `
 📊 ================= AFIYA VOICE PIPELINE LATENCY REPORT =================
-⏱️  1. Microphone Speech Start    : ${t.micSpeechStart ? t.micSpeechStart + 'ms' : 'N/A'}
-⏱️  2. Microphone Speech End      : ${t.micSpeechEnd ? t.micSpeechEnd + 'ms' : 'N/A'}
-⏱️  3. STT Final Transcript       : ${t.sttFinalTranscript ? t.sttFinalTranscript + 'ms' : 'N/A'}
-⏱️  4. Gemini Request Start       : ${t.geminiRequestStart ? t.geminiRequestStart + 'ms' : 'N/A'}
-⏱️  5. First Gemini Text Chunk    : ${t.firstGeminiTextChunk ? t.firstGeminiTextChunk + 'ms' : 'N/A'}
-⏱️  6. First Speech-Ready Chunk   : ${t.firstSpeechReadyChunk ? t.firstSpeechReadyChunk + 'ms' : 'N/A'}
-⏱️  7. First TTS Request          : ${t.firstTtsRequest ? t.firstTtsRequest + 'ms' : 'N/A'}
-⏱️  8. First TTS Audio Received   : ${t.firstTtsAudioReceived ? t.firstTtsAudioReceived + 'ms' : 'N/A'}
-⏱️  9. First Audio Playback       : ${t.firstAudioPlayback ? t.firstAudioPlayback + 'ms' : 'N/A'}
-⏱️ 10. Complete Response Playback : ${t.completeResponsePlayback ? t.completeResponsePlayback + 'ms' : 'N/A'}
+⏱️  T0. Microphone Speech Start    : ${t.micSpeechStart ? t.micSpeechStart + 'ms' : 'N/A'}
+⏱️  T1. Microphone Speech End      : ${t.micSpeechEnd ? t.micSpeechEnd + 'ms' : 'N/A'}
+⏱️  T2. Turn Finalized (STT)       : ${t.sttFinalTranscript ? t.sttFinalTranscript + 'ms' : 'N/A'}
+⏱️  T3. Gemini Request Sent       : ${t.geminiRequestStart ? t.geminiRequestStart + 'ms' : 'N/A'}
+⏱️  T4. First Gemini Text Chunk    : ${t.firstGeminiTextChunk ? t.firstGeminiTextChunk + 'ms' : 'N/A'}
+⏱️  T5. First Speech-Ready Chunk   : ${t.firstSpeechReadyChunk ? t.firstSpeechReadyChunk + 'ms' : 'N/A'}
+⏱️  T6. First Audio Playback       : ${t.firstAudioPlayback ? t.firstAudioPlayback + 'ms' : 'N/A'}
+⏱️  T7. Complete Response Playback : ${t.completeResponsePlayback ? t.completeResponsePlayback + 'ms' : 'N/A'}
 
-📈 --- DERIVED LATENCY METRICS ---
-⚡ speech-end → STT-final              : ${speechEndToStt} ms
-⚡ STT-final → Gemini-first-token       : ${sttToGeminiFirstToken} ms
-⚡ Gemini-first-token → first-speech    : ${geminiFirstTokenToSpeechChunk} ms
-⚡ first-speech-chunk → first-audio     : ${speechChunkToFirstAudio} ms
-🚀 speech-end → first-Afiya-audio (TTFA): ${speechEndToFirstAudio} ms
-🏁 total response latency               : ${totalResponseLatency} ms
+📈 --- DERIVED INTERVAL METRICS ---
+⚡ Turn Finalization Latency (T2 - T1)     : ${speechEndToStt} ms
+⚡ Gemini First-Response Latency (T4 - T3) : ${sttToGeminiFirstToken} ms
+⚡ Speech Chunking Latency                 : ${geminiFirstTokenToSpeechChunk} ms
+⚡ Audio Playback Startup Latency (T6 - T5): ${speechChunkToFirstAudio} ms
+🚀 Perceived Latency (TTFA = T6 - T1)      : ${speechEndToFirstAudio} ms
+🏁 Total Turn Duration                     : ${totalResponseLatency} ms
 ========================================================================`;
 
     if (typeof process === 'undefined' || process.env.NODE_ENV !== 'production') {

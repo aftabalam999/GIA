@@ -21,6 +21,7 @@ import { agentRoutes } from './api/routes/agent.js';
 
 import fastifyMultipart from '@fastify/multipart';
 import { voiceRoutes } from './api/routes/voice.js';
+import { voiceLiveRoutes } from './api/routes/voiceLive.js';
 
 const fastify = Fastify({
   logger: false, // Custom logger handled separately
@@ -143,6 +144,7 @@ await fastify.register(documentRoutes, { prefix: '/api/v1' });
 await fastify.register(toolRoutes, { prefix: '/api/v1' });
 await fastify.register(agentRoutes, { prefix: '/api/v1' });
 await fastify.register(voiceRoutes, { prefix: '/api/v1' });
+await fastify.register(voiceLiveRoutes, { prefix: '/api/v1' });
 
 async function start() {
   try {

@@ -16,13 +16,14 @@ export interface StreamingAudioQueueCallbacks {
 /**
  * StreamingAudioQueue coordinates concurrent TTS synthesis and strictly ordered,
  * non-overlapping audio playback for Afiya's real-time voice pipeline.
+ * Supports response generation versioning to discard late audio chunks upon interruption.
  */
 export class StreamingAudioQueue {
   private adapter: TTSPlayerAdapter;
   private callbacks: StreamingAudioQueueCallbacks;
 
-  private textQueue: Array<{ index: number; text: string }> = [];
-  private audioMap: Map<number, ArrayBuffer> = new Map();
+  private textQueue: Array<{ index: number; text: string; genId: number }> = [];
+  private audioMap: Map<number, { data: ArrayBuffer; genId: number }> = new Map();
   private failedMap: Map<number, boolean> = new Map();
 
   private nextSynthesizeIndex: number = 0;
@@ -30,10 +31,20 @@ export class StreamingAudioQueue {
   private isStreamCompleted: boolean = false;
   private isPlayingLoop: boolean = false;
   private isCancelled: boolean = false;
+  private currentGenId: number = 0;
 
-  constructor(adapter: TTSPlayerAdapter, callbacks: StreamingAudioQueueCallbacks = {}) {
+  constructor(adapter: TTSPlayerAdapter, callbacks: StreamingAudioQueueCallbacks = {}, genId: number = 0) {
     this.adapter = adapter;
     this.callbacks = callbacks;
+    this.currentGenId = genId;
+  }
+
+  public get generationId(): number {
+    return this.currentGenId;
+  }
+
+  public setGenerationId(genId: number): void {
+    this.currentGenId = genId;
   }
 
   public get pendingChunksCount(): number {
@@ -47,14 +58,15 @@ export class StreamingAudioQueue {
   /**
    * Enqueues a speech-ready text chunk for immediate TTS synthesis and ordered playback.
    */
-  public pushChunk(text: string): number {
+  public pushChunk(text: string, genId: number = this.currentGenId): number {
     if (this.isCancelled || !text || text.trim().length === 0) return -1;
+    if (genId !== this.currentGenId) return -1;
 
     const index = this.nextSynthesizeIndex++;
-    this.textQueue.push({ index, text });
+    this.textQueue.push({ index, text, genId });
 
     // Trigger concurrent synthesis asynchronously
-    this.synthesizeNext(index, text);
+    this.synthesizeNext(index, text, genId);
 
     // Trigger playback processing
     this.processPlaybackLoop();
@@ -76,6 +88,7 @@ export class StreamingAudioQueue {
    */
   public cancel(): void {
     this.isCancelled = true;
+    this.currentGenId++; // Increment generation to invalidate all pending async callbacks
     this.textQueue = [];
     this.audioMap.clear();
     this.failedMap.clear();
@@ -92,22 +105,22 @@ export class StreamingAudioQueue {
   /**
    * Asynchronously synthesizes TTS audio for a specific chunk index.
    */
-  private async synthesizeNext(index: number, text: string): Promise<void> {
+  private async synthesizeNext(index: number, text: string, genId: number): Promise<void> {
     if (index === 0) {
       voiceLatencyTracker.record('firstTtsRequest');
     }
     try {
       const audioData = await this.adapter.synthesize(text);
-      if (this.isCancelled) return;
+      if (this.isCancelled || genId !== this.currentGenId) return;
 
       if (index === 0) {
         voiceLatencyTracker.record('firstTtsAudioReceived');
       }
 
-      this.audioMap.set(index, audioData);
+      this.audioMap.set(index, { data: audioData, genId });
       this.processPlaybackLoop();
     } catch (err: any) {
-      if (this.isCancelled) return;
+      if (this.isCancelled || genId !== this.currentGenId) return;
 
       this.failedMap.set(index, true);
       if (this.callbacks.onError) {
@@ -135,7 +148,16 @@ export class StreamingAudioQueue {
         // Play next ordered chunk if audio data is ready in map
         if (this.audioMap.has(this.nextPlayIndex)) {
           const currentIndex = this.nextPlayIndex;
-          const audioBuffer = this.audioMap.get(currentIndex)!;
+          const item = this.audioMap.get(currentIndex)!;
+
+          // Discard late audio chunks from prior interrupted generation
+          if (item.genId !== this.currentGenId || this.isCancelled) {
+            this.audioMap.delete(currentIndex);
+            this.nextPlayIndex++;
+            continue;
+          }
+
+          const audioBuffer = item.data;
           this.audioMap.delete(currentIndex);
 
           const textItem = this.textQueue.find((t) => t.index === currentIndex);
@@ -151,6 +173,8 @@ export class StreamingAudioQueue {
 
           // Await physical audio completion (sourceNode.onended)
           await this.adapter.player.play(audioBuffer);
+
+          if (this.isCancelled || item.genId !== this.currentGenId) break;
 
           if (this.callbacks.onChunkEnd) {
             this.callbacks.onChunkEnd(currentIndex);

@@ -5,9 +5,12 @@ import {
   base64ToBlob,
 } from './tauriMicrophone.js';
 import { voiceLatencyTracker } from './voiceLatencyTracker.js';
+import { LocalVAD } from './localVad.js';
 
 export interface AudioRecorderCallbacks {
   onSpeechStart?: () => void;
+  onSpeechEnd?: () => void;
+  onInterruption?: () => void;
   onUtteranceRecorded?: (blob: Blob) => void;
   onError?: (errMessage: string) => void;
 }
@@ -20,18 +23,68 @@ export class AudioRecorderService {
   private animFrameId: number | null = null;
 
   private isRecording: boolean = false;
-  private isSpeaking: boolean = false;
-  private silenceStartTime: number | null = null;
+  private isPaused: boolean = false;
   private audioChunks: Blob[] = [];
 
   private callbacks: AudioRecorderCallbacks = {};
+  private vad: LocalVAD;
+
+  public get isSpeaking(): boolean {
+    return this.vad.isSpeaking;
+  }
+
+  public setBargeInMode(enabled: boolean): void {
+    this.vad.setBargeInMode(enabled);
+  }
 
   // VAD Volume parameters
-  private readonly VOLUME_THRESHOLD = 0.015; // Normalized volume threshold for speech detection
-  private readonly SILENCE_DURATION_MS = 1200; // 1.2s silence triggers end of utterance
+  private readonly VOLUME_THRESHOLD = 0.015;
+  private readonly SILENCE_DURATION_MS = 650;
 
   constructor(callbacks: AudioRecorderCallbacks = {}) {
     this.callbacks = callbacks;
+    this.vad = new LocalVAD(
+      {
+        speechThreshold: this.VOLUME_THRESHOLD,
+        silenceDurationMs: this.SILENCE_DURATION_MS,
+      },
+      {
+        onSpeechStart: () => {
+          voiceLatencyTracker.startUtterance();
+          voiceLatencyTracker.record('micSpeechStart');
+          if (this.callbacks.onSpeechStart) {
+            this.callbacks.onSpeechStart();
+          }
+        },
+        onInterruption: () => {
+          if (this.callbacks.onInterruption) {
+            this.callbacks.onInterruption();
+          }
+        },
+        onSpeechEnd: () => {
+          voiceLatencyTracker.record('micSpeechEnd');
+          if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+            this.mediaRecorder.stop();
+            setTimeout(() => {
+              if (this.isRecording && this.mediaStream) {
+                this.mediaRecorder = new MediaRecorder(this.mediaStream);
+                this.mediaRecorder.ondataavailable = (e) => {
+                  if (e.data.size > 0) this.audioChunks.push(e.data);
+                };
+                this.mediaRecorder.onstop = () => {
+                  if (this.audioChunks.length > 0 && this.callbacks.onUtteranceRecorded && this.isRecording && !this.isPaused) {
+                    const audioBlob = new Blob(this.audioChunks);
+                    this.audioChunks = [];
+                    this.callbacks.onUtteranceRecorded(audioBlob);
+                  }
+                };
+                this.mediaRecorder.start(100);
+              }
+            }, 200);
+          }
+        },
+      }
+    );
   }
 
   public setCallbacks(callbacks: AudioRecorderCallbacks) {
@@ -86,8 +139,7 @@ export class AudioRecorderService {
       };
 
       this.isRecording = true;
-      this.isSpeaking = false;
-      this.silenceStartTime = null;
+      this.vad.start();
 
       this.mediaRecorder.start(100); // 100ms timeslice
       this.monitorVolume();
@@ -96,6 +148,7 @@ export class AudioRecorderService {
       const nativePerm = await requestNativeMicrophonePermission();
       if (nativePerm.status === 'GRANTED') {
         this.isRecording = true;
+        this.vad.start();
         this.startNativeCaptureLoop();
         return;
       }
@@ -108,14 +161,14 @@ export class AudioRecorderService {
     }
   }
 
-  private isPaused: boolean = false;
-
   public pause() {
     this.isPaused = true;
+    this.vad.setAudioInputEnabled(false);
   }
 
   public resume() {
     this.isPaused = false;
+    this.vad.setAudioInputEnabled(true);
   }
 
   private async startNativeCaptureLoop() {
@@ -153,8 +206,6 @@ export class AudioRecorderService {
     if (!this.isRecording || !this.analyser) return;
 
     if (this.isPaused) {
-      this.isSpeaking = false;
-      this.silenceStartTime = null;
       this.animFrameId = requestAnimationFrame(() => this.monitorVolume());
       return;
     }
@@ -170,57 +221,16 @@ export class AudioRecorderService {
     }
     const rms = Math.sqrt(sum / dataArray.length);
 
-    const now = Date.now();
-
-    if (rms > this.VOLUME_THRESHOLD) {
-      if (!this.isSpeaking) {
-        this.isSpeaking = true;
-        voiceLatencyTracker.startUtterance();
-        voiceLatencyTracker.record('micSpeechStart');
-        if (this.callbacks.onSpeechStart) {
-          this.callbacks.onSpeechStart();
-        }
-      }
-      this.silenceStartTime = null;
-    } else if (this.isSpeaking) {
-      if (this.silenceStartTime === null) {
-        this.silenceStartTime = now;
-      } else if (now - this.silenceStartTime >= this.SILENCE_DURATION_MS) {
-        // Speech ended -> stop slice to emit Blob and start new recorder slice for continuous listening
-        this.isSpeaking = false;
-        this.silenceStartTime = null;
-        voiceLatencyTracker.record('micSpeechEnd');
-
-        if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
-          this.mediaRecorder.stop();
-          // Restart recorder slice for continuous listening loop
-          setTimeout(() => {
-            if (this.isRecording && this.mediaStream) {
-              this.mediaRecorder = new MediaRecorder(this.mediaStream);
-              this.mediaRecorder.ondataavailable = (e) => {
-                if (e.data.size > 0) this.audioChunks.push(e.data);
-              };
-              this.mediaRecorder.onstop = () => {
-                if (this.audioChunks.length > 0 && this.callbacks.onUtteranceRecorded && this.isRecording && !this.isPaused) {
-                  const audioBlob = new Blob(this.audioChunks);
-                  this.audioChunks = [];
-                  this.callbacks.onUtteranceRecorded(audioBlob);
-                }
-              };
-              this.mediaRecorder.start(100);
-            }
-          }, 200);
-        }
-      }
-    }
+    // Delegate VAD speech start / end detection to LocalVAD
+    this.vad.processAudioFrame(rms);
 
     this.animFrameId = requestAnimationFrame(() => this.monitorVolume());
   }
 
   public stop() {
     this.isRecording = false;
-    this.isSpeaking = false;
-    this.silenceStartTime = null;
+    this.isPaused = false;
+    this.vad.stop();
 
     stopNativeMicrophoneTestCapture().catch(() => {});
 

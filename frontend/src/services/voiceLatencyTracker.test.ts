@@ -23,15 +23,15 @@ describe('VoiceLatencyTracker Unit Test Suite', () => {
     tracker.finishAndReport();
 
     expect(consoleSpy).toHaveBeenCalled();
-    const logOutput = consoleSpy.mock.calls[0][0];
+    const logOutput = consoleSpy.mock.calls.map((c) => c[0]).join('\n');
 
     expect(logOutput).toContain('AFIYA VOICE PIPELINE LATENCY REPORT');
-    expect(logOutput).toContain('speech-end → STT-final              : 300 ms');
-    expect(logOutput).toContain('STT-final → Gemini-first-token       : 250 ms');
-    expect(logOutput).toContain('Gemini-first-token → first-speech    : 10 ms');
-    expect(logOutput).toContain('first-speech-chunk → first-audio     : 350 ms');
-    expect(logOutput).toContain('speech-end → first-Afiya-audio (TTFA): 910 ms');
-    expect(logOutput).toContain('total response latency               : 4500 ms');
+    expect(logOutput).toContain('Turn Finalization Latency (T2 - T1)     : 300 ms');
+    expect(logOutput).toContain('Gemini First-Response Latency (T4 - T3) : 250 ms');
+    expect(logOutput).toContain('Speech Chunking Latency                 : 10 ms');
+    expect(logOutput).toContain('Audio Playback Startup Latency (T6 - T5): 350 ms');
+    expect(logOutput).toContain('Perceived Latency (TTFA = T6 - T1)      : 910 ms');
+    expect(logOutput).toContain('Total Turn Duration                     : 4500 ms');
 
     consoleSpy.mockRestore();
   });

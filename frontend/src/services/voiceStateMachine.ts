@@ -2,13 +2,15 @@
  * GIA Phase 8: Continuous Voice Mode State Machine
  * Operates persistent voice mode cycle:
  * IDLE -> STARTING -> LISTENING -> SPEECH_DETECTED -> TRANSCRIBING -> PROCESSING -> SYNTHESIZING -> PLAYING -> LISTENING
+ * Interruption transition: SYNTHESIZING / PLAYING -> INTERRUPTED -> LISTENING
  * Stop transitions: STOP_REQUESTED -> STOPPING -> IDLE
  */
 
-import { detectWakeWord } from '../utils/wakeWord.js';
 import { voiceLatencyTracker } from './voiceLatencyTracker.js';
 import { SpeechTextChunker } from './textChunker.js';
 import { StreamingAudioQueue } from './streamingAudioQueue.js';
+
+import { LiveVoiceController } from './liveVoiceController.js';
 
 export type VoiceState =
   | 'IDLE'
@@ -19,6 +21,7 @@ export type VoiceState =
   | 'PROCESSING'
   | 'SYNTHESIZING'
   | 'PLAYING'
+  | 'INTERRUPTED'
   | 'STOP_REQUESTED'
   | 'STOPPING';
 
@@ -29,11 +32,13 @@ export interface VoiceStateMachineCallbacks {
   onError?: (errorMsg: string) => void;
   onPauseCapture?: () => void;
   onResumeCapture?: () => void;
+  onSetBargeInMode?: (enabled: boolean) => void;
   fetchTranscribeApi?: (audio: Blob | Buffer) => Promise<any>;
   fetchChatApi?: (convoId: string, text: string) => Promise<any>;
   fetchStreamChatApi?: (convoId: string, text: string, onChunk: (chunk: string) => void) => Promise<any>;
   fetchTtsApi?: (text: string) => Promise<ArrayBuffer | Buffer>;
   playAudioApi?: (audioBuffer: ArrayBuffer | Buffer) => Promise<void>;
+  enableLiveMode?: boolean;
 }
 
 export class VoiceStateMachine {
@@ -46,6 +51,9 @@ export class VoiceStateMachine {
   private _activeAbortController: AbortController | null = null;
   private _isProcessingUtterance: boolean = false;
   private _streamingQueue: StreamingAudioQueue | null = null;
+  private _currentGenerationId: number = 0;
+  private _liveController: LiveVoiceController | null = null;
+  private _isLiveMode: boolean = false;
 
   constructor(callbacks: VoiceStateMachineCallbacks = {}) {
     this._callbacks = callbacks;
@@ -63,6 +71,18 @@ export class VoiceStateMachine {
     return this._isSessionActive;
   }
 
+  public get isLiveMode(): boolean {
+    return this._isLiveMode;
+  }
+
+  public get liveController(): LiveVoiceController | null {
+    return this._liveController;
+  }
+
+  public get currentGenerationId(): number {
+    return this._currentGenerationId;
+  }
+
   public resetSession(): void {
     this._isSessionActive = false;
   }
@@ -78,6 +98,43 @@ export class VoiceStateMachine {
   private setState(newState: VoiceState) {
     const prevState = this._state;
     this._state = newState;
+
+    // Authoritative Microphone Input & Barge-In Policy
+    if (newState === 'LISTENING' || newState === 'SPEECH_DETECTED' || newState === 'INTERRUPTED') {
+      console.log(`[VOICE] ${newState.toLowerCase()}`);
+      console.log('[VOICE] microphone-enabled');
+      if (this._callbacks.onSetBargeInMode) {
+        this._callbacks.onSetBargeInMode(false);
+      }
+      if (this._callbacks.onResumeCapture) {
+        this._callbacks.onResumeCapture();
+      }
+    } else if (newState === 'SYNTHESIZING' || newState === 'PLAYING') {
+      console.log(`[VOICE] ${newState.toLowerCase()}`);
+      console.log('[VOICE] microphone-disabled-bargein-enabled');
+      if (this._callbacks.onPauseCapture) {
+        this._callbacks.onPauseCapture();
+      }
+      if (this._callbacks.onSetBargeInMode) {
+        this._callbacks.onSetBargeInMode(true);
+      }
+    } else if (
+      newState === 'IDLE' ||
+      newState === 'PROCESSING' ||
+      newState === 'TRANSCRIBING' ||
+      newState === 'STOP_REQUESTED' ||
+      newState === 'STOPPING'
+    ) {
+      console.log(`[VOICE] ${newState.toLowerCase()}`);
+      console.log('[VOICE] microphone-disabled');
+      if (this._callbacks.onSetBargeInMode) {
+        this._callbacks.onSetBargeInMode(false);
+      }
+      if (this._callbacks.onPauseCapture) {
+        this._callbacks.onPauseCapture();
+      }
+    }
+
     if (prevState !== newState && this._callbacks.onStateChange) {
       this._callbacks.onStateChange(newState);
     }
@@ -87,7 +144,7 @@ export class VoiceStateMachine {
 
   /**
    * Explicitly enables persistent continuous Voice Mode (VOICE_MODE = ON).
-   * Plays introductory welcome greeting when activated.
+   * Attempts Gemini Live mode first, falling back to STT/TTS pipeline if unavailable.
    */
   public async startVoiceMode(conversationId: string, token: string, speakWelcome = true): Promise<void> {
     if (this._isVoiceModeOn) return;
@@ -99,53 +156,42 @@ export class VoiceStateMachine {
 
     this.setState('STARTING');
 
-    if (speakWelcome && this._callbacks.fetchTtsApi) {
-      if (this._callbacks.onPauseCapture) {
-        this._callbacks.onPauseCapture();
-      }
-
+    const liveEnabled = this._callbacks.enableLiveMode !== false;
+    if (liveEnabled) {
       try {
-        const welcomeText = VoiceStateMachine.WELCOME_GREETING;
+        const controller = new LiveVoiceController(this, {
+          onStateChange: (s) => this.setState(s),
+          onTranscript: (t) => {
+            if (this._callbacks.onTranscript) this._callbacks.onTranscript(t);
+          },
+          onAssistantResponse: (u, a) => {
+            if (this._callbacks.onAssistantResponse) this._callbacks.onAssistantResponse(u, a);
+          },
+          onError: (err) => this.handleError(err),
+        });
 
-        this.setState('SYNTHESIZING');
-        let audioBuffer: ArrayBuffer | Buffer | null = null;
-        try {
-          audioBuffer = await this._callbacks.fetchTtsApi(welcomeText);
-        } catch {
-          // If TTS synthesis fails, fall back cleanly to listening mode
+        await controller.start(conversationId, token);
+        this._liveController = controller;
+        this._isLiveMode = true;
+      } catch (err: any) {
+        console.warn('[VOICE] Gemini Live initialization failed. Falling back to STT/TTS pipeline:', err.message);
+        this._isLiveMode = false;
+        this._liveController = null;
+      }
+    }
+
+    if (speakWelcome && this._callbacks.fetchTtsApi && this._callbacks.playAudioApi) {
+      try {
+        const audioBuf = await this._callbacks.fetchTtsApi(VoiceStateMachine.WELCOME_GREETING);
+        if (this._callbacks.onAssistantResponse) {
+          this._callbacks.onAssistantResponse(null, { content: VoiceStateMachine.WELCOME_GREETING });
         }
-
-        if (this.checkStopRequested()) return;
-
-        if (audioBuffer) {
+        if (audioBuf && this._isVoiceModeOn) {
           this.setState('PLAYING');
-
-          if (this._callbacks.onAssistantResponse) {
-            this._callbacks.onAssistantResponse(null, {
-              id: 'welcome-' + Date.now(),
-              role: 'assistant',
-              content: welcomeText,
-              created_at: new Date().toISOString(),
-            });
-          }
-
-          if (this._callbacks.playAudioApi) {
-            await this._callbacks.playAudioApi(audioBuffer);
-          } else {
-            await new Promise((resolve) => setTimeout(resolve, 50));
-          }
-
-          if (this.checkStopRequested()) return;
-
-          // 400ms acoustic guard delay to clear room reverb/echo
-          await new Promise((resolve) => setTimeout(resolve, 400));
+          await this._callbacks.playAudioApi(audioBuf);
         }
       } catch (err: any) {
-        // Handle welcome greeting error gracefully
-      } finally {
-        if (this._callbacks.onResumeCapture) {
-          this._callbacks.onResumeCapture();
-        }
+        console.warn('[VOICE] Welcome greeting play failed:', err.message);
       }
     }
 
@@ -155,23 +201,26 @@ export class VoiceStateMachine {
   }
 
   /**
-   * Explicitly stops persistent continuous Voice Mode (VOICE_MODE = OFF).
-   * Cleanly cancels active capture, fetch requests, or audio playback at any point.
+   * Disables continuous Voice Mode and resets pipeline state.
    */
   public async stopVoiceMode(): Promise<void> {
-    if (!this._isVoiceModeOn && this._state === 'IDLE') return;
+    if (!this._isVoiceModeOn) return;
 
     this._isVoiceModeOn = false;
-    this._isSessionActive = false;
-    this.setState('STOP_REQUESTED');
+    this._currentGenerationId++;
 
-    // Clean up active fetch requests and streaming audio queue
-    if (this._streamingQueue) {
+    if (this._liveController) {
       try {
-        this._streamingQueue.cancel();
+        this._liveController.stop();
       } catch {
         // ignore
       }
+      this._liveController = null;
+    }
+    this._isLiveMode = false;
+
+    if (this._streamingQueue) {
+      this._streamingQueue.cancel();
       this._streamingQueue = null;
     }
 
@@ -184,6 +233,7 @@ export class VoiceStateMachine {
       this._activeAbortController = null;
     }
 
+    this.setState('STOP_REQUESTED');
     this.setState('STOPPING');
 
     // Reset parameters
@@ -203,17 +253,56 @@ export class VoiceStateMachine {
   }
 
   /**
+   * Triggers user interruption / barge-in while Afiya is speaking.
+   * Immediately halts playback, increments response generation ID to drop late audio chunks,
+   * and re-arms microphone for continuous listening.
+   */
+  public handleInterruption(): void {
+    if (!this._isVoiceModeOn) return;
+    if (this._state !== 'SYNTHESIZING' && this._state !== 'PLAYING' && this._state !== 'PROCESSING' && this._state !== 'SPEECH_DETECTED' && this._state !== 'TRANSCRIBING') return;
+
+    console.log('[VOICE] interrupted');
+    this._currentGenerationId++;
+
+    if (this._isLiveMode && this._liveController) {
+      this._liveController.handleInterruption();
+    }
+
+    if (this._activeAbortController) {
+      try {
+        this._activeAbortController.abort();
+      } catch {
+        // ignore
+      }
+      this._activeAbortController = null;
+    }
+
+    if (this._streamingQueue) {
+      this._streamingQueue.cancel();
+      this._streamingQueue = null;
+    }
+
+    this._isProcessingUtterance = false;
+    this.setState('INTERRUPTED');
+
+    if (this._isVoiceModeOn) {
+      this.setState('LISTENING');
+    }
+  }
+
+  /**
    * Processes a captured speech audio utterance through the continuous pipeline:
    * TRANSCRIBING -> PROCESSING -> SYNTHESIZING -> PLAYING -> LISTENING
    */
   public async processSpeechUtterance(audioBlob: Blob | Buffer): Promise<void> {
-    if (!this._isVoiceModeOn || this._isProcessingUtterance) return;
+    if (!this._isVoiceModeOn || this._isProcessingUtterance || this._isLiveMode) return;
     if (this._state !== 'LISTENING' && this._state !== 'SPEECH_DETECTED') return;
 
     this._isProcessingUtterance = true;
+    const utteranceGenId = ++this._currentGenerationId;
     this._activeAbortController = new AbortController();
 
-    // Echo prevention: mute mic capture while processing utterance and playing audio
+    // Mute mic input while processing utterance
     if (this._callbacks.onPauseCapture) {
       this._callbacks.onPauseCapture();
     }
@@ -233,66 +322,27 @@ export class VoiceStateMachine {
         voiceLatencyTracker.record('sttFinalTranscript');
       }
 
+      if (this.checkInterrupted(utteranceGenId)) return;
+
       if (!transcriptText || transcriptText.trim().length === 0) {
         // Pure silence or empty transcription -> end active session & cleanly return to LISTENING
         this._isSessionActive = false;
         this._isProcessingUtterance = false;
-        if (this._callbacks.onResumeCapture) {
-          this._callbacks.onResumeCapture();
-        }
         if (this._isVoiceModeOn) {
           this.setState('LISTENING');
         }
         return;
       }
 
-      // Command-Session & Wake-word / Greeting Evaluation
-      const wakeWordRes = detectWakeWord(transcriptText);
-      let commandText = '';
-
-      if (wakeWordRes.isAuthorized) {
-        // Strong wake phrase with "GIA" detected -> Authorize & Enter/Refresh active command session
-        this._isSessionActive = true;
-
-        if (wakeWordRes.command && wakeWordRes.command.trim().length > 0) {
-          commandText = wakeWordRes.command;
-        } else {
-          // Spoke wake phrase only (e.g. "Hey Gia") -> Active session enabled for next sentence
-          this._isProcessingUtterance = false;
-          if (this._callbacks.onResumeCapture) {
-            this._callbacks.onResumeCapture();
-          }
-          if (this._isVoiceModeOn) {
-            this.setState('LISTENING');
-          }
-          return;
-        }
-      } else if (wakeWordRes.isGreeting) {
-        // Standalone conversational greeting (e.g. "Hi", "Hello", "What's up?")
-        // Enables active session for dialogue, but DOES NOT authorize tool/command execution
-        this._isSessionActive = true;
-        commandText = wakeWordRes.command;
-      } else if (this._isSessionActive) {
-        // Active command session in progress -> Continue natural conversational voice flow without requiring "GIA"
-        commandText = transcriptText.trim();
-      } else {
-        // Outside active session & not a greeting & no GIA wake word -> Ignore transcript
-        this._isProcessingUtterance = false;
-        if (this._callbacks.onResumeCapture) {
-          this._callbacks.onResumeCapture();
-        }
-        if (this._isVoiceModeOn) {
-          this.setState('LISTENING');
-        }
-        return;
-      }
+      // Directly process captured user speech when Voice Mode is ON
+      const commandText = transcriptText.trim();
+      this._isSessionActive = true;
 
       if (this._callbacks.onTranscript) {
         this._callbacks.onTranscript(commandText);
       }
 
-      // Check if user requested stop during STT
-      if (this.checkStopRequested()) return;
+      if (this.checkInterrupted(utteranceGenId)) return;
 
       // 2. PROCESSING: Send command to AI Orchestrator & Stream Speech Chunks
       this.setState('PROCESSING');
@@ -307,6 +357,7 @@ export class VoiceStateMachine {
         this._streamingQueue = new StreamingAudioQueue(
           {
             synthesize: async (t) => {
+              if (this.checkInterrupted(utteranceGenId)) return new ArrayBuffer(0);
               this.setState('SYNTHESIZING');
               const res = await ttsApi(t);
               if (res instanceof ArrayBuffer) return res;
@@ -317,6 +368,7 @@ export class VoiceStateMachine {
             },
             player: {
               play: async (buf: ArrayBuffer | Buffer) => {
+                if (this.checkInterrupted(utteranceGenId)) return;
                 this.setState('PLAYING');
                 await playApi(buf);
               },
@@ -329,23 +381,24 @@ export class VoiceStateMachine {
             onError: (err) => {
               this.handleError('TTS streaming error: ' + err.message);
             },
-          }
+          },
+          utteranceGenId
         );
       }
 
       const chunker = new SpeechTextChunker();
       const pushSpeechChunk = (sc: string) => {
-        if (this.checkStopRequested()) return;
+        if (this.checkInterrupted(utteranceGenId)) return;
         voiceLatencyTracker.record('firstSpeechReadyChunk');
         this.setState('SYNTHESIZING');
         if (this._streamingQueue) {
-          this._streamingQueue.pushChunk(sc);
+          this._streamingQueue.pushChunk(sc, utteranceGenId);
         }
       };
 
       if (this._callbacks.fetchStreamChatApi && this._conversationId) {
         await this._callbacks.fetchStreamChatApi(this._conversationId, commandText, (tokenChunk: string) => {
-          if (this.checkStopRequested()) return;
+          if (this.checkInterrupted(utteranceGenId)) return;
           voiceLatencyTracker.record('firstGeminiTextChunk');
           assistantReplyText += tokenChunk;
           const speechChunks = chunker.push(tokenChunk);
@@ -353,6 +406,8 @@ export class VoiceStateMachine {
             pushSpeechChunk(sc);
           }
         });
+
+        if (this.checkInterrupted(utteranceGenId)) return;
 
         const finalChunks = chunker.flush();
         for (const sc of finalChunks) {
@@ -364,6 +419,8 @@ export class VoiceStateMachine {
         }
       } else if (this._callbacks.fetchChatApi && this._conversationId) {
         const chatRes = await this._callbacks.fetchChatApi(this._conversationId, commandText);
+        if (this.checkInterrupted(utteranceGenId)) return;
+
         assistantReplyText = chatRes?.assistantMessage?.content || chatRes?.data?.assistantMessage?.content || '';
         if (this._callbacks.onAssistantResponse) {
           this._callbacks.onAssistantResponse(chatRes.userMessage, chatRes.assistantMessage);
@@ -387,9 +444,9 @@ export class VoiceStateMachine {
         }
       }
 
-      if (this.checkStopRequested()) return;
+      if (this.checkInterrupted(utteranceGenId)) return;
 
-      // 3. SYNTHESIZING / PLAYING: Await audio playback completion if non-streaming or queue fallback
+      // 3. SYNTHESIZING / PLAYING: Await audio playback completion
       if (!this._streamingQueue) {
         this.setState('SYNTHESIZING');
         let audioBuffer: ArrayBuffer | Buffer | null = null;
@@ -397,7 +454,7 @@ export class VoiceStateMachine {
           audioBuffer = await this._callbacks.fetchTtsApi(assistantReplyText);
         }
 
-        if (this.checkStopRequested()) return;
+        if (this.checkInterrupted(utteranceGenId)) return;
 
         this.setState('PLAYING');
         if (this._callbacks.playAudioApi && audioBuffer) {
@@ -409,7 +466,7 @@ export class VoiceStateMachine {
         // Wait for streaming audio queue to finish playing all chunks
         await new Promise<void>((resolve) => {
           const checkInterval = setInterval(() => {
-            if (this.checkStopRequested() || !this._streamingQueue || this._streamingQueue.isComplete || !this._isVoiceModeOn) {
+            if (this.checkInterrupted(utteranceGenId) || !this._streamingQueue || this._streamingQueue.isComplete || !this._isVoiceModeOn) {
               clearInterval(checkInterval);
               resolve();
             }
@@ -417,7 +474,7 @@ export class VoiceStateMachine {
         });
       }
 
-      if (this.checkStopRequested()) return;
+      if (this.checkInterrupted(utteranceGenId)) return;
 
       // 4. CONTINUOUS LOOP TRANSITION: Fast turn-taking re-arm (50ms guard delay)
       this._isProcessingUtterance = false;
@@ -425,10 +482,6 @@ export class VoiceStateMachine {
       this._streamingQueue = null;
 
       await new Promise((resolve) => setTimeout(resolve, 50));
-
-      if (this._callbacks.onResumeCapture) {
-        this._callbacks.onResumeCapture();
-      }
 
       if (this._isVoiceModeOn) {
         this.setState('LISTENING');
@@ -439,11 +492,8 @@ export class VoiceStateMachine {
       this._isProcessingUtterance = false;
       this._activeAbortController = null;
 
-      if (this._callbacks.onResumeCapture) {
-        this._callbacks.onResumeCapture();
-      }
-
-      if (err.name === 'AbortError' || (this._state as string) === 'STOPPING' || (this._state as string) === 'STOP_REQUESTED') {
+      const s = this._state as string;
+      if (err.name === 'AbortError' || s === 'INTERRUPTED' || s === 'STOPPING' || s === 'STOP_REQUESTED') {
         // Clean cancellation
         return;
       }
@@ -459,18 +509,18 @@ export class VoiceStateMachine {
     }
   }
 
-  private checkStopRequested(): boolean {
-    if (!this._isVoiceModeOn || this._state === 'STOP_REQUESTED' || this._state === 'STOPPING') {
+  private checkInterrupted(expectedGenId: number): boolean {
+    if (!this._isVoiceModeOn || this._currentGenerationId !== expectedGenId || this._state === 'INTERRUPTED' || this._state === 'STOP_REQUESTED' || this._state === 'STOPPING') {
       this._isProcessingUtterance = false;
-      this.setState('IDLE');
       return true;
     }
     return false;
   }
 
-  private handleError(msg: string): void {
+  private handleError(errorMsg: string): void {
+    console.error('[VoiceStateMachine Error]:', errorMsg);
     if (this._callbacks.onError) {
-      this._callbacks.onError(msg);
+      this._callbacks.onError(errorMsg);
     }
   }
 }

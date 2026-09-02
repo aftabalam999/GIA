@@ -184,14 +184,14 @@ describe('GIA Phase 7: STT + AI Orchestrator Integration Suite', () => {
       const body = JSON.parse(res.body);
       expect(body.success).toBe(true);
       expect(body.transcription.text).toBe('Afiya What is the current time?');
-      expect(body.userMessage.content).toBe('What is the current time?');
+      expect(body.userMessage.content).toBe('Afiya What is the current time?');
       expect(body.assistantMessage.content).toBeDefined();
       expect(body.runId).toBeDefined();
 
       // Verify conversation history stored the message
       const history = await MessageRepository.findByConversationId(convoId);
       const lastUserMsg = history.filter((m) => m.role === 'user').pop();
-      expect(lastUserMsg?.content).toBe('What is the current time?');
+      expect(lastUserMsg?.content).toBe('Afiya What is the current time?');
       expect((lastUserMsg?.metadata as any).inputType).toBe('voice');
     });
   });

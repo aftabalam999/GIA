@@ -31,7 +31,7 @@ describe('GIA Phase 8: Voice State Machine Integration & Lifecycle Suite', () =>
   });
 
   it('should execute complete state loop: TRANSCRIBING -> PROCESSING -> SYNTHESIZING -> PLAYING -> LISTENING', async () => {
-    const mockTranscribe = vi.fn().mockResolvedValue({ text: 'Afiya open Chrome' });
+    const mockTranscribe = vi.fn().mockResolvedValue({ text: 'open Chrome' });
     const mockChat = vi.fn().mockResolvedValue({
       userMessage: { content: 'open Chrome' },
       assistantMessage: { content: 'Hello user' },
@@ -71,8 +71,8 @@ describe('GIA Phase 8: Voice State Machine Integration & Lifecycle Suite', () =>
 
   it('should execute multiple utterances continuously without turning voice mode off', async () => {
     const mockTranscribe = vi.fn()
-      .mockResolvedValueOnce({ text: 'Afiya Utterance 1' })
-      .mockResolvedValueOnce({ text: 'Hey Afiya Utterance 2' });
+      .mockResolvedValueOnce({ text: 'Utterance 1' })
+      .mockResolvedValueOnce({ text: 'Utterance 2' });
 
     const mockChat = vi.fn()
       .mockResolvedValueOnce({ assistantMessage: { content: 'Response 1' } })
