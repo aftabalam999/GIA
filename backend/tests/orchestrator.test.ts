@@ -1,13 +1,15 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import fastifyJwt from '@fastify/jwt';
 import fastifyCookie from '@fastify/cookie';
-import { agentRoutes } from '../src/api/routes/agent.ts';
-import { conversationRoutes } from '../src/api/routes/conversations.ts';
+import { agentRoutes } from '../src/api/routes/agent.js';
+import { conversationRoutes } from '../src/api/routes/conversations.js';
 import { authRoutes } from '../src/api/routes/auth.js';
 import { errorHandler } from '../src/api/middleware/errorHandler.js';
 import { initializeDatabase, pool, query } from '../src/database/client.js';
+import { LLMGateway, setTestProvider } from '../src/ai/router/index.js';
+import { MockProvider } from '../src/ai/providers/mock.provider.js';
 
 describe('GIA Agent Orchestration Integration Tests', () => {
   const app = Fastify();
@@ -16,6 +18,7 @@ describe('GIA Agent Orchestration Integration Tests', () => {
   let convoId: string;
 
   beforeAll(async () => {
+    setTestProvider(new MockProvider());
     app.setErrorHandler(errorHandler);
     await app.register(cors);
     await app.register(fastifyCookie);
@@ -27,7 +30,7 @@ describe('GIA Agent Orchestration Integration Tests', () => {
     await app.register(agentRoutes, { prefix: '/api/v1' });
 
     await initializeDatabase();
-    await query('DELETE FROM users');
+    await query("DELETE FROM users WHERE email = 'agent_orchestrator@gia.ai'");
 
     const signupRes = await app.inject({
       method: 'POST',
@@ -49,11 +52,69 @@ describe('GIA Agent Orchestration Integration Tests', () => {
   });
 
   afterAll(async () => {
-    await query('DELETE FROM users');
+    setTestProvider(null);
+    await query("DELETE FROM users WHERE email = 'agent_orchestrator@gia.ai'");
     await pool.end();
   });
 
   describe('Agent State Machine & Transitions', () => {
+    it('should formulate plan without LLM generation and require explicit approval before execution for "open VS Code"', async () => {
+      const spy = vi.spyOn(LLMGateway, 'generate');
+      spy.mockClear();
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/conversations/${convoId}/messages/agent`,
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: { content: 'open VS Code' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.plan).toBeDefined();
+      expect(body.plan.objective).toContain('Visual Studio Code');
+      expect(body.assistantMessage.content).toContain('Execution Plan Formulated');
+
+      // Verify LLMGateway.generate was called ZERO times across plan formulation!
+      expect(spy).toHaveBeenCalledTimes(0);
+
+      // Verify explicit approval requirement is enforced (Phase 2 & 3)
+      const approveRes = await app.inject({
+        method: 'POST',
+        url: `/api/v1/conversations/${convoId}/messages/agent`,
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: { content: 'approve' },
+      });
+
+      expect(approveRes.statusCode).toBe(200);
+      const approveBody = JSON.parse(approveRes.body);
+      expect(approveBody.success).toBe(true);
+      expect(approveBody.assistantMessage.content).toContain('approved and executed');
+
+      spy.mockRestore();
+    });
+
+    it('should call LLMGateway.generate() for normal non-deterministic commands', async () => {
+      const spy = vi.spyOn(LLMGateway, 'generate');
+      spy.mockClear();
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/conversations/${convoId}/messages/agent`,
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: { content: 'Compare TypeScript vs JavaScript' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+
+      // Verify LLMGateway.generate WAS called for normal AI query
+      expect(spy.mock.calls.length).toBeGreaterThan(0);
+      spy.mockRestore();
+    });
+
     it('should successfully run the state machine through: planning -> retrieval -> responding -> done', async () => {
       const res = await app.inject({
         method: 'POST',

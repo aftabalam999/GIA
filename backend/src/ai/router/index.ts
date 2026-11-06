@@ -1,9 +1,7 @@
 import { config } from '../../config/index.js';
 import { LLMProvider, LLMRequest, LLMResponse, LLMChunk } from '../providers/provider.interface.js';
 import { MockProvider } from '../providers/mock.provider.js';
-import { OpenAIProvider } from '../providers/openai.provider.js';
-import { GeminiProvider } from '../providers/gemini.provider.js';
-import { AnthropicProvider } from '../providers/anthropic.provider.js';
+import { LocalQwenProvider } from '../providers/qwen.provider.js';
 import { ModelRunRepository } from '../../database/repositories/modelRun.repository.js';
 import { logger } from '../../shared/logger.js';
 import { ROUTER_CONFIGS, ModelType } from './config.js';
@@ -12,7 +10,8 @@ import { withRetryAndTimeout } from '../../shared/retry.js';
 let testProviderOverride: LLMProvider | null = null;
 
 /**
- * Instantiates the appropriate LLM provider based on config mapping.
+ * Instantiates LocalQwenProvider as GIA's single local inference engine.
+ * Qwen 3.5 4B runs locally on the Python AI inference service with no external network calls.
  */
 export function getProviderInstance(providerName: string, modelName: string): LLMProvider {
   if (testProviderOverride) return testProviderOverride;
@@ -21,16 +20,8 @@ export function getProviderInstance(providerName: string, modelName: string): LL
     return new MockProvider();
   }
 
-  switch (providerName) {
-    case 'openai':
-      return new OpenAIProvider(config.OPENAI_API_KEY || '', modelName);
-    case 'gemini':
-      return new GeminiProvider(config.GOOGLE_AI_API_KEY || '', modelName);
-    case 'anthropic':
-      return new AnthropicProvider(config.ANTHROPIC_API_KEY || '', modelName);
-    default:
-      return new MockProvider();
-  }
+  // Qwen is the single local conversational and reasoning AI provider
+  return new LocalQwenProvider(config.AI_SERVICE_URL, modelName);
 }
 
 /**
@@ -47,7 +38,7 @@ export interface GatewayOptions {
 }
 
 /**
- * GIA LLM Gateway centralizing model routing, timeout retries, and database run logging.
+ * GIA LLM Gateway centralizing local Qwen model execution, timeout retries, and database run logging.
  */
 export class LLMGateway {
   static async generate(request: LLMRequest, options: GatewayOptions = {}): Promise<LLMResponse> {
@@ -57,7 +48,7 @@ export class LLMGateway {
     const start = Date.now();
 
     logger.info({
-      msg: `🤖 [LLM GATEWAY] Requesting LLM completion`,
+      msg: `🤖 [LLM GATEWAY] Requesting local LLM completion`,
       slot: modelType,
       targetProvider: modelConfig.provider,
       targetModel: modelConfig.model,
@@ -72,7 +63,7 @@ export class LLMGateway {
       const latency = Date.now() - start;
 
       logger.info({
-        msg: `✅ [LLM GATEWAY] LLM execution succeeded`,
+        msg: `✅ [LLM GATEWAY] Local LLM execution succeeded`,
         provider: response.provider,
         model: response.model,
         latencyMs: latency,
@@ -110,31 +101,15 @@ export class LLMGateway {
         errors: err.message,
       }).catch((logErr) => logger.error({ msg: 'Failed to log failed model run metrics', err: logErr.message }));
 
-      const errMsg = (err?.message || '').toLowerCase();
-      const isQuotaOrRateLimit =
-        errMsg.includes('429') ||
-        errMsg.includes('quota') ||
-        errMsg.includes('resource_exhausted') ||
-        errMsg.includes('rate limit') ||
-        errMsg.includes('rate_limit');
-
-      if (isQuotaOrRateLimit && !testProviderOverride) {
-        logger.warn({ msg: `Primary LLM provider '${modelConfig.provider}' hit rate limit (${err.message}). Attempting fallback provider...` });
-        try {
-          const fallbackProvider = new MockProvider();
-          const fallbackRes = await fallbackProvider.generate(request);
-          logger.info({ msg: `Successfully recovered using fallback provider 'mock'` });
-          return fallbackRes;
-        } catch {
-          // ignore
-        }
-      }
-
       throw err;
     }
   }
 
-  static async *stream(request: LLMRequest, options: GatewayOptions = {}): AsyncIterable<LLMChunk> {
+  static async *stream(
+    request: LLMRequest,
+    options: GatewayOptions = {},
+    signal?: AbortSignal
+  ): AsyncIterable<LLMChunk> {
     const modelType = options.modelType ?? 'general';
     const modelConfig = ROUTER_CONFIGS[modelType];
     const provider = getProviderInstance(modelConfig.provider, modelConfig.model);
@@ -142,8 +117,9 @@ export class LLMGateway {
     let fullText = '';
 
     try {
-      const stream = provider.stream(request);
+      const stream = provider.stream(request, signal);
       for await (const chunk of stream) {
+        if (signal?.aborted) break;
         fullText += chunk.content;
         yield chunk;
       }
@@ -180,6 +156,7 @@ export class LLMGateway {
     }
   }
 }
+
 export function getLLMProvider(): LLMProvider {
-  return getProviderInstance('mock', 'mock-model');
+  return getProviderInstance('qwen', 'Qwen3.5-4B');
 }

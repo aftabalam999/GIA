@@ -12,13 +12,13 @@ async def get_embedding_status():
         return EmbeddingStatusResponse(
             is_ready=False,
             model_name="none",
-            dimension=1536,
+            dimension=384,
             device="cpu"
         )
     return EmbeddingStatusResponse(
         is_ready=service.is_ready(),
-        model_name=getattr(service, "model_name", "text-embedding-3-small"),
-        dimension=getattr(service, "dimension", 1536),
+        model_name=getattr(service, "model_name", "all-MiniLM-L6-v2"),
+        dimension=getattr(service, "dimension", 384),
         device=getattr(service, "device", "cpu")
     )
 

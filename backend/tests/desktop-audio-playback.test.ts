@@ -89,7 +89,7 @@ describe('GIA Phase 10: Tauri Desktop Audio Playback & Feedback Control Suite', 
   it('should suppress audio feedback (prevent GIA from transcribing her own output while PLAYING)', async () => {
     await vsm.startVoiceMode('convo-123', 'token-abc');
 
-    const mockTranscribe = vi.fn().mockResolvedValue({ text: 'Hello' });
+    const mockTranscribe = vi.fn().mockResolvedValue({ text: 'Hey Afiya, Hello' });
     const mockChat = vi.fn().mockResolvedValue({ assistantMessage: { content: 'Hi there' } });
     const mockTts = vi.fn().mockResolvedValue(new ArrayBuffer(10));
 
@@ -124,7 +124,7 @@ describe('GIA Phase 10: Tauri Desktop Audio Playback & Feedback Control Suite', 
     await vsm.startVoiceMode('convo-123', 'token-abc');
 
     vsm.setCallbacks({
-      fetchTranscribeApi: vi.fn().mockResolvedValue({ text: 'Interruption test' }),
+      fetchTranscribeApi: vi.fn().mockResolvedValue({ text: 'Hey Afiya, Interruption test' }),
       fetchChatApi: vi.fn().mockResolvedValue({ assistantMessage: { content: 'Speaking text...' } }),
       fetchTtsApi: vi.fn().mockResolvedValue(new ArrayBuffer(10)),
       playAudioApi: (buf) => player.play(buf),

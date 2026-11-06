@@ -31,9 +31,9 @@ describe('GIA Phase 8: Voice State Machine Integration & Lifecycle Suite', () =>
   });
 
   it('should execute complete state loop: TRANSCRIBING -> PROCESSING -> SYNTHESIZING -> PLAYING -> LISTENING', async () => {
-    const mockTranscribe = vi.fn().mockResolvedValue({ text: 'Hello GIA' });
+    const mockTranscribe = vi.fn().mockResolvedValue({ text: 'open Chrome' });
     const mockChat = vi.fn().mockResolvedValue({
-      userMessage: { content: 'Hello GIA' },
+      userMessage: { content: 'open Chrome' },
       assistantMessage: { content: 'Hello user' },
     });
     const mockTts = vi.fn().mockResolvedValue(new ArrayBuffer(100));
@@ -46,7 +46,7 @@ describe('GIA Phase 8: Voice State Machine Integration & Lifecycle Suite', () =>
       playAudioApi: mockPlay,
     });
 
-    await vsm.startVoiceMode('convo-123', 'token-abc');
+    await vsm.startVoiceMode('convo-123', 'token-abc', false);
     stateHistory = []; // Reset after start
 
     vsm.handleSpeechStart();
@@ -64,7 +64,7 @@ describe('GIA Phase 8: Voice State Machine Integration & Lifecycle Suite', () =>
     expect(vsm.state).toBe('LISTENING');
     expect(vsm.isVoiceModeOn).toBe(true);
     expect(mockTranscribe).toHaveBeenCalledTimes(1);
-    expect(mockChat).toHaveBeenCalledWith('convo-123', 'Hello GIA');
+    expect(mockChat).toHaveBeenCalledWith('convo-123', 'open Chrome');
     expect(mockTts).toHaveBeenCalledWith('Hello user');
     expect(mockPlay).toHaveBeenCalledTimes(1);
   });

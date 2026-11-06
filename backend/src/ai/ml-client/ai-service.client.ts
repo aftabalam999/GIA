@@ -41,7 +41,7 @@ export class AIServiceClient {
     }
 
     const formData = new FormData();
-    const blob = new Blob([audio], { type: 'audio/wav' });
+    const blob = new Blob([new Uint8Array(audio)], { type: 'audio/wav' });
     formData.append('file', blob, filename);
     if (language) {
       formData.append('language', language);

@@ -65,11 +65,14 @@ export class DocumentChunkRepository {
     userId: string,
     embedding: number[],
     limit = 5,
-    threshold = 0.5
+    threshold = 0.5,
+    metadataFilter?: Record<string, any>,
+    documentId?: string
   ): Promise<ChunkSearchResult[]> {
     const vectorStr = `[${embedding.join(',')}]`;
+    
     // Cosine similarity matching joined on documents table to filter by user_id
-    const sql = `
+    let sql = `
       SELECT dc.id, dc.document_id, dc.content, dc.metadata, d.name AS title, d.file_url AS source_url,
              (1 - (dc.embedding <=> $1::vector)) as score
       FROM document_chunks dc
@@ -77,10 +80,26 @@ export class DocumentChunkRepository {
       WHERE d.user_id = $2 
         AND dc.embedding IS NOT NULL 
         AND (1 - (dc.embedding <=> $1::vector)) >= $3
-      ORDER BY score DESC
-      LIMIT $4
     `;
-    const res = await query<any>(sql, [vectorStr, userId, threshold, limit]);
+    const params: any[] = [vectorStr, userId, threshold];
+
+    if (documentId) {
+      params.push(documentId);
+      sql += ` AND dc.document_id = $${params.length}`;
+    }
+
+    if (metadataFilter && Object.keys(metadataFilter).length > 0) {
+      params.push(JSON.stringify(metadataFilter));
+      sql += ` AND dc.metadata @> $${params.length}::jsonb`;
+    }
+
+    sql += `
+      ORDER BY score DESC
+      LIMIT $${params.length + 1}
+    `;
+    params.push(limit);
+
+    const res = await query<any>(sql, params);
     return res.rows.map((row) => ({
       id: row.id,
       document_id: row.document_id,

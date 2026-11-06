@@ -19,37 +19,35 @@ export class PostgresVectorStore implements VectorStore {
     embedding: number[],
     limit = 5,
     threshold = 0.5,
-    category?: string
+    category?: string,
+    metadataFilter?: Record<string, any>
   ): Promise<VectorSearchResult[]> {
     const vectorStr = `[${embedding.join(',')}]`;
     
-    let sql: string;
-    let params: any[];
+    let sql = `
+      SELECT id, content, type, metadata, (1 - (embedding <=> $1::vector)) as score
+      FROM memories
+      WHERE user_id = $2 
+        AND embedding IS NOT NULL 
+        AND (1 - (embedding <=> $1::vector)) >= $3
+    `;
+    const params: any[] = [vectorStr, userId, threshold];
 
     if (category) {
-      sql = `
-        SELECT id, content, type, metadata, (1 - (embedding <=> $1::vector)) as score
-        FROM memories
-        WHERE user_id = $2 
-          AND embedding IS NOT NULL 
-          AND (1 - (embedding <=> $1::vector)) >= $3
-          AND (type = $5 OR (metadata->>'category') = $5)
-        ORDER BY score DESC
-        LIMIT $4
-      `;
-      params = [vectorStr, userId, threshold, limit, category];
-    } else {
-      sql = `
-        SELECT id, content, type, metadata, (1 - (embedding <=> $1::vector)) as score
-        FROM memories
-        WHERE user_id = $2 
-          AND embedding IS NOT NULL 
-          AND (1 - (embedding <=> $1::vector)) >= $3
-        ORDER BY score DESC
-        LIMIT $4
-      `;
-      params = [vectorStr, userId, threshold, limit];
+      params.push(category);
+      sql += ` AND (type = $${params.length} OR (metadata->>'category') = $${params.length})`;
     }
+
+    if (metadataFilter && Object.keys(metadataFilter).length > 0) {
+      params.push(JSON.stringify(metadataFilter));
+      sql += ` AND metadata @> $${params.length}::jsonb`;
+    }
+
+    sql += `
+      ORDER BY score DESC
+      LIMIT $${params.length + 1}
+    `;
+    params.push(limit);
 
     try {
       const res = await query<{

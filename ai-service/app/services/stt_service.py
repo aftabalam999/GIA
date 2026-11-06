@@ -64,6 +64,24 @@ class WhisperSTTService(SpeechToTextService):
             error=self._init_error
         )
 
+    def _resolve_model_path(self) -> str:
+        """Resolves local model directory path if available."""
+        from pathlib import Path
+        model_path_str = getattr(settings, "STT_MODEL_PATH", "ai-service/models/stt/whisper-tiny")
+        path = Path(model_path_str)
+        if path.is_absolute() and path.exists():
+            return str(path)
+        if path.exists():
+            return str(path.resolve())
+        base_dir = Path(__file__).resolve().parent.parent.parent
+        candidate = base_dir / model_path_str
+        if candidate.exists():
+            return str(candidate.resolve())
+        candidate_sub = base_dir / "models" / "stt" / "whisper-tiny"
+        if candidate_sub.exists():
+            return str(candidate_sub.resolve())
+        return self.model_name
+
     async def initialize(self) -> None:
         """Initializes and loads the STT model weights ONCE into memory."""
         async with self._lifecycle_lock:
@@ -72,7 +90,8 @@ class WhisperSTTService(SpeechToTextService):
 
             self._state = STTModelState.LOADING
             self._init_error = None
-            logger.info(f"Loading STT model '{self.model_name}' on device '{self.device}' ({self.compute_type})...")
+            resolved_target = self._resolve_model_path()
+            logger.info(f"Loading STT model from '{resolved_target}' on device '{self.device}' ({self.compute_type})...")
 
             try:
                 from faster_whisper import WhisperModel
@@ -80,9 +99,10 @@ class WhisperSTTService(SpeechToTextService):
                 loop = asyncio.get_running_loop()
                 def _load_model():
                     return WhisperModel(
-                        self.model_name,
+                        resolved_target,
                         device=self.device,
                         compute_type=self.compute_type,
+                        local_files_only=getattr(settings, "STT_LOCAL_FILES_ONLY", True),
                         download_root=None
                     )
 

@@ -6,15 +6,12 @@ import { z } from 'zod';
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
 const configSchema = z.object({
-  PORT: z.coerce.number().default(5000),
+  PORT: z.coerce.number().default(5001),
   HOST: z.string().default('0.0.0.0'),
   DATABASE_URL: z.string(),
   DATABASE_POOL_SIZE: z.coerce.number().default(20),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters long'),
-  OPENAI_API_KEY: z.string().optional(),
-  GOOGLE_AI_API_KEY: z.string().optional(),
-  ANTHROPIC_API_KEY: z.string().optional(),
   INTERNAL_API_KEY: z.string().default('gia_internal_secret_key_987654321'),
   CORS_ORIGIN: z.string().optional(),
   REDIS_URL: z.string().default('redis://localhost:6379'),

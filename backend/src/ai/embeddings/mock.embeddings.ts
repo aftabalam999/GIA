@@ -12,27 +12,29 @@ export class MockEmbeddingProvider implements EmbeddingProvider {
       throw new Error('Simulated embedding provider failure');
     }
 
-    const vector = new Array(1536).fill(0);
+    const vector = new Array(384).fill(0);
     const lower = text.toLowerCase();
 
     // Map semantic zones to verify cosine similarity assertions in test suites
     if (lower.includes('python') || lower.includes('code') || lower.includes('programming')) {
-      for (let i = 0; i < 100; i++) vector[i] = 0.8;
-    } else if (lower.includes('java')) {
       for (let i = 0; i < 50; i++) vector[i] = 0.8;
+    } else if (lower.includes('java')) {
+      for (let i = 50; i < 100; i++) vector[i] = 0.8;
     } else if (lower.includes('chocolate') || lower.includes('sweet') || lower.includes('food')) {
-      for (let i = 1436; i < 1536; i++) vector[i] = 0.8;
+      for (let i = 350; i < 384; i++) vector[i] = 0.8;
+    } else if (lower.includes('architecture') || lower.includes('guide')) {
+      for (let i = 150; i < 200; i++) vector[i] = 0.8;
     } else {
       // General fallbacks
-      for (let i = 500; i < 600; i++) vector[i] = 0.5;
+      for (let i = 250; i < 300; i++) vector[i] = 0.5;
     }
 
     // Normalize vector to unit length
     let sumSquares = 0;
-    for (let i = 0; i < 1536; i++) sumSquares += vector[i] * vector[i];
+    for (let i = 0; i < 384; i++) sumSquares += vector[i] * vector[i];
     const norm = Math.sqrt(sumSquares);
     if (norm > 0) {
-      for (let i = 0; i < 1536; i++) vector[i] /= norm;
+      for (let i = 0; i < 384; i++) vector[i] /= norm;
     }
 
     return vector;

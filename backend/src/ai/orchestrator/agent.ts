@@ -63,6 +63,8 @@ Important rules:
       const history = await MessageRepository.findByConversationId(conversationId);
       const llmRequest = ContextBuilder.buildContext(history);
       llmRequest.systemPrompt = systemPrompt;
+      llmRequest.maxTokens = 350;
+      llmRequest.enableThinking = false;
 
       // Invoke LLM Gateway
       const response = await LLMGateway.generate(llmRequest, { conversationId });

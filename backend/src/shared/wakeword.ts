@@ -1,36 +1,82 @@
 export interface WakeWordResult {
   detected: boolean;
-  confidence: number;
+  isAuthorized: boolean;
+  isWakeOnly: boolean;
+  wakeWord: string | null;
   command: string | null;
 }
 
+/**
+ * Isolated Wake-Word Authorization Detector for GIA.
+ * 
+ * Enforces strict wake-word requirement:
+ * GIA only executes commands after wake-word authorization.
+ * 
+ * Supported Wake-Words:
+ * - "GIA", "Hey GIA", "Hello GIA", "Hi GIA", "OK GIA", "Okay GIA", "Yo GIA"
+ * - "Afiya", "Hey Afiya" (backwards compatibility)
+ */
 export class WakeWordDetector {
+  private static readonly WAKE_WORD_PATTERN =
+    /^(?:hey|hello|hi|ok|okay|yo)?\s*[,.:;!-]?\s*\b(gia|afiya)\b\s*[,.:;!-]?\s*(?:please)?\s*[,.:;!-]?\s*(.*)$/i;
+
+  private static readonly EMBEDDED_WAKE_PATTERN =
+    /\b(gia|afiya)\b\s*[,.:;!-]?\s*(?:please)?\s*[,.:;!-]?\s*(.*)$/i;
+
   /**
    * Evaluates text for the GIA wake word.
-   * If detected, returns the confidence score and the extracted command.
+   * If detected, returns authorization state and the extracted command.
    */
   static detect(input: string): WakeWordResult {
-    if (!input || !input.trim()) {
-      return { detected: false, confidence: 0.0, command: null };
+    if (!input || typeof input !== 'string' || !input.trim()) {
+      return {
+        detected: false,
+        isAuthorized: false,
+        isWakeOnly: false,
+        wakeWord: null,
+        command: null,
+      };
     }
 
     const trimmed = input.trim();
 
-    // Word boundary checks to avoid partial matches (e.g. "giant", "plagiarize")
-    // Captures optional greetings, punctuation delimiters, and politeness tokens
-    const wakeWordPattern = /^(?:hey|hello|hi|ok|okay)?\s*[,.:;]?\s*\bgia\b\s*[,.:;]?\s*(?:please)?\s*[,.:;]?\s*(.*)$/i;
+    // 1. Check primary prefix-based wake word pattern (e.g. "Hey GIA, open VS Code", "GIA what time is it?")
+    let match = trimmed.match(this.WAKE_WORD_PATTERN);
+    let wakeWordFound: string | null = null;
+    let rawCommand = '';
 
-    const match = trimmed.match(wakeWordPattern);
-    if (!match) {
-      return { detected: false, confidence: 0.0, command: null };
+    if (match) {
+      wakeWordFound = match[1].toUpperCase();
+      rawCommand = match[2] ? match[2].trim() : '';
+    } else {
+      // 2. Check embedded wake word (e.g. "Please GIA open Chrome")
+      const embeddedMatch = trimmed.match(this.EMBEDDED_WAKE_PATTERN);
+      if (embeddedMatch) {
+        wakeWordFound = embeddedMatch[1].toUpperCase();
+        rawCommand = embeddedMatch[2] ? embeddedMatch[2].trim() : '';
+      }
     }
 
-    const command = match[1]?.trim() || '';
+    if (!wakeWordFound) {
+      return {
+        detected: false,
+        isAuthorized: false,
+        isWakeOnly: false,
+        wakeWord: null,
+        command: null,
+      };
+    }
+
+    // Clean leading punctuation from command
+    const cleanedCommand = rawCommand.replace(/^[^\w]+/, '').trim();
+    const isWakeOnly = cleanedCommand.length === 0;
 
     return {
       detected: true,
-      confidence: 1.0,
-      command: command.length > 0 ? command : null,
+      isAuthorized: true,
+      isWakeOnly,
+      wakeWord: wakeWordFound,
+      command: isWakeOnly ? null : cleanedCommand,
     };
   }
 }

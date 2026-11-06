@@ -15,9 +15,9 @@ export async function withRetryAndTimeout<T>(
   fn: (signal: AbortSignal) => Promise<T>,
   options: RetryOptions = {}
 ): Promise<T> {
-  const retries = options.retries ?? 3;
+  const retries = options.retries ?? 2;
   let delay = options.delay ?? 1000;
-  const timeoutMs = options.timeoutMs ?? 10000; // 10s default
+  const timeoutMs = options.timeoutMs ?? 60000; // 60s for local inference engines
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     const controller = new AbortController();

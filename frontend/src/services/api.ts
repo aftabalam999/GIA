@@ -1,4 +1,4 @@
-const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string) || 'http://localhost:5000';
+const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string) || 'http://127.0.0.1:5001';
 
 export interface User {
   id: string;
@@ -122,12 +122,22 @@ export async function sendMessageRAG(token: string, conversationId: string, cont
   };
 }
 
-export async function sendMessageAgent(token: string, conversationId: string, content: string): Promise<{ userMessage: Message; assistantMessage: Message; runId: string }> {
+export async function sendMessageAgent(token: string, conversationId: string, content: string): Promise<{
+  userMessage: Message;
+  assistantMessage: Message;
+  runId?: string;
+  plan?: ExecutionPlan;
+  presentation?: string;
+  execution?: PlanExecutionResult;
+}> {
   const data = await apiRequest(`/api/v1/conversations/${conversationId}/messages/agent`, 'POST', token, { content });
   return {
     userMessage: data.userMessage,
     assistantMessage: data.assistantMessage,
     runId: data.runId,
+    plan: data.plan,
+    presentation: data.presentation,
+    execution: data.execution,
   };
 }
 
@@ -224,11 +234,24 @@ export function connectChatStream(
 }
 
 export interface HealthResponse {
-  status: 'healthy' | 'unhealthy';
+  status: 'healthy' | 'degraded' | 'unhealthy';
   timestamp: string;
-  services: {
-    database: 'connected' | 'disconnected';
+  version?: string;
+  dependencies?: {
+    database: 'healthy' | 'unhealthy';
+    redis: 'healthy' | 'unhealthy';
+    python_ai_service: 'healthy' | 'degraded' | 'unhealthy';
+    llm: 'healthy' | 'unhealthy' | 'unconfigured';
+    embeddings: 'healthy' | 'unhealthy' | 'unconfigured';
   };
+  python_ai_service?: {
+    reachable: boolean;
+    healthy: boolean;
+    ready: boolean;
+    subsystems?: Record<string, boolean>;
+    error?: string;
+  };
+  latency?: Record<string, number>;
 }
 
 export async function fetchHealthStatus(): Promise<HealthResponse> {
@@ -295,5 +318,174 @@ export async function sendVoiceMessage(token: string, conversationId: string, au
   }
   return data;
 }
+
+// ==============================================================================
+// PLAN, PERMISSION & EXECUTION API (PHASE 4)
+// ==============================================================================
+
+export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
+export type PlanStatus =
+  | 'pending'
+  | 'awaiting_approval'
+  | 'approved'
+  | 'rejected'
+  | 'modified'
+  | 'modifying'
+  | 'expired'
+  | 'executing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'draft';
+
+export interface PlanStep {
+  step_id: number;
+  action: string;
+  target?: string;
+  description: string;
+  tool_name?: string;
+  tool_args?: Record<string, any>;
+  risk_level: RiskLevel;
+  requires_approval: boolean;
+  depends_on: number[];
+  expected_outcome?: string;
+}
+
+export interface ExecutionPlan {
+  id: string;
+  conversation_id: string;
+  user_id: string;
+  objective: string;
+  status: PlanStatus;
+  is_ambiguous: boolean;
+  clarification_question?: string | null;
+  steps: PlanStep[];
+  approval: {
+    required: boolean;
+    approved: boolean;
+    approved_at?: string | null;
+    feedback?: string | null;
+  };
+  metadata?: Record<string, any>;
+  version: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ExecutionTicket {
+  ticketId: string;
+  ticket_token?: string;
+  planId: string;
+  planVersion: number;
+  userId: string;
+  issuedAt: number;
+  expiresAt: number;
+  approvedSteps: number[];
+  confirmedSensitiveOperations: Record<string, boolean>;
+  usedSteps: number[];
+}
+
+export interface StepExecutionRecord {
+  id?: string;
+  executionId?: string;
+  stepId: number;
+  action: string;
+  toolName?: string;
+  toolArgs?: Record<string, any>;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
+  result?: any;
+  verification?: {
+    verified: boolean;
+    message: string;
+    details?: Record<string, any>;
+  };
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+}
+
+export interface PlanExecutionResult {
+  executionId: string;
+  planId: string;
+  planVersion: number;
+  userId: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  totalSteps: number;
+  completedSteps: number;
+  failedStepId?: number;
+  errorMessage?: string;
+  stepRecords: StepExecutionRecord[];
+  startedAt: string;
+  completedAt?: string;
+}
+
+export async function getActivePlan(token: string, conversationId: string): Promise<ExecutionPlan | null> {
+  const res = await apiRequest(`/api/v1/conversations/${conversationId}/plans/active`, 'GET', token);
+  return res.plan || null;
+}
+
+export async function createPlan(token: string, conversationId: string, instruction: string): Promise<{ plan: ExecutionPlan; presentation: string }> {
+  return apiRequest(`/api/v1/conversations/${conversationId}/plans`, 'POST', token, { instruction });
+}
+
+export async function modifyPlan(token: string, conversationId: string, planId: string, feedback: string): Promise<{ plan: ExecutionPlan; presentation: string }> {
+  return apiRequest(`/api/v1/conversations/${conversationId}/plans/${planId}`, 'PUT', token, { feedback });
+}
+
+export async function approvePlan(
+  token: string,
+  conversationId: string,
+  planId: string,
+  options?: {
+    planVersion?: number;
+    channel?: 'web_ui' | 'voice_command' | 'api';
+    explicitConfirmation?: boolean;
+    voiceTranscript?: string;
+    sensitiveConfirmations?: Record<string, boolean>;
+    isAssistantVoice?: boolean;
+  }
+): Promise<{ success: boolean; plan: ExecutionPlan; ticket: ExecutionTicket; message: string }> {
+  return apiRequest(`/api/v1/conversations/${conversationId}/plans/${planId}/approve`, 'POST', token, options);
+}
+
+export async function rejectPlan(token: string, conversationId: string, planId: string, reason?: string): Promise<{ success: boolean; plan: ExecutionPlan; message: string }> {
+  return apiRequest(`/api/v1/conversations/${conversationId}/plans/${planId}/reject`, 'POST', token, { reason });
+}
+
+export async function executePlan(
+  token: string,
+  conversationId: string,
+  planId: string,
+  ticketToken: string,
+  planVersion?: number
+): Promise<{ success: boolean; execution: PlanExecutionResult }> {
+  return apiRequest(`/api/v1/conversations/${conversationId}/plans/${planId}/execute`, 'POST', token, {
+    ticketToken,
+    planVersion,
+  });
+}
+
+export async function cancelPlan(token: string, conversationId: string, planId: string): Promise<{ success: boolean; message: string }> {
+  return apiRequest(`/api/v1/conversations/${conversationId}/plans/${planId}/cancel`, 'POST', token);
+}
+
+export async function getPlanExecutions(token: string, conversationId: string, planId: string): Promise<any[]> {
+  const res = await apiRequest(`/api/v1/conversations/${conversationId}/plans/${planId}/executions`, 'GET', token);
+  return res.executions || [];
+}
+
+export async function getStepExecutions(token: string, conversationId: string, planId: string, executionId: string): Promise<any[]> {
+  const res = await apiRequest(`/api/v1/conversations/${conversationId}/plans/${planId}/executions/${executionId}/steps`, 'GET', token);
+  return res.steps || [];
+}
+
+export async function sendVoicePlanCommand(token: string, conversationId: string, transcript: string, isAssistantVoice?: boolean): Promise<any> {
+  return apiRequest(`/api/v1/conversations/${conversationId}/plans/voice-command`, 'POST', token, {
+    transcript,
+    isAssistantVoice,
+  });
+}
+
 
 

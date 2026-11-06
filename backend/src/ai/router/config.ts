@@ -1,24 +1,28 @@
 export interface ModelConfig {
-  provider: 'openai' | 'gemini' | 'anthropic' | 'mock';
+  provider: 'qwen' | 'mock';
   model: string;
 }
 
 export type ModelType = 'fast' | 'general' | 'reasoning';
 
 /**
- * Global mappings associating semantic model aliases to provider-specific targets.
+ * Centralized model configuration for GIA.
+ * The local Qwen 3.5 4B model is the ONLY LLM throughout the project across all model slots.
+ * Fully offline, private, and hosted on the local Python AI inference service.
  */
+export const DEFAULT_QWEN_MODEL = 'Qwen3.5-4B';
+
 export const ROUTER_CONFIGS: Record<ModelType, ModelConfig> = {
   fast: {
-    provider: 'gemini',
-    model: 'gemini-3.6-flash',
+    provider: 'qwen',
+    model: DEFAULT_QWEN_MODEL,
   },
   general: {
-    provider: 'gemini',
-    model: 'gemini-3.6-flash', // switched from openai: no credits
+    provider: 'qwen',
+    model: DEFAULT_QWEN_MODEL,
   },
   reasoning: {
-    provider: 'anthropic',
-    model: 'claude-3-5-sonnet-20241022',
+    provider: 'qwen',
+    model: DEFAULT_QWEN_MODEL,
   },
 };

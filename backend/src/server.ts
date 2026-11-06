@@ -18,6 +18,7 @@ import { memoryRoutes } from './api/routes/memories.js';
 import { documentRoutes } from './api/routes/documents.js';
 import { toolRoutes } from './api/routes/tools.js';
 import { agentRoutes } from './api/routes/agent.js';
+import { planRoutes } from './api/routes/plans.js';
 
 import fastifyMultipart from '@fastify/multipart';
 import { voiceRoutes } from './api/routes/voice.js';
@@ -143,6 +144,7 @@ await fastify.register(documentRoutes, { prefix: '/api/v1' });
 await fastify.register(toolRoutes, { prefix: '/api/v1' });
 await fastify.register(agentRoutes, { prefix: '/api/v1' });
 await fastify.register(voiceRoutes, { prefix: '/api/v1' });
+await fastify.register(planRoutes, { prefix: '/api/v1' });
 
 async function start() {
   try {

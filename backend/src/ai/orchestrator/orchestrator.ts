@@ -26,6 +26,7 @@ export interface AgentState {
   maxSteps: number;
   stepsHistory: Array<{ node: string; timestamp: string }>;
   error?: string;
+  deterministic?: boolean;
 }
 
 export class AgentOrchestrator {
@@ -39,12 +40,12 @@ export class AgentOrchestrator {
     inputQuery: string | NormalizedUserInput,
     options?: { requestId?: string }
   ): Promise<{ userMessage: Message; assistantMessage: Message; runId: string }> {
-    const AGENT_TIMEOUT_MS = 60_000; // 60 second wall-clock deadline
+    const AGENT_TIMEOUT_MS = 120_000; // 120 second wall-clock deadline for local ML inference
 
     const runPromise = this._runInternal(userId, conversationId, inputQuery, options);
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(
-        () => reject(new Error('Agent execution timed out after 60 seconds')),
+        () => reject(new Error('Agent execution timed out after 120 seconds')),
         AGENT_TIMEOUT_MS
       )
     );
@@ -195,6 +196,9 @@ export class AgentOrchestrator {
 
   private static async planningNode(state: AgentState): Promise<void> {
     const decision = await AgentRouter.route(state.inputQuery, state.userId);
+    if (decision.deterministic) {
+      state.deterministic = true;
+    }
 
     // Apply the parsed routing decision
     if (decision.route === 'tool' && decision.tool) {
@@ -269,6 +273,28 @@ export class AgentOrchestrator {
   }
 
   private static async respondingNode(state: AgentState): Promise<void> {
+    // 1. Deterministic response bypass (bypasses LLM output synthesis)
+    if (state.deterministic) {
+      const executedTool = state.toolCalls[0];
+      if (executedTool) {
+        if (executedTool.error) {
+          state.finalResponse = `Failed to execute local command: ${executedTool.error}`;
+        } else if (executedTool.result?.error) {
+          state.finalResponse = `Failed to execute local command: ${executedTool.result.error}`;
+        } else if (executedTool.result?.folderOpened) {
+          state.finalResponse = `VS Code opened successfully for "${executedTool.result.folderOpened}".`;
+        } else if (executedTool.result?.message) {
+          state.finalResponse = executedTool.result.message;
+        } else {
+          state.finalResponse = `Local command "${executedTool.name}" executed successfully.`;
+        }
+      } else {
+        state.finalResponse = 'Local command processed successfully.';
+      }
+      state.currentNode = 'done';
+      return;
+    }
+
     let retrievedText = '';
 
     if (state.retrievedContext.memories.length > 0) {
@@ -292,14 +318,16 @@ export class AgentOrchestrator {
       });
     }
 
-    const systemPrompt = `You are GIA, a modular personal assistant.
-Answer the user's question leveraging the provided context. If documents are cited, mention document titles.
+    const systemPrompt = `You are GIA (General Intelligent Assistant), an autonomous local desktop AI assistant.
+Answer the user's question concisely leveraging any provided context. If documents are cited, mention document titles. You have full capability to execute desktop tools on the user's machine.
 
 Context details:${retrievedText || '\n(No background context retrieved)'}`;
 
     const history = await MessageRepository.findByConversationId(state.conversationId);
     const llmRequest = ContextBuilder.buildContext(history);
     llmRequest.systemPrompt = systemPrompt;
+    llmRequest.maxTokens = 350;
+    llmRequest.enableThinking = false;
 
     const response = await LLMGateway.generate(llmRequest, { conversationId: state.conversationId });
     state.finalResponse = response.content;

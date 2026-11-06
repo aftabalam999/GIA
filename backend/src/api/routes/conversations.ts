@@ -16,6 +16,14 @@ const createMessageSchema = z.object({
   content: z.string().min(1, 'Message content is required'),
 });
 
+const ragMessageSchema = z.object({
+  content: z.string().min(1, 'Message content is required'),
+  threshold: z.number().min(0).max(1).optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+  metadataFilter: z.record(z.any()).optional(),
+  strictGrounded: z.boolean().optional(),
+});
+
 export async function conversationRoutes(fastify: FastifyInstance, options: FastifyPluginOptions) {
   // Enforce JWT check on all routes in this plugin
   fastify.addHook('preHandler', authenticate);
@@ -89,16 +97,21 @@ export async function conversationRoutes(fastify: FastifyInstance, options: Fast
 
   // POST /api/v1/conversations/:id/messages/rag (RAG message endpoint)
   fastify.post('/conversations/:id/messages/rag', async (request, reply) => {
-    const parsed = createMessageSchema.safeParse(request.body);
+    const parsed = ragMessageSchema.safeParse(request.body);
     if (!parsed.success) {
       throw new ValidationError('Validation failed', parsed.error.format());
     }
 
     const userId = request.user.id;
     const { id: conversationId } = request.params as { id: string };
-    const { content } = parsed.data;
+    const { content, threshold, limit, metadataFilter, strictGrounded } = parsed.data;
 
-    const result = await RAGService.sendMessageRAG(userId, conversationId, content);
+    const result = await RAGService.sendMessageRAG(userId, conversationId, content, {
+      threshold,
+      limit,
+      metadataFilter,
+      strictGrounded,
+    });
 
     return reply.status(200).send({
       success: true,

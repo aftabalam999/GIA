@@ -8,6 +8,8 @@ export interface LLMRequest {
   messages: LLMMessage[];
   temperature?: number;
   responseFormat?: 'json' | 'text';
+  maxTokens?: number;
+  enableThinking?: boolean;
 }
 
 export interface LLMResponse {
@@ -22,5 +24,5 @@ export interface LLMChunk {
 
 export interface LLMProvider {
   generate(request: LLMRequest, signal?: AbortSignal): Promise<LLMResponse>;
-  stream(request: LLMRequest): AsyncIterable<LLMChunk>;
+  stream(request: LLMRequest, signal?: AbortSignal): AsyncIterable<LLMChunk>;
 }

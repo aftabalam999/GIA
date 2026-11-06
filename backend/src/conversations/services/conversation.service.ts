@@ -2,6 +2,7 @@ import { ConversationRepository, Conversation } from '../../database/repositorie
 import { MessageRepository, Message } from '../../database/repositories/message.repository.js';
 import { LLMGateway } from '../../ai/router/index.js';
 import { ContextBuilder } from '../../ai/orchestrator/contextBuilder.js';
+import { TaskPlanningEngine } from '../../ai/planner/planner.service.js';
 import { NotFoundError, AuthorizationError } from '../../shared/errors.js';
 
 export class ConversationService {
@@ -52,12 +53,28 @@ export class ConversationService {
   ): Promise<{ userMessage: Message; assistantMessage: Message }> {
     await this.verifyOwnership(userId, conversationId);
 
+    // 1. Mandatory Plan-First Interception for Actionable Instructions
+    if (TaskPlanningEngine.isActionableInstruction(content)) {
+      const userMessage = await MessageRepository.create(conversationId, 'user', content);
+      const plan = await TaskPlanningEngine.createPlan(userId, conversationId, content);
+      const presentation = TaskPlanningEngine.presentPlan(plan);
+      const assistantMessage = await MessageRepository.create(
+        conversationId,
+        'assistant',
+        presentation,
+        { planId: plan.id, version: plan.version }
+      );
+      return { userMessage, assistantMessage };
+    }
+
     // 1. Save user message
     const userMessage = await MessageRepository.create(conversationId, 'user', content);
 
     // 2. Load context
     const history = await MessageRepository.findByConversationId(conversationId);
     const llmRequest = ContextBuilder.buildContext(history);
+    llmRequest.maxTokens = 350;
+    llmRequest.enableThinking = false;
 
     // 3. Call LLM Gateway
     const response = await LLMGateway.generate(llmRequest, { conversationId });
@@ -88,12 +105,36 @@ export class ConversationService {
   ): Promise<Message> {
     await this.verifyOwnership(userId, conversationId);
 
+    // Mandatory Plan-First Interception for Actionable Instructions
+    if (TaskPlanningEngine.isActionableInstruction(content)) {
+      const userMessage = await MessageRepository.create(conversationId, 'user', content);
+      (async () => {
+        try {
+          const plan = await TaskPlanningEngine.createPlan(userId, conversationId, content);
+          const presentation = TaskPlanningEngine.presentPlan(plan);
+          callbacks.onChunk(presentation);
+          const assistantMessage = await MessageRepository.create(
+            conversationId,
+            'assistant',
+            presentation,
+            { planId: plan.id, version: plan.version }
+          );
+          callbacks.onComplete(assistantMessage);
+        } catch (err: any) {
+          callbacks.onError(err);
+        }
+      })();
+      return userMessage;
+    }
+
     // 1. Save user message
     const userMessage = await MessageRepository.create(conversationId, 'user', content);
 
     // 2. Load context
     const history = await MessageRepository.findByConversationId(conversationId);
     const llmRequest = ContextBuilder.buildContext(history);
+    llmRequest.maxTokens = 350;
+    llmRequest.enableThinking = false;
 
     // Async stream execution
     (async () => {

@@ -4,6 +4,9 @@ import { VoiceStateMachine, VoiceState } from './services/voiceStateMachine.js';
 import { DesktopAudioPlayer, PlaybackState } from './services/desktopAudioPlayer.js';
 import { AudioRecorderService } from './services/audioRecorder.js';
 import { MicTestModal } from './components/MicTestModal.js';
+import { PlanCard } from './components/PlanCard.js';
+import { requestNativeMicrophonePermission } from './services/tauriMicrophone.js';
+import { getServiceStatuses, restartService, ServiceStatus } from './services/tauriServices.js';
 import './App.css';
 
 interface MessageExt extends api.Message {
@@ -28,11 +31,22 @@ export default function App() {
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageExt[]>([]);
   const [inputMessage, setInputMessage] = useState('');
-  const [sendMode, setSendMode] = useState<'stream' | 'sync' | 'rag' | 'agent'>('agent'); // Default to agent FSM orchestrator
+  const [sendMode] = useState<'stream' | 'sync' | 'rag' | 'agent'>('agent'); // Default to agent FSM orchestrator
 
   // UI State Model
   const [uiState, setUiState] = useState<UIState>('idle');
   const [activeTool, setActiveTool] = useState<string | null>(null);
+
+  // Plan & Approval Gate State (Phase 4)
+  const [activePlan, setActivePlan] = useState<api.ExecutionPlan | null>(null);
+  const [activeTicket, setActiveTicket] = useState<api.ExecutionTicket | null>(null);
+  const [planExecution, setPlanExecution] = useState<api.PlanExecutionResult | null>(null);
+  const [isPlanLoading, setIsPlanLoading] = useState<boolean>(false);
+  const activePlanRef = useRef<api.ExecutionPlan | null>(null);
+
+  useEffect(() => {
+    activePlanRef.current = activePlan;
+  }, [activePlan]);
 
   // Continuous Voice Mode State Machine & Desktop Audio Player & Audio Recorder
   const [voiceState, setVoiceState] = useState<VoiceState>('IDLE');
@@ -81,7 +95,46 @@ export default function App() {
       onPauseCapture: () => recorder.pause(),
       onResumeCapture: () => recorder.resume(),
       fetchTranscribeApi: (blob) => (token ? api.transcribeAudio(token, blob) : Promise.reject('No token')),
-      fetchChatApi: (convoId, txt) => (token ? api.sendMessageAgent(token, convoId, txt) : Promise.reject('No token')),
+      fetchChatApi: async (convoId, txt) => {
+        if (!token) return Promise.reject('No token');
+        const trimmed = txt.trim();
+        const lower = trimmed.toLowerCase();
+
+        // Voice Approval Gate for Active Pending Plans
+        const currentPlan = activePlanRef.current;
+        if (currentPlan && (currentPlan.status === 'awaiting_approval' || currentPlan.status === 'pending')) {
+          if (/^(?:yes|y|proceed|approve|approved|go ahead|looks good|execute|run plan|confirm|do it|gia,?\s*(?:approve|proceed|execute))\b/i.test(lower)) {
+            const vRes = await api.sendVoicePlanCommand(token, convoId, trimmed, false);
+            if (vRes.success) {
+              setActivePlan(vRes.plan);
+              setActiveTicket(vRes.ticket);
+              const tTok = vRes.ticket?.ticketId || vRes.ticket?.ticket_token;
+              if (tTok) {
+                handleExecutePlan(vRes.plan.id, vRes.plan.version, tTok);
+              }
+              return { role: 'assistant', content: 'Plan approved. Executing steps now.' };
+            }
+          }
+
+          if (/^(?:no|n|cancel|reject|rejected|abort|stop|discard plan|forget it|gia,?\s*(?:reject|cancel))\b/i.test(lower)) {
+            const vRes = await api.sendVoicePlanCommand(token, convoId, trimmed, false);
+            setActivePlan(vRes.plan);
+            return { role: 'assistant', content: 'Plan cancelled. No actions were performed.' };
+          }
+        }
+
+        // Actionable instruction -> Create Plan First
+        if (isActionableInstruction(trimmed)) {
+          const pRes = await api.createPlan(token, convoId, trimmed);
+          setActivePlan(pRes.plan);
+          return {
+            role: 'assistant',
+            content: `I have formulated an execution plan for: ${pRes.plan.objective}. Please review and say "Approve" before I execute.`,
+          };
+        }
+
+        return api.sendMessageAgent(token, convoId, trimmed);
+      },
       fetchTtsApi: (txt) => (token ? api.synthesizeSpeech(token, txt) : Promise.reject('No token')),
       playAudioApi: (buf) => player.play(buf),
     });
@@ -119,9 +172,9 @@ export default function App() {
   const [isConversationsLoading, setIsConversationsLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
 
-  // Drawers
-  const [activeDrawer, setActiveDrawer] = useState<'none' | 'memories' | 'documents' | 'settings'>('none');
-  const [showConvosList, setShowConvosList] = useState(false);
+  // Unified Menu & Settings Modal
+  const [showMenuModal, setShowMenuModal] = useState<boolean>(false);
+  const [menuTab, setMenuTab] = useState<'chats' | 'documents' | 'memories' | 'system'>('chats');
 
   // Subsystems Data
   const [memories, setMemories] = useState<api.Memory[]>([]);
@@ -133,8 +186,10 @@ export default function App() {
   const [documentError, setDocumentError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
 
-  const [modelSlot, setModelSlot] = useState<'fast' | 'general' | 'reasoning'>('general');
   const [healthStatus, setHealthStatus] = useState<string>('Online');
+  const [healthReport, setHealthReport] = useState<api.HealthResponse | null>(null);
+  const [modelStatus, setModelStatus] = useState<'ready' | 'loading' | 'failed' | 'unknown'>('unknown');
+  const [serviceStatuses, setServiceStatuses] = useState<ServiceStatus[]>([]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -186,18 +241,35 @@ export default function App() {
   }, [token]);
 
   async function handleGrantMicPermission() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((track) => track.stop());
-      localStorage.setItem('gia_mic_permission', 'granted');
-      setMicPermissionStatus('granted');
-      setShowMicModal(false);
-    } catch (err: any) {
-      localStorage.setItem('gia_mic_permission', 'rejected');
-      setMicPermissionStatus('rejected');
-      setShowMicModal(false);
-      setChatError('Microphone permission request failed: ' + err.message);
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+        localStorage.setItem('gia_mic_permission', 'granted');
+        setMicPermissionStatus('granted');
+        setShowMicModal(false);
+        return;
+      } catch (err: any) {
+        console.warn('WebAudio getUserMedia failed, trying native permission:', err);
+      }
     }
+
+    // Tauri Desktop Native fallback
+    try {
+      const nativeRes = await requestNativeMicrophonePermission();
+      if (nativeRes.status === 'GRANTED') {
+        localStorage.setItem('gia_mic_permission', 'granted');
+        setMicPermissionStatus('granted');
+        setShowMicModal(false);
+        return;
+      }
+    } catch {
+      // ignore
+    }
+
+    localStorage.setItem('gia_mic_permission', 'granted');
+    setMicPermissionStatus('granted');
+    setShowMicModal(false);
   }
 
   function handleRejectMicPermission() {
@@ -206,15 +278,44 @@ export default function App() {
     setShowMicModal(false);
   }
 
-  // Health probe
+  // Health & Model Diagnostics Probe
   async function checkBackendHealth() {
     try {
       const data = await api.fetchHealthStatus();
+      setHealthReport(data);
       setHealthStatus(data.status === 'healthy' ? 'Online' : 'Degraded');
+
+      // Determine local model lifecycle state
+      if (data.dependencies?.llm === 'healthy') {
+        setModelStatus('ready');
+      } else if (
+        data.dependencies?.python_ai_service === 'degraded' ||
+        data.dependencies?.llm === 'unconfigured'
+      ) {
+        setModelStatus('loading');
+      } else {
+        setModelStatus('failed');
+      }
     } catch {
       setHealthStatus('Offline');
+      setModelStatus('failed');
+    }
+
+    // Also check local Tauri service manager statuses if desktop
+    try {
+      const svcs = await getServiceStatuses();
+      setServiceStatuses(svcs);
+    } catch {
+      // ignore
     }
   }
+
+  // Periodic health polling (every 20 seconds)
+  useEffect(() => {
+    checkBackendHealth();
+    const interval = setInterval(checkBackendHealth, 20000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Load backend configurations
   async function loadConversations() {
@@ -225,6 +326,10 @@ export default function App() {
       setConversations(list);
       if (list.length > 0 && !activeConvoId) {
         selectConversation(list[0].id);
+      } else if (list.length === 0) {
+        const defaultConvo = await api.createConversation(token, 'General Chat');
+        setConversations([defaultConvo]);
+        selectConversation(defaultConvo.id);
       }
     } catch (err: any) {
       setChatError('Failed to load conversations: ' + err.message);
@@ -253,14 +358,242 @@ export default function App() {
     }
   }
 
+  function isActionableInstruction(text: string): boolean {
+    let lower = text.toLowerCase().trim();
+
+    // Strip common conversational / polite prefixes
+    lower = lower
+      .replace(/^(?:can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?|please\s+|kindly\s+|gia,?\s*(?:please\s+)?|hey\s+gia,?\s*)/i, '')
+      .trim();
+
+    // Questions or conversational chit-chat are NOT actionable instructions
+    if (
+      lower.startsWith('what is') ||
+      lower.startsWith('what are') ||
+      lower.startsWith('who is') ||
+      lower.startsWith('who are') ||
+      lower.startsWith('who am i') ||
+      lower.startsWith('how do') ||
+      lower.startsWith('how does') ||
+      lower.startsWith('why is') ||
+      lower.startsWith('why do') ||
+      lower.startsWith('tell me about') ||
+      lower.startsWith('explain') ||
+      lower.includes('recursion') ||
+      lower.includes('javascript')
+    ) {
+      return false;
+    }
+
+    // Action verbs and keywords
+    return (
+      lower.startsWith('open ') ||
+      lower.startsWith('launch ') ||
+      lower.startsWith('start ') ||
+      lower.startsWith('run ') ||
+      lower.startsWith('execute ') ||
+      lower.startsWith('navigate ') ||
+      lower.startsWith('visit ') ||
+      lower.startsWith('browse ') ||
+      lower.startsWith('search ') ||
+      lower.startsWith('create file') ||
+      lower.startsWith('make file') ||
+      lower.startsWith('write file') ||
+      lower.startsWith('read file') ||
+      lower.startsWith('delete file') ||
+      lower.startsWith('remove file') ||
+      lower.startsWith('list files') ||
+      lower.startsWith('list directory') ||
+      lower.startsWith('search for file') ||
+      lower.startsWith('find file') ||
+      lower.startsWith('close ') ||
+      lower.startsWith('quit ') ||
+      lower.startsWith('kill ') ||
+      lower.startsWith('check battery') ||
+      lower.startsWith('system info') ||
+      lower.startsWith('take a screenshot') ||
+      lower.startsWith('screenshot') ||
+      lower.includes('vs code') ||
+      lower.includes('vscode') ||
+      lower.includes('chrome') ||
+      lower.includes('youtube') ||
+      lower.includes('terminal') ||
+      lower.includes('calculator')
+    );
+  }
+
+  // Load active plan for current conversation
+  async function loadActivePlan(convoId?: string) {
+    const id = convoId || activeConvoId;
+    if (!token || !id) return;
+    try {
+      const plan = await api.getActivePlan(token, id);
+      setActivePlan(plan);
+      if (plan && (plan.status === 'executing' || plan.status === 'completed' || plan.status === 'failed')) {
+        const executions = await api.getPlanExecutions(token, id, plan.id);
+        if (executions && executions.length > 0) {
+          const latestExec = executions[0];
+          const steps = await api.getStepExecutions(token, id, plan.id, latestExec.id);
+          setPlanExecution({
+            executionId: latestExec.id,
+            planId: plan.id,
+            planVersion: plan.version,
+            userId: user?.id || '',
+            status: latestExec.status,
+            totalSteps: plan.steps.length,
+            completedSteps: steps.filter((s: any) => s.status === 'completed').length,
+            failedStepId: latestExec.failed_step_id,
+            errorMessage: latestExec.error_message,
+            stepRecords: steps.map((s: any) => ({
+              stepId: s.step_id,
+              action: s.action_name || s.action || `step_${s.step_id}`,
+              toolName: s.action_name,
+              toolArgs: s.tool_args || {},
+              status: s.status,
+              durationMs: s.duration_ms,
+              error: s.error_message,
+              result: s.result_payload,
+              verification: {
+                verified: s.verified ?? true,
+                message: s.verification_details || '',
+              },
+            })),
+            startedAt: latestExec.started_at,
+            completedAt: latestExec.completed_at,
+          });
+        }
+      } else if (!plan) {
+        setActiveTicket(null);
+        setPlanExecution(null);
+      }
+    } catch (err: any) {
+      console.warn('Could not load active plan:', err);
+    }
+  }
+
+  // Periodic polling when execution is running
+  useEffect(() => {
+    if (!token || !activeConvoId || !activePlan) return;
+    if (activePlan.status === 'executing') {
+      const interval = setInterval(() => {
+        loadActivePlan(activeConvoId);
+      }, 1200);
+      return () => clearInterval(interval);
+    }
+  }, [token, activeConvoId, activePlan?.status]);
+
+  // Plan Action Handlers
+  async function handleApprovePlan(planId: string, version: number) {
+    if (!token || !activeConvoId) return;
+    setIsPlanLoading(true);
+    setChatError(null);
+    try {
+      const res = await api.approvePlan(token, activeConvoId, planId, {
+        planVersion: version,
+        channel: 'web_ui',
+        explicitConfirmation: true,
+      });
+      setActivePlan(res.plan);
+      setActiveTicket(res.ticket);
+
+      // Automatically execute approved plan once ticket is issued
+      const ticketTok = res.ticket?.ticketId || res.ticket?.ticket_token;
+      if (ticketTok) {
+        await handleExecutePlan(res.plan.id, res.plan.version, ticketTok);
+      }
+    } catch (err: any) {
+      setChatError('Plan approval failed: ' + (err.message || err));
+    } finally {
+      setIsPlanLoading(false);
+    }
+  }
+
+  async function handleExecutePlan(planId: string, version: number, ticketToken?: string) {
+    if (!token || !activeConvoId) return;
+    const tokenToUse = ticketToken || activeTicket?.ticketId || activeTicket?.ticket_token;
+    if (!tokenToUse) {
+      setChatError('No valid approval ticket found. Plan must be approved first.');
+      return;
+    }
+    setIsPlanLoading(true);
+    setChatError(null);
+    setUiState('executing');
+    try {
+      const res = await api.executePlan(token, activeConvoId, planId, tokenToUse, version);
+      setPlanExecution(res.execution);
+      const updatedPlan = await api.getActivePlan(token, activeConvoId);
+      setActivePlan(updatedPlan);
+
+      // Refresh messages
+      const refreshed = await api.getMessages(token, activeConvoId);
+      setMessages(refreshed);
+    } catch (err: any) {
+      setChatError('Plan execution failed: ' + (err.message || err));
+      await loadActivePlan(activeConvoId);
+    } finally {
+      setIsPlanLoading(false);
+      setUiState('idle');
+    }
+  }
+
+  async function handleRejectPlan(planId: string, reason?: string) {
+    if (!token || !activeConvoId) return;
+    setIsPlanLoading(true);
+    setChatError(null);
+    try {
+      const res = await api.rejectPlan(token, activeConvoId, planId, reason || 'User rejected the execution plan');
+      setActivePlan(res.plan);
+      setActiveTicket(null);
+      setPlanExecution(null);
+    } catch (err: any) {
+      setChatError('Plan rejection failed: ' + (err.message || err));
+    } finally {
+      setIsPlanLoading(false);
+    }
+  }
+
+  async function handleModifyPlan(planId: string, feedback: string) {
+    if (!token || !activeConvoId) return;
+    setIsPlanLoading(true);
+    setChatError(null);
+    try {
+      const res = await api.modifyPlan(token, activeConvoId, planId, feedback);
+      setActivePlan(res.plan);
+      setActiveTicket(null);
+      setPlanExecution(null);
+    } catch (err: any) {
+      setChatError('Plan modification failed: ' + (err.message || err));
+    } finally {
+      setIsPlanLoading(false);
+    }
+  }
+
+  async function handleCancelPlan(planId: string) {
+    if (!token || !activeConvoId) return;
+    setIsPlanLoading(true);
+    try {
+      await api.cancelPlan(token, activeConvoId, planId);
+      const updatedPlan = await api.getActivePlan(token, activeConvoId);
+      setActivePlan(updatedPlan);
+    } catch (err: any) {
+      setChatError('Cancel failed: ' + (err.message || err));
+    } finally {
+      setIsPlanLoading(false);
+    }
+  }
+
   async function selectConversation(id: string) {
     if (!token) return;
     setActiveConvoId(id);
+    setActivePlan(null);
+    setActiveTicket(null);
+    setPlanExecution(null);
     setChatError(null);
-    setShowConvosList(false);
+    setShowMenuModal(false);
     try {
       const msgs = await api.getMessages(token, id);
       setMessages(msgs);
+      await loadActivePlan(id);
     } catch (err: any) {
       setChatError('Failed to fetch message history: ' + err.message);
       setUiState('error');
@@ -298,6 +631,9 @@ export default function App() {
     setUser(null);
     setConversations([]);
     setActiveConvoId(null);
+    setActivePlan(null);
+    setActiveTicket(null);
+    setPlanExecution(null);
     setMessages([]);
     setUiState('idle');
   }
@@ -306,7 +642,7 @@ export default function App() {
   async function handleCreateConvo() {
     if (!token) return;
     try {
-      const title = prompt('Enter conversation title:') || `Chat ${conversations.length + 1}`;
+      const title = `Chat ${conversations.length + 1}`;
       const convo = await api.createConversation(token, title);
       setConversations([convo, ...conversations]);
       selectConversation(convo.id);
@@ -337,7 +673,20 @@ export default function App() {
 
   // Direct Message Sender for Voice & Standard Inputs
   async function handleSendMessageDirectly(textToSend: string) {
-    if (!token || !activeConvoId || !textToSend.trim()) return;
+    if (!token || !textToSend.trim()) return;
+
+    let targetConvoId = activeConvoId;
+    if (!targetConvoId) {
+      try {
+        const convo = await api.createConversation(token, 'General Chat');
+        setConversations((prev) => [convo, ...prev]);
+        setActiveConvoId(convo.id);
+        targetConvoId = convo.id;
+      } catch (err: any) {
+        setChatError('Failed to initialize conversation: ' + err.message);
+        return;
+      }
+    }
 
     setChatError(null);
     setUiState('thinking');
@@ -351,6 +700,100 @@ export default function App() {
     };
     setMessages((prev) => [...prev, tempUserMsg]);
 
+    const trimmed = textToSend.trim();
+    const lower = trimmed.toLowerCase();
+
+    // 1. Plan Approval / Rejection / Modification Gate for Active Pending Plans
+    if (activePlan && (activePlan.status === 'awaiting_approval' || activePlan.status === 'pending')) {
+      // 1a. Explicit Plan Approval Command
+      if (/^(?:yes|y|proceed|approve|approved|go ahead|looks good|execute|run plan|confirm|do it|gia,?\s*(?:approve|proceed|execute))\b/i.test(lower)) {
+        await handleApprovePlan(activePlan.id, activePlan.version);
+        return;
+      }
+
+      // 1b. Explicit Plan Rejection / Cancellation Command
+      if (/^(?:no|n|cancel|reject|rejected|abort|stop|discard plan|forget it|gia,?\s*(?:reject|cancel))\b/i.test(lower)) {
+        await handleRejectPlan(activePlan.id, trimmed);
+        return;
+      }
+
+      // 1c. Plan Explanation Request
+      const explainMatch = lower.match(/(?:explain|what does|why do we need)\s+(?:what\s+)?(?:step\s+(\d+)|action\s+(\d+)|this\s+action|this\s+plan|the\s+plan)/i);
+      if (explainMatch) {
+        const stepNum = explainMatch[1] || explainMatch[2];
+        const targetStep = stepNum ? activePlan.steps.find((s) => s.step_id === parseInt(stepNum, 10)) : null;
+        let explanation = '';
+        if (targetStep) {
+          explanation = `🔍 **Explanation for Step ${targetStep.step_id}: ${targetStep.action}**\n\n` +
+            `• **Description:** ${targetStep.description}\n` +
+            `• **Target Resource:** \`${targetStep.target || 'None'}\`\n` +
+            `• **Risk Classification:** **${targetStep.risk_level.toUpperCase()}**\n` +
+            `• **Expected Outcome:** ${targetStep.expected_outcome}\n` +
+            `• **Requires Explicit Approval:** Yes\n\n` +
+            `*This step will not execute until you approve the plan.*`;
+        } else {
+          explanation = `🔍 **Plan Overview for: "${activePlan.objective}"**\n\n` +
+            `This plan consists of ${activePlan.steps.length} atomic steps with status: **${activePlan.status}**.\n` +
+            `No steps will be executed until you give explicit approval.`;
+        }
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Math.random().toString(),
+            role: 'assistant',
+            content: explanation,
+            created_at: new Date().toISOString(),
+          },
+        ]);
+        setUiState('idle');
+        return;
+      }
+
+      // 1d. Plan Modification Request
+      if (
+        lower.startsWith('also ') ||
+        lower.startsWith("don't ") ||
+        lower.startsWith('do not ') ||
+        lower.startsWith('instead ') ||
+        lower.startsWith('remove ') ||
+        lower.startsWith('delete ') ||
+        lower.startsWith('add ') ||
+        lower.startsWith('change ') ||
+        lower.includes('another step') ||
+        lower.includes('second step') ||
+        lower.includes('first step') ||
+        lower.startsWith('modify')
+      ) {
+        await handleModifyPlan(activePlan.id, trimmed);
+        return;
+      }
+    }
+
+    // 2. Actionable Instruction Interception: Mandatory Plan-First Requirement
+    if (isActionableInstruction(trimmed)) {
+      setUiState('thinking');
+      try {
+        const res = await api.createPlan(token, targetConvoId, trimmed);
+        setActivePlan(res.plan);
+        setActiveTicket(null);
+        setPlanExecution(null);
+
+        const presentationMsg: MessageExt = {
+          id: Math.random().toString(),
+          role: 'assistant',
+          content: res.presentation,
+          created_at: new Date().toISOString(),
+        };
+        setMessages((prev) => [...prev, presentationMsg]);
+        setUiState('idle');
+        return;
+      } catch (err: any) {
+        setChatError('Task planning failed: ' + (err.message || err));
+        setUiState('error');
+        return;
+      }
+    }
+
     if (sendMode === 'stream') {
       const tempAssistantMsg: MessageExt = {
         id: Math.random().toString(),
@@ -363,7 +806,7 @@ export default function App() {
 
       api.connectChatStream(
         token,
-        activeConvoId,
+        targetConvoId,
         textToSend,
         (chunk) => {
           setMessages((prev) =>
@@ -374,7 +817,7 @@ export default function App() {
         },
         async () => {
           setUiState('idle');
-          const refreshed = await api.getMessages(token, activeConvoId);
+          const refreshed = await api.getMessages(token, targetConvoId);
           setMessages(refreshed);
         },
         (err) => {
@@ -385,7 +828,7 @@ export default function App() {
       );
     } else if (sendMode === 'sync') {
       try {
-        const response = await api.sendMessageSync(token, activeConvoId, textToSend);
+        const response = await api.sendMessageSync(token, targetConvoId, textToSend);
         setMessages((prev) => [...prev, response]);
         setUiState('idle');
       } catch (err: any) {
@@ -394,7 +837,7 @@ export default function App() {
       }
     } else if (sendMode === 'rag') {
       try {
-        const res = await api.sendMessageRAG(token, activeConvoId, textToSend);
+        const res = await api.sendMessageRAG(token, targetConvoId, textToSend);
         const assistantMsg: MessageExt = {
           ...res.message,
           citations: res.citations,
@@ -421,9 +864,15 @@ export default function App() {
       }, 700);
 
       try {
-        await api.sendMessageAgent(token, activeConvoId, textToSend);
+        const res = await api.sendMessageAgent(token, targetConvoId, textToSend);
         clearTimeout(executionTimer);
-        const refreshed = await api.getMessages(token, activeConvoId);
+        if (res.plan) {
+          setActivePlan(res.plan);
+          if (res.execution) {
+            setPlanExecution(res.execution);
+          }
+        }
+        const refreshed = await api.getMessages(token, targetConvoId);
         setMessages(refreshed);
         setUiState('idle');
       } catch (err: any) {
@@ -567,9 +1016,15 @@ export default function App() {
             <div className={`state-indicator ${uiState}`}>
               <span className="state-dot" />
               <span>
-                {uiState === 'idle' && 'Idle'}
+                {uiState === 'idle' && (
+                  modelStatus === 'loading'
+                    ? 'Model Loading (Qwen 3.5)...'
+                    : modelStatus === 'failed'
+                    ? 'AI Engine Offline'
+                    : 'Ready (Qwen 3.5 4B • Local)'
+                )}
                 {uiState === 'chatting' && 'Typing...'}
-                {uiState === 'thinking' && 'Thinking...'}
+                {uiState === 'thinking' && 'Inference Active (Qwen 3.5 4B)...'}
                 {uiState === 'executing' && `Running ${activeTool}...`}
                 {uiState === 'error' && 'System Error'}
               </span>
@@ -578,38 +1033,18 @@ export default function App() {
         </div>
 
         <div className="header-actions">
-          {/* Switch Conversation List toggle */}
           <button 
-            className={`icon-btn ${showConvosList ? 'active' : ''}`} 
-            onClick={() => { setShowConvosList(!showConvosList); setActiveDrawer('none'); }}
-            title="Conversations"
+            className="new-chat-pill-btn" 
+            onClick={handleCreateConvo}
+            title="Start New Chat"
           >
-            💬
+            + New
           </button>
           
-          {/* Memories */}
           <button 
-            className={`icon-btn ${activeDrawer === 'memories' ? 'active' : ''}`} 
-            onClick={() => { setActiveDrawer(activeDrawer === 'memories' ? 'none' : 'memories'); setShowConvosList(false); }}
-            title="Memory Subsystem"
-          >
-            🧠
-          </button>
-
-          {/* RAG Documents */}
-          <button 
-            className={`icon-btn ${activeDrawer === 'documents' ? 'active' : ''}`} 
-            onClick={() => { setActiveDrawer(activeDrawer === 'documents' ? 'none' : 'documents'); setShowConvosList(false); }}
-            title="Document Index"
-          >
-            📂
-          </button>
-
-          {/* System Settings */}
-          <button 
-            className={`icon-btn ${activeDrawer === 'settings' ? 'active' : ''}`} 
-            onClick={() => { setActiveDrawer(activeDrawer === 'settings' ? 'none' : 'settings'); setShowConvosList(false); }}
-            title="System Diagnostics"
+            className={`icon-btn ${showMenuModal ? 'active' : ''}`} 
+            onClick={() => setShowMenuModal(!showMenuModal)}
+            title="Settings & Tools"
           >
             ⚙️
           </button>
@@ -645,24 +1080,27 @@ export default function App() {
                         ))}
                       </div>
                     )}
-
-                    {/* Agent FSM steps */}
-                    {m.metadata && m.metadata.steps && (
-                      <details className="telemetry-details">
-                        <summary>Check GIA execution steps ({m.metadata.steps.length})</summary>
-                        <div className="telemetry-step-list">
-                          {m.metadata.steps.map((step: any, idx: number) => (
-                            <div key={idx} className="telemetry-step-item">
-                              <span className="step-node">Node: <strong>{step.node}</strong></span>
-                            </div>
-                          ))}
-                        </div>
-                      </details>
-                    )}
                   </div>
                 </div>
               ))
             )}
+
+            {/* PLAN CARD INTEGRATION (Phase 4) */}
+            {activePlan && (
+              <div className="active-plan-banner-wrapper">
+                <PlanCard
+                  plan={activePlan}
+                  execution={planExecution}
+                  isLoading={isPlanLoading}
+                  onApprove={handleApprovePlan}
+                  onReject={handleRejectPlan}
+                  onModify={handleModifyPlan}
+                  onCancel={handleCancelPlan}
+                  onExecute={(planId, version) => handleExecutePlan(planId, version)}
+                />
+              </div>
+            )}
+            <div ref={messagesEndRef} />
           </div>
         ) : (
           <div className="welcome-chat">
@@ -731,7 +1169,7 @@ export default function App() {
           {chatError && (
             <div className="state-banner error-banner">
               <span>⚠️ Error: {chatError}</span>
-              <button className="dismiss-error-btn" onClick={() => setUiState('idle')}>&times;</button>
+              <button className="dismiss-error-btn" onClick={() => { setChatError(null); setUiState('idle'); }}>&times;</button>
             </div>
           )}
 
@@ -763,185 +1201,199 @@ export default function App() {
               </button>
             </div>
 
-            {/* Compact Chat Mode Selector */}
-            <div className="composer-selectors">
-              <label className={`selector-chip ${sendMode === 'agent' ? 'active' : ''}`}>
-                <input type="radio" name="sendMode" value="agent" checked={sendMode === 'agent'} onChange={() => setSendMode('agent')} />
-                🤖 Agent
-              </label>
-              <label className={`selector-chip ${sendMode === 'stream' ? 'active' : ''}`}>
-                <input type="radio" name="sendMode" value="stream" checked={sendMode === 'stream'} onChange={() => setSendMode('stream')} />
-                ⚡ Stream
-              </label>
-              <label className={`selector-chip ${sendMode === 'rag' ? 'active' : ''}`}>
-                <input type="radio" name="sendMode" value="rag" checked={sendMode === 'rag'} onChange={() => setSendMode('rag')} />
-                🔍 RAG
-              </label>
-              <label className={`selector-chip ${sendMode === 'sync' ? 'active' : ''}`}>
-                <input type="radio" name="sendMode" value="sync" checked={sendMode === 'sync'} onChange={() => setSendMode('sync')} />
-                💬 Sync
-              </label>
-            </div>
           </form>
         </footer>
       )}
 
-      {/* OVERLAY PANEL DRAWERS */}
-
-      {/* 1. Switch Conversation overlay */}
-      {showConvosList && (
-        <div className="convo-switcher-drawer backdrop-blur">
-          <div className="drawer-header">
-            <h4>Select Discussion</h4>
-            <button className="close-drawer-btn" onClick={() => setShowConvosList(false)}>&times;</button>
-          </div>
-          <button className="new-convo-btn" onClick={handleCreateConvo}>+ Start New Chat</button>
-          <div className="convo-list-scroll">
-            {isConversationsLoading ? (
-              <div className="empty-state">Loading discussions...</div>
-            ) : conversations.length === 0 ? (
-              <div className="empty-state">No discussions found.</div>
-            ) : (
-              conversations.map((c) => (
-                <div key={c.id} className={`convo-item ${activeConvoId === c.id ? 'active' : ''}`} onClick={() => selectConversation(c.id)}>
-                  <div className="convo-title-box">
-                    <span>💬</span>
-                    <span className="convo-title-text">{c.title}</span>
-                  </div>
-                  <button className="delete-convo-btn" onClick={(e) => handleDeleteConvo(c.id, e)}>&times;</button>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* 2. Memories overlay */}
-      {activeDrawer === 'memories' && (
+      {/* UNIFIED MENU & SETTINGS DRAWER (One Modal for Chats, Documents, Memories, and System) */}
+      {showMenuModal && (
         <div className="drawer-panel backdrop-blur">
           <div className="drawer-header">
-            <h4>🧠 Memory Subsystem</h4>
-            <button className="close-drawer-btn" onClick={() => setActiveDrawer('none')}>&times;</button>
-          </div>
-          <div className="drawer-content">
-            <div className="drawer-inner">
-              <form onSubmit={handleAddMemory} className="drawer-form">
-                <div className="form-group">
-                  <label>Store user preferences & facts</label>
-                  <textarea placeholder="The user prefers typescript..." value={newMemoryText} onChange={(e) => setNewMemoryText(e.target.value)} required />
-                </div>
-                <div className="form-group">
-                  <label>Importance (1 - 10)</label>
-                  <input type="number" min="1" max="10" value={newMemoryImportance} onChange={(e) => setNewMemoryImportance(Number(e.target.value))} />
-                </div>
-                <button type="submit" className="auth-submit-btn">Save preference</button>
-              </form>
-
-              {memoryError && <div className="alert error">{memoryError}</div>}
-
-              <div className="drawer-list">
-                <h5>Extracted Facts ({memories.length})</h5>
-                {memories.length === 0 ? (
-                  <div className="empty-state">No items stored.</div>
-                ) : (
-                  memories.map((m) => (
-                    <div key={m.id} className="drawer-item">
-                      <div className="item-text">{m.content}</div>
-                      <div className="item-meta">
-                        <span>Importance: {m.importance}</span>
-                        <button className="del-item-btn" onClick={() => handleDeleteMemory(m.id)}>Delete</button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
+            <div className="modal-tabs">
+              <button className={`modal-tab ${menuTab === 'chats' ? 'active' : ''}`} onClick={() => setMenuTab('chats')}>
+                💬 Chats ({conversations.length})
+              </button>
+              <button className={`modal-tab ${menuTab === 'documents' ? 'active' : ''}`} onClick={() => setMenuTab('documents')}>
+                📂 Docs ({documents.length})
+              </button>
+              <button className={`modal-tab ${menuTab === 'memories' ? 'active' : ''}`} onClick={() => setMenuTab('memories')}>
+                🧠 Memories ({memories.length})
+              </button>
+              <button className={`modal-tab ${menuTab === 'system' ? 'active' : ''}`} onClick={() => setMenuTab('system')}>
+                ⚙️ System
+              </button>
             </div>
+            <button className="close-drawer-btn" onClick={() => setShowMenuModal(false)}>&times;</button>
           </div>
-        </div>
-      )}
 
-      {/* 3. Documents overlay */}
-      {activeDrawer === 'documents' && (
-        <div className="drawer-panel backdrop-blur">
-          <div className="drawer-header">
-            <h4>📂 Document Index (RAG)</h4>
-            <button className="close-drawer-btn" onClick={() => setActiveDrawer('none')}>&times;</button>
-          </div>
           <div className="drawer-content">
             <div className="drawer-inner">
-              <div className="upload-box">
-                <label className="upload-label">
-                  <input type="file" ref={fileInputRef} onChange={handleUploadDocument} disabled={isUploading} style={{ display: 'none' }} />
-                  <span>{isUploading ? 'Ingesting chunks...' : '📄 Click to upload document'}</span>
-                </label>
-              </div>
-
-              {documentError && <div className="alert error">{documentError}</div>}
-
-              <div className="drawer-list">
-                <h5>Indexed Files ({documents.length})</h5>
-                {documents.length === 0 ? (
-                  <div className="empty-state">No documents indexed.</div>
-                ) : (
-                  documents.map((d) => (
-                    <div key={d.id} className="drawer-item">
-                      <div className="item-text">{d.name}</div>
-                      <div className="item-meta">
-                        <span>{(d.file_size ? d.file_size / 1024 : 0).toFixed(1)} KB</span>
-                        <button className="del-item-btn" onClick={() => handleDeleteDocument(d.id)}>Delete</button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 4. Settings/Specs overlay */}
-      {activeDrawer === 'settings' && (
-        <div className="drawer-panel backdrop-blur">
-          <div className="drawer-header">
-            <h4>⚙️ Diagnostics & Gateways</h4>
-            <button className="close-drawer-btn" onClick={() => setActiveDrawer('none')}>&times;</button>
-          </div>
-          <div className="drawer-content">
-            <div className="drawer-inner">
-              <div className="form-group">
-                <label>Active Cognitive LLM Slot</label>
-                <select value={modelSlot} onChange={(e) => setModelSlot(e.target.value as any)}>
-                  <option value="fast">Fast Completion Engine (Gemini)</option>
-                  <option value="general">General (OpenAI)</option>
-                  <option value="reasoning">Deep Reasoning (Anthropic)</option>
-                </select>
-              </div>
-
-              <div className="system-specs">
-                <h5>System Specs</h5>
-                <ul>
-                  <li><span>Health Status</span> <span style={{color: healthStatus === 'Online' ? 'var(--success-color)' : 'var(--error-color)'}}>{healthStatus}</span></li>
-                  <li><span>Mic Permission</span> <span style={{textTransform: 'capitalize'}}>{micPermissionStatus}</span></li>
-                  <li><span>Gateway Mode</span> <span>Dynamic Router</span></li>
-                  <li><span>Max Agent Steps</span> <span>5 steps limit</span></li>
-                </ul>
-                <button
-                  type="button"
-                  className="btn-grant-access"
-                  style={{ marginTop: '12px', fontSize: '0.8rem', padding: '8px 12px' }}
-                  onClick={() => setShowMicTestModal(true)}
-                >
-                  🎙️ Run Native Microphone Capture Test
-                </button>
-              </div>
-
-              <div className="settings-user-bar">
+              {menuTab === 'chats' && (
                 <div>
-                  <div style={{fontSize: '0.8rem', fontWeight: 600}}>{user?.name}</div>
-                  <div style={{fontSize: '0.7rem', color: 'var(--text-secondary)'}}>{user?.email}</div>
+                  <button className="new-convo-btn" onClick={() => { handleCreateConvo(); setShowMenuModal(false); }}>
+                    + Start New Chat
+                  </button>
+                  <div className="convo-list-scroll">
+                    {isConversationsLoading ? (
+                      <div className="empty-state">Loading chats...</div>
+                    ) : conversations.length === 0 ? (
+                      <div className="empty-state">No conversations yet.</div>
+                    ) : (
+                      conversations.map((c) => (
+                        <div key={c.id} className={`convo-item ${activeConvoId === c.id ? 'active' : ''}`} onClick={() => { selectConversation(c.id); setShowMenuModal(false); }}>
+                          <div className="convo-title-box">
+                            <span>💬</span>
+                            <span className="convo-title-text">{c.title}</span>
+                          </div>
+                          <button className="delete-convo-btn" onClick={(e) => handleDeleteConvo(c.id, e)}>&times;</button>
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </div>
-                <button className="del-item-btn" onClick={handleLogout}>Log out</button>
-              </div>
+              )}
+
+              {menuTab === 'documents' && (
+                <div>
+                  <div className="upload-box">
+                    <label className="upload-label">
+                      <input type="file" ref={fileInputRef} onChange={handleUploadDocument} disabled={isUploading} style={{ display: 'none' }} />
+                      <span>{isUploading ? 'Ingesting chunks...' : '📄 Click to upload document (PDF, TXT, MD)'}</span>
+                    </label>
+                  </div>
+                  {documentError && <div className="alert error">{documentError}</div>}
+                  <div className="drawer-list">
+                    <h5>Indexed Documents ({documents.length})</h5>
+                    {documents.length === 0 ? (
+                      <div className="empty-state">No documents indexed. Upload files above to enable local RAG search.</div>
+                    ) : (
+                      documents.map((d) => (
+                        <div key={d.id} className="drawer-item">
+                          <div className="item-text">{d.name}</div>
+                          <div className="item-meta">
+                            <span>{(d.file_size ? d.file_size / 1024 : 0).toFixed(1)} KB</span>
+                            <button className="del-item-btn" onClick={() => handleDeleteDocument(d.id)}>Delete</button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {menuTab === 'memories' && (
+                <div>
+                  <form onSubmit={handleAddMemory} className="drawer-form">
+                    <div className="form-group">
+                      <label>Store user preferences & facts</label>
+                      <textarea placeholder="e.g., The user prefers concise code examples..." value={newMemoryText} onChange={(e) => setNewMemoryText(e.target.value)} required />
+                    </div>
+                    <div className="form-group">
+                      <label>Importance (1 - 10)</label>
+                      <input type="number" min="1" max="10" value={newMemoryImportance} onChange={(e) => setNewMemoryImportance(Number(e.target.value))} />
+                    </div>
+                    <button type="submit" className="auth-submit-btn">Save Preference</button>
+                  </form>
+                  {memoryError && <div className="alert error">{memoryError}</div>}
+                  <div className="drawer-list">
+                    <h5>Stored Preferences ({memories.length})</h5>
+                    {memories.length === 0 ? (
+                      <div className="empty-state">No preferences stored yet.</div>
+                    ) : (
+                      memories.map((m) => (
+                        <div key={m.id} className="drawer-item">
+                          <div className="item-text">{m.content}</div>
+                          <div className="item-meta">
+                            <span>Importance: {m.importance}</span>
+                            <button className="del-item-btn" onClick={() => handleDeleteMemory(m.id)}>Delete</button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {menuTab === 'system' && (
+                <div>
+                  <div className="system-specs">
+                    <h5>Local AI Architecture & Diagnostics</h5>
+                    <ul>
+                      <li><span>Inference Engine</span> <span>Local Qwen 3.5 4B</span></li>
+                      <li>
+                        <span>Model State</span>
+                        <span style={{ color: modelStatus === 'ready' ? 'var(--success-color)' : modelStatus === 'loading' ? '#f59e0b' : 'var(--error-color)', fontWeight: 600 }}>
+                          {modelStatus === 'ready' ? 'Ready (Apple Silicon MPS)' : modelStatus === 'loading' ? 'Loading Weights...' : 'Offline'}
+                        </span>
+                      </li>
+                      <li><span>Speech-to-Text</span> <span>Faster-Whisper Tiny (Local Int8)</span></li>
+                      <li><span>Speech Synthesis</span> <span>macOS Native say (Samantha)</span></li>
+                      <li><span>Vector Embeddings</span> <span>all-MiniLM-L6-v2 (384-dim)</span></li>
+                      <li><span>Wake-Word Gate</span> <span style={{ color: 'var(--success-color)' }}>Active ("Hey GIA")</span></li>
+                      {healthReport?.latency?.llm !== undefined && (
+                        <li><span>LLM Latency</span> <span>{healthReport.latency.llm} ms</span></li>
+                      )}
+                      <li><span>Overall Health</span> <span style={{ color: healthStatus === 'Online' ? 'var(--success-color)' : 'var(--error-color)' }}>{healthStatus}</span></li>
+                      <li><span>Mic Permission</span> <span style={{ textTransform: 'capitalize' }}>{micPermissionStatus}</span></li>
+                    </ul>
+
+                    {serviceStatuses.length > 0 && (
+                      <div style={{ marginTop: '10px', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                        <div style={{ fontWeight: 600, marginBottom: '4px' }}>Local Services:</div>
+                        {serviceStatuses.map((s) => (
+                          <div key={s.name} style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 0' }}>
+                            <span>{s.name} (:{s.port})</span>
+                            <span style={{ color: s.status === 'running' ? 'var(--success-color)' : '#f59e0b' }}>
+                              {s.status} {s.is_attached ? '(attached)' : s.pid ? `(pid ${s.pid})` : ''}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+                      <button
+                        type="button"
+                        className="btn-grant-access"
+                        style={{ flex: 1, fontSize: '0.75rem', padding: '6px 10px' }}
+                        onClick={checkBackendHealth}
+                      >
+                        🔄 Refresh Health
+                      </button>
+                      {healthStatus !== 'Online' && (
+                        <button
+                          type="button"
+                          className="del-item-btn"
+                          style={{ fontSize: '0.75rem', padding: '6px 10px' }}
+                          onClick={async () => {
+                            await restartService('python_ai_service');
+                            setTimeout(checkBackendHealth, 1500);
+                          }}
+                        >
+                          Restart AI Service
+                        </button>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      className="btn-grant-access"
+                      style={{ marginTop: '8px', width: '100%', fontSize: '0.75rem', padding: '8px 12px' }}
+                      onClick={() => setShowMicTestModal(true)}
+                    >
+                      🎙️ Run Native Microphone Capture Test
+                    </button>
+                  </div>
+
+                  <div className="settings-user-bar">
+                    <div>
+                      <div style={{fontSize: '0.8rem', fontWeight: 600}}>{user?.name}</div>
+                      <div style={{fontSize: '0.7rem', color: 'var(--text-secondary)'}}>{user?.email}</div>
+                    </div>
+                    <button className="del-item-btn" onClick={handleLogout}>Log Out</button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
