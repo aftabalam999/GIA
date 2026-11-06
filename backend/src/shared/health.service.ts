@@ -1,7 +1,6 @@
 import { config } from '../config/index.js';
 import { checkConnection } from '../database/client.js';
 import { redis } from './redis.js';
-import { ROUTER_CONFIGS } from '../ai/router/config.js';
 import { logger } from './logger.js';
 
 import { aiServiceClient } from '../ai/ml-client/ai-service.client.js';
@@ -151,8 +150,7 @@ export class HealthService {
       logger.error({ msg: 'Health probe Python AI service check error', err: err.message });
     }
 
-    // 4. Probe LLM API
-    const llmProvider = ROUTER_CONFIGS.general.provider;
+    // 4. Probe Local Qwen LLM
     const llmStart = Date.now();
     if (healthTestOverrides.llmHealthy !== null) {
       report.dependencies.llm = healthTestOverrides.llmHealthy ? 'healthy' : 'unhealthy';
@@ -162,19 +160,16 @@ export class HealthService {
       report.latency.llm = 5;
     } else {
       try {
-        const status = await this.probeLLMProvider(llmProvider);
+        const status = await this.probeLocalQwen();
         report.dependencies.llm = status;
-        if (status !== 'unconfigured') {
-          report.latency.llm = Date.now() - llmStart;
-        }
+        report.latency.llm = Date.now() - llmStart;
       } catch (err: any) {
         report.dependencies.llm = 'unhealthy';
-        logger.error({ msg: 'Health probe LLM API error', err: err.message });
+        logger.error({ msg: 'Health probe Local Qwen LLM error', err: err.message });
       }
     }
 
-    // 5. Probe Embeddings API
-    const hasOpenAIKey = !!config.OPENAI_API_KEY;
+    // 5. Probe Local Python Embeddings
     const embStart = Date.now();
     if (healthTestOverrides.embeddingsHealthy !== null) {
       report.dependencies.embeddings = healthTestOverrides.embeddingsHealthy ? 'healthy' : 'unhealthy';
@@ -182,16 +177,14 @@ export class HealthService {
     } else if (config.NODE_ENV === 'test') {
       report.dependencies.embeddings = 'healthy';
       report.latency.embeddings = 5;
-    } else if (!hasOpenAIKey) {
-      report.dependencies.embeddings = 'unconfigured';
     } else {
       try {
-        const status = await this.probeOpenAI(config.OPENAI_API_KEY || '');
+        const status = await this.probeLocalEmbeddings();
         report.dependencies.embeddings = status;
         report.latency.embeddings = Date.now() - embStart;
       } catch (err: any) {
         report.dependencies.embeddings = 'unhealthy';
-        logger.error({ msg: 'Health probe Embeddings API error', err: err.message });
+        logger.error({ msg: 'Health probe Local Embeddings error', err: err.message });
       }
     }
 
@@ -201,8 +194,8 @@ export class HealthService {
       report.status = 'unhealthy';
     } else {
       const isPyReady = report.dependencies.python_ai_service === 'healthy';
-      const isLlmHealthy = report.dependencies.llm === 'healthy' || report.dependencies.llm === 'unconfigured';
-      const isEmbHealthy = report.dependencies.embeddings === 'healthy' || report.dependencies.embeddings === 'unconfigured';
+      const isLlmHealthy = report.dependencies.llm === 'healthy';
+      const isEmbHealthy = report.dependencies.embeddings === 'healthy';
 
       if (!isPyReady || !isLlmHealthy || !isEmbHealthy) {
         report.status = 'degraded';
@@ -214,60 +207,41 @@ export class HealthService {
     return report;
   }
 
-  private static async probeLLMProvider(provider: string): Promise<'healthy' | 'unhealthy' | 'unconfigured'> {
-    if (!config.GOOGLE_AI_API_KEY) return 'unconfigured';
-    return this.probeGemini(config.GOOGLE_AI_API_KEY);
-  }
-
-  private static async probeOpenAI(apiKey: string): Promise<'healthy' | 'unhealthy'> {
+  private static async probeLocalQwen(): Promise<'healthy' | 'unhealthy'> {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      const res = await fetch('https://api.openai.com/v1/models', {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        signal: controller.signal,
-      });
+      const url = `${(config.AI_SERVICE_URL || 'http://127.0.0.1:8001').replace(/\/+$/, '')}/api/llm/health`;
+      const res = await fetch(url, { signal: controller.signal });
       clearTimeout(id);
-      return res.status === 200 ? 'healthy' : 'unhealthy';
+      if (res.status === 200) {
+        const body = (await res.json()) as any;
+        return body.ready || body.model_loaded ? 'healthy' : 'unhealthy';
+      }
+      return 'unhealthy';
     } catch {
       clearTimeout(id);
       return 'unhealthy';
     }
   }
 
-  private static async probeGemini(apiKey: string): Promise<'healthy' | 'unhealthy'> {
+  private static async probeLocalEmbeddings(): Promise<'healthy' | 'unhealthy'> {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, {
-        signal: controller.signal,
-      });
-      clearTimeout(id);
-      return res.status === 200 ? 'healthy' : 'unhealthy';
-    } catch {
-      clearTimeout(id);
-      return 'unhealthy';
-    }
-  }
-
-  private static async probeAnthropic(apiKey: string): Promise<'healthy' | 'unhealthy'> {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
+      const url = `${(config.AI_SERVICE_URL || 'http://127.0.0.1:8001').replace(/\/+$/, '')}/v1/embeddings/status`;
+      const res = await fetch(url, {
         headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'Content-Type': 'application/json',
+          'x-internal-api-key': config.INTERNAL_API_KEY,
         },
-        body: JSON.stringify({}),
         signal: controller.signal,
       });
       clearTimeout(id);
-      // Sending an empty request yields 400 Bad Request if authenticated and reachable,
-      // whereas bad keys yield 401 Unauthorized, and timeout/network drops yield exceptions.
-      return res.status === 400 ? 'healthy' : 'unhealthy';
+      if (res.status === 200) {
+        const body = (await res.json()) as any;
+        return body.is_ready ? 'healthy' : 'unhealthy';
+      }
+      return 'unhealthy';
     } catch {
       clearTimeout(id);
       return 'unhealthy';

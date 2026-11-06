@@ -19,6 +19,8 @@ export interface VectorStore {
     userId: string,
     embedding: number[],
     limit?: number,
-    threshold?: number
+    threshold?: number,
+    category?: string,
+    metadataFilter?: Record<string, any>
   ): Promise<VectorSearchResult[]>;
 }

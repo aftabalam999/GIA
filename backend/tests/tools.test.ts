@@ -313,5 +313,47 @@ describe('GIA Tool execution Integration Tests (Phase 16)', () => {
       expect(result.assistantMessage.content).toBe('The current time is 2026-08-29T12:00:00Z');
       expect(mockLLM.callCount).toBe(2);
     });
+
+    it('should successfully execute get_system_info tool and return hardware and battery diagnostics', async () => {
+      const res: ToolResult = await ToolExecutor.executeTool(userId, 'get_system_info', {});
+      expect(res.success).toBe(true);
+      expect(res.result.info.os).toBeDefined();
+      expect(res.result.info.cpu).toBeDefined();
+      expect(res.result.info.memory).toBeDefined();
+      expect(res.result.info.battery).toBeDefined();
+      expect(res.result.message).toContain('Laptop System Information');
+    });
+
+    it('should successfully execute list_directory tool for Desktop or root directory', async () => {
+      const res: ToolResult = await ToolExecutor.executeTool(userId, 'list_directory', {});
+      expect(res.success).toBe(true);
+      expect(res.result.directory).toBeDefined();
+      expect(Array.isArray(res.result.entries)).toBe(true);
+      expect(res.result.message).toContain('Found');
+    });
+
+    it('should successfully execute read_file_content tool and enforce boundary checks', async () => {
+      // Test reading package.json inside home or project
+      const res: ToolResult = await ToolExecutor.executeTool(userId, 'read_file_content', {
+        filePath: 'Desktop/GIA-AI/backend/package.json',
+      });
+      expect(res.success).toBe(true);
+      expect(res.result.content).toBeDefined();
+      expect(res.result.content).toContain('backend');
+
+      // Test path traversal blocking
+      const deniedRes = await ToolExecutor.executeTool(userId, 'read_file_content', { filePath: '/etc/shadow' });
+      expect(deniedRes.success).toBe(false);
+      expect(deniedRes.error).toMatch(/Access denied/);
+    });
+
+    it('should successfully execute search_files tool across laptop directories', async () => {
+      const res: ToolResult = await ToolExecutor.executeTool(userId, 'search_files', {
+        query: 'package.json',
+      });
+      expect(res.success).toBe(true);
+      expect(res.result.count).toBeGreaterThanOrEqual(1);
+      expect(res.result.message).toContain('package.json');
+    });
   });
 });

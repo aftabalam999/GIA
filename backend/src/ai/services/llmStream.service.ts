@@ -11,7 +11,7 @@ export interface StreamGenerationCallbacks {
   onError?: (error: Error) => void;
 }
 
-export class GeminiStreamHandle {
+export class LLMStreamHandle {
   private controller: AbortController;
   private _isCancelled = false;
   private _isCompleted = false;
@@ -33,13 +33,13 @@ export class GeminiStreamHandle {
   }
 
   /**
-   * Immediately halts active Gemini text stream generation.
+   * Immediately halts active local LLM text stream generation.
    */
   public cancelGeneration(): void {
     if (this._isCancelled || this._isCompleted) return;
     this._isCancelled = true;
     this.controller.abort();
-    logger.info({ msg: '🛑 [GEMINI STREAM] Stream generation cancelled by caller' });
+    logger.info({ msg: '🛑 [LLM STREAM] Stream generation cancelled by caller' });
   }
 
   public markCompleted(): void {
@@ -48,20 +48,20 @@ export class GeminiStreamHandle {
 }
 
 /**
- * GeminiStreamService provides an event-driven incremental streaming abstraction over Google Gemini.
+ * LLMStreamService provides an event-driven incremental streaming abstraction over the local LLM.
  * Dispatches raw text chunks and speech-ready chunks immediately without full response buffering.
  */
-export class GeminiStreamService {
+export class LLMStreamService {
   /**
-   * Initiates streaming generation for Afiya.
-   * Returns a GeminiStreamHandle exposing cancelGeneration().
+   * Initiates streaming generation for GIA using the local Qwen 3.5 4B model.
+   * Returns an LLMStreamHandle exposing cancelGeneration().
    */
   static startGeneration(
     request: LLMRequest,
     callbacks: StreamGenerationCallbacks,
     options: GatewayOptions = {}
-  ): GeminiStreamHandle {
-    const handle = new GeminiStreamHandle();
+  ): LLMStreamHandle {
+    const handle = new LLMStreamHandle();
     const chunker = new SpeechTextChunker();
 
     (async () => {
@@ -105,14 +105,13 @@ export class GeminiStreamService {
           }
         }
       } catch (err: any) {
-        chunker.cancel();
-        if (handle.isCancelled || handle.signal.aborted || err.name === 'AbortError') {
-          logger.info({ msg: 'Gemini stream generation aborted cleanly' });
+        if (handle.isCancelled || handle.signal.aborted) {
+          logger.info({ msg: 'Local LLM stream generation aborted cleanly' });
           return;
         }
-        logger.error({ msg: 'Gemini stream generation encountered an error', err: err.message });
+        logger.error({ msg: 'Local LLM stream generation encountered an error', err: err.message });
         if (callbacks.onError) {
-          callbacks.onError(err instanceof Error ? err : new Error(String(err)));
+          callbacks.onError(err);
         }
       }
     })();
@@ -120,3 +119,5 @@ export class GeminiStreamService {
     return handle;
   }
 }
+
+

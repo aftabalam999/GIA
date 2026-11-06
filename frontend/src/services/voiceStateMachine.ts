@@ -9,8 +9,7 @@
 import { voiceLatencyTracker } from './voiceLatencyTracker.js';
 import { SpeechTextChunker } from './textChunker.js';
 import { StreamingAudioQueue } from './streamingAudioQueue.js';
-
-import { LiveVoiceController } from './liveVoiceController.js';
+import { detectWakeWord } from '../utils/wakeWord.js';
 
 export type VoiceState =
   | 'IDLE'
@@ -39,6 +38,7 @@ export interface VoiceStateMachineCallbacks {
   fetchTtsApi?: (text: string) => Promise<ArrayBuffer | Buffer>;
   playAudioApi?: (audioBuffer: ArrayBuffer | Buffer) => Promise<void>;
   enableLiveMode?: boolean;
+  requireWakeWord?: boolean;
 }
 
 export class VoiceStateMachine {
@@ -52,7 +52,6 @@ export class VoiceStateMachine {
   private _isProcessingUtterance: boolean = false;
   private _streamingQueue: StreamingAudioQueue | null = null;
   private _currentGenerationId: number = 0;
-  private _liveController: LiveVoiceController | null = null;
   private _isLiveMode: boolean = false;
 
   constructor(callbacks: VoiceStateMachineCallbacks = {}) {
@@ -72,11 +71,11 @@ export class VoiceStateMachine {
   }
 
   public get isLiveMode(): boolean {
-    return this._isLiveMode;
+    return false;
   }
 
-  public get liveController(): LiveVoiceController | null {
-    return this._liveController;
+  public get liveController(): null {
+    return null;
   }
 
   public get currentGenerationId(): number {
@@ -140,11 +139,11 @@ export class VoiceStateMachine {
     }
   }
 
-  public static readonly WELCOME_GREETING = "Hello! I am Afiya, your AI assistant. How can I help you today?";
+  public static readonly WELCOME_GREETING = "Hello! I am GIA, your local AI assistant. How can I help you today?";
 
   /**
    * Explicitly enables persistent continuous Voice Mode (VOICE_MODE = ON).
-   * Attempts Gemini Live mode first, falling back to STT/TTS pipeline if unavailable.
+   * Operates fully local STT/TTS and local Qwen pipeline.
    */
   public async startVoiceMode(conversationId: string, token: string, speakWelcome = true): Promise<void> {
     if (this._isVoiceModeOn) return;
@@ -155,30 +154,6 @@ export class VoiceStateMachine {
     this._token = token;
 
     this.setState('STARTING');
-
-    const liveEnabled = this._callbacks.enableLiveMode !== false;
-    if (liveEnabled) {
-      try {
-        const controller = new LiveVoiceController(this, {
-          onStateChange: (s) => this.setState(s),
-          onTranscript: (t) => {
-            if (this._callbacks.onTranscript) this._callbacks.onTranscript(t);
-          },
-          onAssistantResponse: (u, a) => {
-            if (this._callbacks.onAssistantResponse) this._callbacks.onAssistantResponse(u, a);
-          },
-          onError: (err) => this.handleError(err),
-        });
-
-        await controller.start(conversationId, token);
-        this._liveController = controller;
-        this._isLiveMode = true;
-      } catch (err: any) {
-        console.warn('[VOICE] Gemini Live initialization failed. Falling back to STT/TTS pipeline:', err.message);
-        this._isLiveMode = false;
-        this._liveController = null;
-      }
-    }
 
     if (speakWelcome && this._callbacks.fetchTtsApi && this._callbacks.playAudioApi) {
       try {
@@ -208,16 +183,6 @@ export class VoiceStateMachine {
 
     this._isVoiceModeOn = false;
     this._currentGenerationId++;
-
-    if (this._liveController) {
-      try {
-        this._liveController.stop();
-      } catch {
-        // ignore
-      }
-      this._liveController = null;
-    }
-    this._isLiveMode = false;
 
     if (this._streamingQueue) {
       this._streamingQueue.cancel();
@@ -263,10 +228,6 @@ export class VoiceStateMachine {
 
     console.log('[VOICE] interrupted');
     this._currentGenerationId++;
-
-    if (this._isLiveMode && this._liveController) {
-      this._liveController.handleInterruption();
-    }
 
     if (this._activeAbortController) {
       try {
@@ -334,8 +295,56 @@ export class VoiceStateMachine {
         return;
       }
 
-      // Directly process captured user speech when Voice Mode is ON
-      const commandText = transcriptText.trim();
+      let commandText = transcriptText.trim();
+
+      // Enforce GIA wake-word authorization when requireWakeWord is enabled
+      if (this._callbacks.requireWakeWord) {
+        const wakeResult = detectWakeWord(commandText);
+        if (!wakeResult.isAuthorized) {
+          console.log('[VOICE] Command ignored: wake-word authorization required');
+          this._isSessionActive = false;
+          this._isProcessingUtterance = false;
+          if (this._callbacks.onTranscript) {
+            this._callbacks.onTranscript(commandText + ' (Ignored: Wake word required)');
+          }
+          if (this._isVoiceModeOn) {
+            this.setState('LISTENING');
+          }
+          return;
+        }
+
+        // If wake-only (e.g. "Hey GIA"):
+        if (wakeResult.isWakeOnly || !wakeResult.command) {
+          const greetingReply = "I'm listening. How can I help you today?";
+          this._isSessionActive = true;
+          if (this._callbacks.onTranscript) {
+            this._callbacks.onTranscript(commandText);
+          }
+          if (this._callbacks.onAssistantResponse) {
+            this._callbacks.onAssistantResponse(
+              { content: commandText },
+              { content: greetingReply }
+            );
+          }
+          if (this._callbacks.fetchTtsApi && this._callbacks.playAudioApi) {
+            this.setState('SYNTHESIZING');
+            const audioBuf = await this._callbacks.fetchTtsApi(greetingReply);
+            if (this.checkInterrupted(utteranceGenId)) return;
+            this.setState('PLAYING');
+            await this._callbacks.playAudioApi(audioBuf);
+          }
+          this._isProcessingUtterance = false;
+          this._activeAbortController = null;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          if (this._isVoiceModeOn) {
+            this.setState('LISTENING');
+          }
+          return;
+        }
+
+        commandText = wakeResult.command;
+      }
+
       this._isSessionActive = true;
 
       if (this._callbacks.onTranscript) {
@@ -347,7 +356,7 @@ export class VoiceStateMachine {
       // 2. PROCESSING: Send command to AI Orchestrator & Stream Speech Chunks
       this.setState('PROCESSING');
       let assistantReplyText = '';
-      voiceLatencyTracker.record('geminiRequestStart');
+      voiceLatencyTracker.record('llmRequestStart');
 
       // Initialize StreamingAudioQueue if TTS and Playback APIs are registered
       if (this._callbacks.fetchTtsApi && this._callbacks.playAudioApi) {
@@ -399,7 +408,7 @@ export class VoiceStateMachine {
       if (this._callbacks.fetchStreamChatApi && this._conversationId) {
         await this._callbacks.fetchStreamChatApi(this._conversationId, commandText, (tokenChunk: string) => {
           if (this.checkInterrupted(utteranceGenId)) return;
-          voiceLatencyTracker.record('firstGeminiTextChunk');
+          voiceLatencyTracker.record('firstLlmTextChunk');
           assistantReplyText += tokenChunk;
           const speechChunks = chunker.push(tokenChunk);
           for (const sc of speechChunks) {

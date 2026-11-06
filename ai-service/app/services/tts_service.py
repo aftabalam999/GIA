@@ -4,6 +4,8 @@ import math
 import struct
 import asyncio
 import logging
+import tempfile
+import os
 from typing import Optional, AsyncGenerator
 from app.services.base_tts import TextToSpeechService
 from app.schemas.tts import TTSModelState, TTSStatusResponse
@@ -170,28 +172,77 @@ class GIATextToSpeechService(TextToSpeechService):
         return clean
 
     async def _execute_synthesis(self, text: str, voice: Optional[str], speed: Optional[str]) -> bytes:
-        """Synthesizes text payload into spoken human voice WAV audio bytes."""
-        try:
-            from gtts import gTTS
-            tts = gTTS(text=text, lang='en')
-            mp3_io = io.BytesIO()
-            tts.write_to_fp(mp3_io)
-            mp3_bytes = mp3_io.getvalue()
+        """Synthesizes text payload into spoken human voice WAV audio bytes locally."""
+        selected_voice = voice or self.voice or "Samantha"
 
+        # 1. macOS native high-performance local speech synthesis
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+                temp_wav_path = temp_wav.name
+
+            cmd = [
+                'say',
+                '-v', selected_voice,
+                '-o', temp_wav_path,
+                f'--data-format=LEI16@{self.sample_rate}',
+                text
+            ]
             proc = await asyncio.create_subprocess_exec(
-                'ffmpeg', '-y', '-i', 'pipe:0', '-f', 'wav', '-ar', str(self.sample_rate), '-ac', '1', 'pipe:1',
-                stdin=asyncio.subprocess.PIPE,
+                *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            wav_bytes, err = await proc.communicate(input=mp3_bytes)
-            if proc.returncode == 0 and len(wav_bytes) > 100:
-                logger.info(f"Synthesized human TTS speech: {len(text)} chars -> {len(wav_bytes)} WAV bytes")
+            await proc.communicate()
+
+            if proc.returncode == 0 and os.path.exists(temp_wav_path) and os.path.getsize(temp_wav_path) > 100:
+                with open(temp_wav_path, 'rb') as f:
+                    wav_bytes = f.read()
+                try:
+                    os.remove(temp_wav_path)
+                except Exception:
+                    pass
+                logger.info(f"Synthesized local macOS TTS speech: {len(text)} chars -> {len(wav_bytes)} WAV bytes")
                 return wav_bytes
         except Exception as e:
-            logger.warning(f"gTTS online speech synthesis fallback to offline tone: {e}")
+            logger.debug(f"macOS native say synthesis unavailable: {e}")
+        finally:
+            if 'temp_wav_path' in locals() and os.path.exists(temp_wav_path):
+                try:
+                    os.remove(temp_wav_path)
+                except Exception:
+                    pass
 
-        # Fallback tone synthesizer if offline
+        # 2. Linux / cross-platform local espeak-ng / espeak fallback
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+                temp_wav_path = temp_wav.name
+
+            proc = await asyncio.create_subprocess_exec(
+                'espeak-ng', '-w', temp_wav_path, text,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+
+            if proc.returncode == 0 and os.path.exists(temp_wav_path) and os.path.getsize(temp_wav_path) > 100:
+                with open(temp_wav_path, 'rb') as f:
+                    wav_bytes = f.read()
+                try:
+                    os.remove(temp_wav_path)
+                except Exception:
+                    pass
+                logger.info(f"Synthesized local espeak TTS speech: {len(text)} chars -> {len(wav_bytes)} WAV bytes")
+                return wav_bytes
+        except Exception:
+            pass
+        finally:
+            if 'temp_wav_path' in locals() and os.path.exists(temp_wav_path):
+                try:
+                    os.remove(temp_wav_path)
+                except Exception:
+                    pass
+
+        # 3. Deterministic Local Tone / Cadence Synthesizer (pure offline fallback)
         duration_per_char = 0.04
         duration = max(0.4, min(15.0, len(text) * duration_per_char))
         num_samples = int(self.sample_rate * duration)
@@ -200,8 +251,8 @@ class GIATextToSpeechService(TextToSpeechService):
         base_freq = 220.0
 
         for i in range(num_samples):
-            if i % 1000 == 0:
-                await asyncio.sleep(0.005)
+            if i % 2000 == 0:
+                await asyncio.sleep(0.001)
             t = float(i) / self.sample_rate
             val = 0.6 * math.sin(2.0 * math.pi * base_freq * t) + 0.3 * math.sin(2.0 * math.pi * (base_freq * 1.5) * t)
             sample_val = int(16000 * val)
@@ -214,7 +265,7 @@ class GIATextToSpeechService(TextToSpeechService):
             wav_file.setframerate(self.sample_rate)
             wav_file.writeframes(pcm_data)
 
-        logger.info(f"Synthesized fallback TTS audio: {len(text)} chars -> {len(pcm_data)} PCM bytes ({duration:.2f}s)")
+        logger.info(f"Synthesized local fallback TTS audio: {len(text)} chars -> {len(pcm_data)} PCM bytes ({duration:.2f}s)")
         return wav_io.getvalue()
 
 gia_tts_service = GIATextToSpeechService()

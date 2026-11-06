@@ -64,7 +64,7 @@ describe('StreamingAudioQueue Unit Test Suite', () => {
     expect(completeFired).toBe(true);
   });
 
-  it('2. Queue behavior & Gemini stream ending: should play queued items and fire onQueueComplete when stream ends', async () => {
+  it('2. Queue behavior & Local LLM stream ending: should play queued items and fire onQueueComplete when stream ends', async () => {
     const adapter: TTSPlayerAdapter = {
       synthesize: async (t) => new TextEncoder().encode(`Audio:${t}`).buffer,
       player: mockPlayer,

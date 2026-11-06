@@ -60,7 +60,14 @@ export class DocumentService {
     for (let index = 0; index < chunks.length; index++) {
       const chunkText = chunks[index];
       try {
-        const chunk = await DocumentChunkRepository.create(doc.id, index, chunkText);
+        const chunkMetadata = {
+          ...metadata,
+          title,
+          sourceType,
+          sourceUrl,
+          chunkIndex: index,
+        };
+        const chunk = await DocumentChunkRepository.create(doc.id, index, chunkText, chunkMetadata);
         const vector = await embeddingProvider.embed(chunkText);
         await DocumentChunkRepository.updateEmbedding(chunk.id, vector);
       } catch (err: any) {

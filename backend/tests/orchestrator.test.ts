@@ -58,7 +58,7 @@ describe('GIA Agent Orchestration Integration Tests', () => {
   });
 
   describe('Agent State Machine & Transitions', () => {
-    it('should bypass LLMGateway.generate() completely (0 calls) and return deterministic response for "open VS Code"', async () => {
+    it('should formulate plan without LLM generation and require explicit approval before execution for "open VS Code"', async () => {
       const spy = vi.spyOn(LLMGateway, 'generate');
       spy.mockClear();
 
@@ -72,10 +72,26 @@ describe('GIA Agent Orchestration Integration Tests', () => {
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(true);
-      expect(body.assistantMessage.content).toContain('VS Code opened successfully');
+      expect(body.plan).toBeDefined();
+      expect(body.plan.objective).toContain('Visual Studio Code');
+      expect(body.assistantMessage.content).toContain('Execution Plan Formulated');
 
-      // Verify LLMGateway.generate was called ZERO times across the entire request!
+      // Verify LLMGateway.generate was called ZERO times across plan formulation!
       expect(spy).toHaveBeenCalledTimes(0);
+
+      // Verify explicit approval requirement is enforced (Phase 2 & 3)
+      const approveRes = await app.inject({
+        method: 'POST',
+        url: `/api/v1/conversations/${convoId}/messages/agent`,
+        headers: { authorization: `Bearer ${userToken}` },
+        payload: { content: 'approve' },
+      });
+
+      expect(approveRes.statusCode).toBe(200);
+      const approveBody = JSON.parse(approveRes.body);
+      expect(approveBody.success).toBe(true);
+      expect(approveBody.assistantMessage.content).toContain('approved and executed');
+
       spy.mockRestore();
     });
 

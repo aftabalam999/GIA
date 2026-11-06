@@ -64,7 +64,7 @@ describe('Voice Microphone Input Gating Policy Test Suite', () => {
     expect(vad.isSpeaking).toBe(false);
   });
 
-  it('Test 8 — Gemini session persistence: transitioning LISTENING -> PROCESSING -> PLAYING -> LISTENING maintains conversation session without reconnection', async () => {
+  it('Test 8 — Session persistence: transitioning LISTENING -> PROCESSING -> PLAYING -> LISTENING maintains conversation session without reconnection', async () => {
     let chatCalls = 0;
     const vsm = new VoiceStateMachine({
       fetchTranscribeApi: async () => ({ text: 'Turn 1 query' }),

@@ -1,27 +1,28 @@
 export interface ModelConfig {
-  provider: 'gemini' | 'mock';
+  provider: 'qwen' | 'mock';
   model: string;
 }
 
 export type ModelType = 'fast' | 'general' | 'reasoning';
 
 /**
- * Centralized model configuration for Afiya.
- * Google Gemini is the single source of conversational intelligence across all model slots.
+ * Centralized model configuration for GIA.
+ * The local Qwen 3.5 4B model is the ONLY LLM throughout the project across all model slots.
+ * Fully offline, private, and hosted on the local Python AI inference service.
  */
-export const DEFAULT_GEMINI_MODEL = 'gemini-3.6-flash';
+export const DEFAULT_QWEN_MODEL = 'Qwen3.5-4B';
 
 export const ROUTER_CONFIGS: Record<ModelType, ModelConfig> = {
   fast: {
-    provider: 'gemini',
-    model: DEFAULT_GEMINI_MODEL,
+    provider: 'qwen',
+    model: DEFAULT_QWEN_MODEL,
   },
   general: {
-    provider: 'gemini',
-    model: DEFAULT_GEMINI_MODEL,
+    provider: 'qwen',
+    model: DEFAULT_QWEN_MODEL,
   },
   reasoning: {
-    provider: 'gemini',
-    model: DEFAULT_GEMINI_MODEL,
+    provider: 'qwen',
+    model: DEFAULT_QWEN_MODEL,
   },
 };

@@ -39,13 +39,13 @@ export class AgentRouter {
     if (!queryText || typeof queryText !== 'string') return null;
     const trimmed = queryText.trim();
 
-    // Check for VS Code local launch commands
-    // Matches: "open VS Code", "open vscode", "launch VS Code", "launch vscode", "open <folder> in VS Code", etc.
-    const vscodePattern = /^(?:open|launch)\s+(?:(.*?)\s+in\s+)?(?:vs\s*code|vscode)$/i;
+    // 1. Check for VS Code local launch commands
+    // Matches: "open VS Code", "open vscode", "launch VS Code", "launch vscode", "can you open vscode", "open <folder> in VS Code", etc.
+    const vscodePattern = /(?:(?:can\s+you\s+|please\s+)?(?:open|launch|start)\s+(?:(?:folder|project|app)?\s*(.*?)\s*(?:in|with)?\s*)?(?:vs\s*code|vscode|visual\s*studio\s*code)\b)/i;
     const match = trimmed.match(vscodePattern);
 
     if (match) {
-      const folderArg = match[1] ? match[1].trim() : 'GIA-AI';
+      const folderArg = match[1] && match[1].trim() ? match[1].trim() : 'GIA-AI';
       return {
         route: 'tool',
         reason: 'Matched deterministic local desktop VS Code command.',
@@ -55,6 +55,126 @@ export class AgentRouter {
         tool: {
           name: 'open_folder_in_vscode',
           args: { folderName: folderArg || 'GIA-AI' },
+        },
+        deterministic: true,
+      };
+    }
+
+    // 2. System Diagnostics & Battery Status
+    const sysInfoPattern = /^(?:(?:can\s+you\s+|please\s+)?(?:what\s+is\s+|show\s+(?:me\s+)?|get\s+)?(?:the\s+)?(?:battery(?:\s+status|\s+percentage|\s+level)?|system\s+info(?:rmation)?|laptop\s+specs?|computer\s+specs?|ram\s+usage|memory\s+usage|cpu\s+usage)|system\s+info)$/i;
+    if (sysInfoPattern.test(trimmed)) {
+      return {
+        route: 'tool',
+        reason: 'Matched deterministic local system info command.',
+        requires_memory: false,
+        requires_rag: false,
+        requires_tool: true,
+        tool: {
+          name: 'get_system_info',
+          args: {},
+        },
+        deterministic: true,
+      };
+    }
+
+    // 3. Open Well-known Folder (Downloads, Desktop, Documents, etc.)
+    const openFolderPattern = /^(?:(?:can\s+you\s+|please\s+)?(?:open|launch)\s+(?:my\s+)?(?:folder|directory\s+)?(downloads|desktop|documents|pictures|music|videos|home|projects)\b(?:\s+folder)?)$/i;
+    const folderMatch = trimmed.match(openFolderPattern);
+    if (folderMatch) {
+      const folderName = folderMatch[1];
+      return {
+        route: 'tool',
+        reason: 'Matched deterministic local folder open command.',
+        requires_memory: false,
+        requires_rag: false,
+        requires_tool: true,
+        tool: {
+          name: 'open_file_or_folder',
+          args: { targetPath: folderName },
+        },
+        deterministic: true,
+      };
+    }
+
+    // 4. List Directory / Browse Files
+    const listDirPattern = /^(?:(?:can\s+you\s+|please\s+)?(?:list|show|view|display)\s+(?:all\s+)?(?:files|items|folders|contents|what(?:\s*'?s|\s+is))\s*(?:in|on|inside|of)?\s*(downloads|desktop|documents|projects|home|.*)?)$/i;
+    const listMatch = trimmed.match(listDirPattern);
+    if (listMatch && (trimmed.toLowerCase().includes('files') || trimmed.toLowerCase().includes('contents') || trimmed.toLowerCase().includes('what is in') || trimmed.toLowerCase().includes('what\'s in'))) {
+      const dirArg = listMatch[1] && listMatch[1].trim() ? listMatch[1].trim() : 'Desktop';
+      return {
+        route: 'tool',
+        reason: 'Matched deterministic local list directory command.',
+        requires_memory: false,
+        requires_rag: false,
+        requires_tool: true,
+        tool: {
+          name: 'list_directory',
+          args: { directoryPath: dirArg },
+        },
+        deterministic: true,
+      };
+    }
+
+    // 5. Open Application (Chrome, Brave, Safari, Spotify, Terminal, Calculator, Notes, Finder, etc.)
+    const KNOWN_APPS = new Set([
+      'chrome', 'google chrome', 'brave', 'brave browser', 'safari', 'firefox',
+      'terminal', 'iterm', 'iterm2', 'calculator', 'spotify', 'notes', 'apple notes',
+      'finder', 'calendar', 'settings', 'system settings', 'system preferences',
+      'mail', 'music', 'apple music', 'slack', 'discord', 'whatsapp', 'messages',
+      'textedit', 'preview', 'photos', 'reminders', 'activity monitor', 'vlc',
+      'pycharm', 'dbeaver', 'obs', 'sublime', 'telegram', 'zoom'
+    ]);
+
+    const openAppMatch = trimmed.match(/^(?:(?:can\s+you\s+|please\s+)?(?:open|launch|start|run)\s+(?:the\s+)?(?:app(?:lication)?\s+)?([a-zA-Z0-9\s._-]+?)(?:\s+app)?)$/i);
+    if (openAppMatch) {
+      const candidate = openAppMatch[1].trim().toLowerCase();
+      if (KNOWN_APPS.has(candidate) || trimmed.toLowerCase().includes('app ') || trimmed.toLowerCase().endsWith(' app')) {
+        return {
+          route: 'tool',
+          reason: 'Matched deterministic local application open command.',
+          requires_memory: false,
+          requires_rag: false,
+          requires_tool: true,
+          tool: {
+            name: 'open_application',
+            args: { appName: openAppMatch[1].trim() },
+          },
+          deterministic: true,
+        };
+      }
+    }
+
+    // 6. Read File Content
+    const readFilePattern = /^(?:(?:can\s+you\s+|please\s+)?(?:read|cat|display|show\s+content\s+of|print)\s+(?:file\s+)?([a-zA-Z0-9_./~-]+\.[a-zA-Z0-9]+))$/i;
+    const readFileMatch = trimmed.match(readFilePattern);
+    if (readFileMatch) {
+      return {
+        route: 'tool',
+        reason: 'Matched deterministic local read file command.',
+        requires_memory: false,
+        requires_rag: false,
+        requires_tool: true,
+        tool: {
+          name: 'read_file_content',
+          args: { filePath: readFileMatch[1].trim() },
+        },
+        deterministic: true,
+      };
+    }
+
+    // 7. Search / Find Files
+    const searchFilePattern = /^(?:(?:can\s+you\s+|please\s+)?(?:find|search(?:\s+for)?|locate)\s+(?:file|folder)?\s*["']?([a-zA-Z0-9_.-]+)["']?)$/i;
+    const searchFileMatch = trimmed.match(searchFilePattern);
+    if (searchFileMatch && !trimmed.toLowerCase().includes('memory') && !trimmed.toLowerCase().includes('document')) {
+      return {
+        route: 'tool',
+        reason: 'Matched deterministic local search files command.',
+        requires_memory: false,
+        requires_rag: false,
+        requires_tool: true,
+        tool: {
+          name: 'search_files',
+          args: { query: searchFileMatch[1].trim() },
         },
         deterministic: true,
       };
@@ -115,6 +235,12 @@ Available Routes:
    - "search_memories": Search user memories semantically (arguments: { "query": string }).
    - "list_documents": List all document metadata uploaded (arguments: {}).
    - "open_url": Opens a specified web browser URL (arguments: { "url": string }).
+   - "open_application": Opens and launches any desktop application on the laptop (arguments: { "appName": string }).
+   - "open_file_or_folder": Opens any local file or folder in Finder/default viewer (arguments: { "targetPath": string }).
+   - "list_directory": Lists files and folders inside a directory on the laptop (arguments: { "directoryPath": string }).
+   - "read_file_content": Reads text, code, or config file contents (arguments: { "filePath": string, "maxLines": number }).
+   - "search_files": Searches for files or folders matching a query pattern (arguments: { "query": string, "directory": string }).
+   - "get_system_info": Returns hardware, OS, battery, memory, CPU, and laptop diagnostics (arguments: {}).
    - "open_folder_in_vscode": Opens a specified folder/project on the user's desktop in VS Code (arguments: { "folderName": string }).
    - "run_project_frontend": Runs the dev frontend script inside the specified project folder (arguments: { "folderName": string, "scriptName": string }).
 5. "multi_step": For complex queries requiring multiple operations (e.g. retrieving documents AND checking the time).
@@ -136,6 +262,8 @@ Constraints:
             messages: [{ role: 'user', content: queryText }],
             temperature: 0.0, // force deterministic decisions
             responseFormat: 'json',
+            maxTokens: 80,
+            enableThinking: false,
           },
           { modelType: 'fast' }
         );

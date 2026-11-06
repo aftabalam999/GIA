@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS memories (
     content TEXT NOT NULL,
     importance INT NOT NULL CHECK (importance BETWEEN 1 AND 10),
     confidence DOUBLE PRECISION NOT NULL CHECK (confidence BETWEEN 0.0 AND 1.0),
-    embedding vector(1536), -- 1536-dimensional embeddings (e.g. OpenAI text-embedding-3-small)
+    embedding vector(1536), -- 1536-dimensional embeddings (e.g. local Python embedding service)
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()

@@ -55,7 +55,7 @@ describe('GIA Agent Router & Policy Validation Tests', () => {
   });
 
   describe('AgentRouter.route() Direct Unit Tests', () => {
-    it('should deterministically route "open VS Code" to open_folder_in_vscode without calling Gemini LLM', async () => {
+    it('should deterministically route "open VS Code" to open_folder_in_vscode without calling LLM', async () => {
       const decision = await AgentRouter.route('open VS Code', 'test-user-id');
       expect(decision.route).toBe('tool');
       expect(decision.requires_tool).toBe(true);
@@ -63,7 +63,7 @@ describe('GIA Agent Router & Policy Validation Tests', () => {
       expect(decision.deterministic).toBe(true);
     });
 
-    it('should deterministically route "open vscode" to open_folder_in_vscode without calling Gemini LLM', async () => {
+    it('should deterministically route "open vscode" to open_folder_in_vscode without calling LLM', async () => {
       const decision = await AgentRouter.route('open vscode', 'test-user-id');
       expect(decision.route).toBe('tool');
       expect(decision.requires_tool).toBe(true);
@@ -71,11 +71,51 @@ describe('GIA Agent Router & Policy Validation Tests', () => {
       expect(decision.deterministic).toBe(true);
     });
 
-    it('should deterministically route "launch VS Code" to open_folder_in_vscode without calling Gemini LLM', async () => {
+    it('should deterministically route "launch VS Code" to open_folder_in_vscode without calling LLM', async () => {
       const decision = await AgentRouter.route('launch VS Code', 'test-user-id');
       expect(decision.route).toBe('tool');
       expect(decision.requires_tool).toBe(true);
       expect(decision.tool?.name).toBe('open_folder_in_vscode');
+      expect(decision.deterministic).toBe(true);
+    });
+
+    it('should deterministically route "system info" to get_system_info without calling LLM', async () => {
+      const decision = await AgentRouter.route('system info', 'test-user-id');
+      expect(decision.route).toBe('tool');
+      expect(decision.requires_tool).toBe(true);
+      expect(decision.tool?.name).toBe('get_system_info');
+      expect(decision.deterministic).toBe(true);
+    });
+
+    it('should deterministically route "battery status" to get_system_info without calling LLM', async () => {
+      const decision = await AgentRouter.route('battery status', 'test-user-id');
+      expect(decision.route).toBe('tool');
+      expect(decision.requires_tool).toBe(true);
+      expect(decision.tool?.name).toBe('get_system_info');
+      expect(decision.deterministic).toBe(true);
+    });
+
+    it('should deterministically route "open downloads" to open_file_or_folder without calling LLM', async () => {
+      const decision = await AgentRouter.route('open downloads', 'test-user-id');
+      expect(decision.route).toBe('tool');
+      expect(decision.requires_tool).toBe(true);
+      expect(decision.tool?.name).toBe('open_file_or_folder');
+      expect(decision.deterministic).toBe(true);
+    });
+
+    it('should deterministically route "open chrome" to open_application without calling LLM', async () => {
+      const decision = await AgentRouter.route('open chrome', 'test-user-id');
+      expect(decision.route).toBe('tool');
+      expect(decision.requires_tool).toBe(true);
+      expect(decision.tool?.name).toBe('open_application');
+      expect(decision.deterministic).toBe(true);
+    });
+
+    it('should deterministically route "list files on desktop" to list_directory without calling LLM', async () => {
+      const decision = await AgentRouter.route('list files on desktop', 'test-user-id');
+      expect(decision.route).toBe('tool');
+      expect(decision.requires_tool).toBe(true);
+      expect(decision.tool?.name).toBe('list_directory');
       expect(decision.deterministic).toBe(true);
     });
 

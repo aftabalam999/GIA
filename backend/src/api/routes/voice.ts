@@ -3,6 +3,8 @@ import { authenticate } from '../middleware/auth.js';
 import { aiServiceClient } from '../../ai/ml-client/ai-service.client.js';
 import { AgentOrchestrator } from '../../ai/orchestrator/orchestrator.js';
 import { NormalizedUserInput } from '../../ai/orchestrator/input.model.js';
+import { WakeWordDetector } from '../../shared/wakeword.js';
+import { MessageRepository } from '../../database/repositories/message.repository.js';
 import {
   AIServiceUnavailableError,
   AIServiceTimeoutError,
@@ -170,7 +172,7 @@ export async function voiceRoutes(fastify: FastifyInstance) {
         correlationId,
       });
 
-      // Process transcription text directly without requiring a wake-word
+      // Validate transcription content
       if (!transcription.text || transcription.text.trim().length === 0) {
         return reply.status(200).send({
           success: true,
@@ -181,12 +183,80 @@ export async function voiceRoutes(fastify: FastifyInstance) {
         });
       }
 
-      const commandText = transcription.text.trim();
+      const fullTranscript = transcription.text.trim();
+
+      // Check wake-word requirement:
+      // Can be configured via query, form field, or header (defaults to true for voice safety)
+      const requireWakeWordVal =
+        fields?.requireWakeWord?.value ??
+        (request.query as any)?.requireWakeWord ??
+        request.headers['x-require-wake-word'];
+
+      const requireWakeWord =
+        requireWakeWordVal === undefined ||
+        requireWakeWordVal === 'true' ||
+        requireWakeWordVal === true;
+
+      const synthesizeRequested =
+        fields?.synthesize?.value === 'true' || (request.query as any)?.synthesize === 'true';
+
+      if (requireWakeWord) {
+        const wakeResult = WakeWordDetector.detect(fullTranscript);
+        if (!wakeResult.detected || !wakeResult.isAuthorized) {
+          return reply.status(200).send({
+            success: true,
+            userMessage: null,
+            assistantMessage: null,
+            ignored: true,
+            authorized: false,
+            reason: "Wake-word authorization required. Please say 'Hey GIA' before your command.",
+          });
+        }
+
+        // If user spoke only the wake word ("Hey GIA"):
+        if (wakeResult.isWakeOnly || !wakeResult.command) {
+          const userMsg = await MessageRepository.create(
+            conversationId,
+            'user',
+            fullTranscript,
+            { inputType: 'voice', wakeOnly: true }
+          );
+          const greetingReply = "I'm listening. How can I help you today?";
+          const assistantMsg = await MessageRepository.create(
+            conversationId,
+            'assistant',
+            greetingReply,
+            { model: 'qwen3.5-4b', provider: 'local', wakeAcknowledgment: true }
+          );
+
+          let ttsAudioBase64: string | undefined = undefined;
+          if (synthesizeRequested) {
+            try {
+              const audioBuffer = await aiServiceClient.synthesize(greetingReply, undefined, undefined, {
+                requestId,
+                correlationId,
+              });
+              ttsAudioBase64 = audioBuffer.toString('base64');
+            } catch {
+              // Keep response intact if optional synthesis fails
+            }
+          }
+
+          return reply.status(200).send({
+            success: true,
+            authorized: true,
+            userMessage: userMsg,
+            assistantMessage: assistantMsg,
+            transcription,
+            audioBase64: ttsAudioBase64,
+          });
+        }
+      }
 
       // 2. Build NormalizedUserInput structure for voice
       const normalizedVoiceInput: NormalizedUserInput = {
         inputType: 'voice',
-        content: commandText,
+        content: fullTranscript,
         userId,
         conversationId,
         requestId,
@@ -208,7 +278,6 @@ export async function voiceRoutes(fastify: FastifyInstance) {
 
       // 4. Optionally synthesize TTS audio for assistant response if requested
       let ttsAudioBase64: string | undefined = undefined;
-      const synthesizeRequested = fields?.synthesize?.value === 'true' || (request.query as any)?.synthesize === 'true';
 
       if (synthesizeRequested && result.assistantMessage?.content) {
         try {

@@ -132,7 +132,7 @@ describe('Voice Barge-In & Interruption Unit Test Suite', () => {
     expect(interrupted).toBe(false);
   });
 
-  it('Test 6 — Same Gemini session: SPEAKING -> INTERRUPTED -> LISTENING maintains conversation session without reconnection', async () => {
+  it('Test 6 — Session persistence: SPEAKING -> INTERRUPTED -> LISTENING maintains conversation session without reconnection', async () => {
     let chatCallCount = 0;
     const vsm = new VoiceStateMachine({
       fetchChatApi: async (convoId) => {

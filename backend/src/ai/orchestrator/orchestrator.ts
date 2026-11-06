@@ -40,12 +40,12 @@ export class AgentOrchestrator {
     inputQuery: string | NormalizedUserInput,
     options?: { requestId?: string }
   ): Promise<{ userMessage: Message; assistantMessage: Message; runId: string }> {
-    const AGENT_TIMEOUT_MS = 60_000; // 60 second wall-clock deadline
+    const AGENT_TIMEOUT_MS = 120_000; // 120 second wall-clock deadline for local ML inference
 
     const runPromise = this._runInternal(userId, conversationId, inputQuery, options);
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(
-        () => reject(new Error('Agent execution timed out after 60 seconds')),
+        () => reject(new Error('Agent execution timed out after 120 seconds')),
         AGENT_TIMEOUT_MS
       )
     );
@@ -318,14 +318,16 @@ export class AgentOrchestrator {
       });
     }
 
-    const systemPrompt = `You are GIA, a modular personal assistant.
-Answer the user's question leveraging the provided context. If documents are cited, mention document titles.
+    const systemPrompt = `You are GIA (General Intelligent Assistant), an autonomous local desktop AI assistant.
+Answer the user's question concisely leveraging any provided context. If documents are cited, mention document titles. You have full capability to execute desktop tools on the user's machine.
 
 Context details:${retrievedText || '\n(No background context retrieved)'}`;
 
     const history = await MessageRepository.findByConversationId(state.conversationId);
     const llmRequest = ContextBuilder.buildContext(history);
     llmRequest.systemPrompt = systemPrompt;
+    llmRequest.maxTokens = 350;
+    llmRequest.enableThinking = false;
 
     const response = await LLMGateway.generate(llmRequest, { conversationId: state.conversationId });
     state.finalResponse = response.content;

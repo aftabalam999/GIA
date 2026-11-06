@@ -94,57 +94,71 @@ export class AudioRecorderService {
   public async start(): Promise<void> {
     if (this.isRecording) return;
 
-    try {
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+    // 1. Check if browser/webview supports navigator.mediaDevices.getUserMedia
+    const hasGetUserMedia =
+      typeof navigator !== 'undefined' &&
+      Boolean(navigator.mediaDevices) &&
+      typeof navigator.mediaDevices.getUserMedia === 'function';
 
-      // Setup Web Audio API AnalyserNode for volume VAD
-      const AudioCtx = (typeof window !== 'undefined' ? (window.AudioContext || (window as any).webkitAudioContext) : null) || (globalThis as any).AudioContext;
-      this.audioContext = new AudioCtx();
-      if (!this.audioContext) return;
-      const source = this.audioContext.createMediaStreamSource(this.mediaStream);
-      this.analyser = this.audioContext.createAnalyser();
-      this.analyser.fftSize = 512;
-      source.connect(this.analyser);
+    if (hasGetUserMedia) {
+      try {
+        this.mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
 
-      // Setup MediaRecorder
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
-        ? 'audio/ogg;codecs=opus'
-        : 'audio/wav';
-
-      this.mediaRecorder = new MediaRecorder(this.mediaStream, { mimeType });
-      this.audioChunks = [];
-
-      this.mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          this.audioChunks.push(event.data);
+        // Setup Web Audio API AnalyserNode for volume VAD
+        const AudioCtx = (typeof window !== 'undefined' ? (window.AudioContext || (window as any).webkitAudioContext) : null) || (globalThis as any).AudioContext;
+        this.audioContext = new AudioCtx();
+        if (this.audioContext) {
+          const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+          this.analyser = this.audioContext.createAnalyser();
+          this.analyser.fftSize = 512;
+          source.connect(this.analyser);
         }
-      };
 
-      this.mediaRecorder.onstop = () => {
-        if (this.audioChunks.length > 0) {
-          const audioBlob = new Blob(this.audioChunks, { type: mimeType });
-          this.audioChunks = [];
-          if (this.callbacks.onUtteranceRecorded && this.isRecording && !this.isPaused) {
-            this.callbacks.onUtteranceRecorded(audioBlob);
+        // Setup MediaRecorder
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
+          ? 'audio/ogg;codecs=opus'
+          : 'audio/wav';
+
+        this.mediaRecorder = new MediaRecorder(this.mediaStream, { mimeType });
+        this.audioChunks = [];
+
+        this.mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            this.audioChunks.push(event.data);
           }
-        }
-      };
+        };
 
-      this.isRecording = true;
-      this.vad.start();
+        this.mediaRecorder.onstop = () => {
+          if (this.audioChunks.length > 0) {
+            const audioBlob = new Blob(this.audioChunks, { type: mimeType });
+            this.audioChunks = [];
+            if (this.callbacks.onUtteranceRecorded && this.isRecording && !this.isPaused) {
+              this.callbacks.onUtteranceRecorded(audioBlob);
+            }
+          }
+        };
 
-      this.mediaRecorder.start(100); // 100ms timeslice
-      this.monitorVolume();
-    } catch (err: any) {
-      // Fallback to Tauri Native Desktop Microphone Capture if WebKitGTK / browser getUserMedia is restricted
+        this.isRecording = true;
+        this.vad.start();
+
+        this.mediaRecorder.start(100); // 100ms timeslice
+        this.monitorVolume();
+        return;
+      } catch (err: any) {
+        console.warn('WebAudio getUserMedia unavailable, falling back to desktop native capture:', err);
+      }
+    }
+
+    // 2. Fallback to Tauri Native Desktop Microphone Capture (Cross-Platform macOS & Linux)
+    try {
       const nativePerm = await requestNativeMicrophonePermission();
       if (nativePerm.status === 'GRANTED') {
         this.isRecording = true;
@@ -153,7 +167,13 @@ export class AudioRecorderService {
         return;
       }
 
-      const msg = `Microphone access error: ${err.message || 'Permission denied'}`;
+      const msg = `Microphone access denied: ${nativePerm.message || 'Permission denied'}`;
+      if (this.callbacks.onError) {
+        this.callbacks.onError(msg);
+      }
+      throw new Error(msg);
+    } catch (err: any) {
+      const msg = `Microphone capture failed: ${err.message || 'Permission denied'}`;
       if (this.callbacks.onError) {
         this.callbacks.onError(msg);
       }

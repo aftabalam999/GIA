@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from app.services.base_stt import SpeechToTextService
 from app.services.base_tts import TextToSpeechService
 from app.services.base_audio import AudioProcessor
@@ -21,6 +21,7 @@ class ModelLifecycleManager:
         self._vad_service: Optional[VoiceActivityDetector] = None
         self._embedding_service: Optional[EmbeddingService] = None
         self._reranker_service: Optional[RerankerService] = None
+        self._llm_service: Optional[Any] = None
 
     def register_stt_service(self, service: SpeechToTextService):
         self._stt_service = service
@@ -46,6 +47,10 @@ class ModelLifecycleManager:
         self._reranker_service = service
         logger.info(f"Registered Reranker Service: {service.__class__.__name__}")
 
+    def register_llm_service(self, service: Any):
+        self._llm_service = service
+        logger.info(f"Registered LLM Service: {service.__class__.__name__}")
+
     @property
     def stt_service(self) -> Optional[SpeechToTextService]:
         return self._stt_service
@@ -69,6 +74,10 @@ class ModelLifecycleManager:
     @property
     def reranker_service(self) -> Optional[RerankerService]:
         return self._reranker_service
+
+    @property
+    def llm_service(self) -> Optional[Any]:
+        return self._llm_service
 
     async def startup(self) -> None:
         """Startup hook: Initializes all registered ML models."""
@@ -97,6 +106,12 @@ class ModelLifecycleManager:
             except Exception as e:
                 logger.error(f"Reranker Service initialization error: {e}")
 
+        if self._llm_service:
+            try:
+                await self._llm_service.initialize()
+            except Exception as e:
+                logger.error(f"LLM Service initialization error: {e}")
+
     async def shutdown(self) -> None:
         """Shutdown hook: Releases resources for all registered ML models."""
         logger.info("Shutting down ML model subsystems...")
@@ -124,6 +139,12 @@ class ModelLifecycleManager:
             except Exception as e:
                 logger.error(f"Reranker Service shutdown error: {e}")
 
+        if self._llm_service:
+            try:
+                await self._llm_service.shutdown()
+            except Exception as e:
+                logger.error(f"LLM Service shutdown error: {e}")
+
     def get_subsystem_statuses(self) -> Dict[str, bool]:
         """Returns readiness status for all registered subsystems."""
         return {
@@ -133,6 +154,7 @@ class ModelLifecycleManager:
             "tts": self._tts_service.is_ready() if self._tts_service else False,
             "embedding": self._embedding_service.is_ready() if self._embedding_service else False,
             "reranker": self._reranker_service.is_ready() if self._reranker_service else False,
+            "llm": self._llm_service.is_ready() if self._llm_service else False,
         }
 
     def is_overall_ready(self) -> bool:
@@ -150,6 +172,7 @@ from app.services.stt_service import gia_stt_service
 from app.services.tts_service import gia_tts_service
 from app.services.embedding_service import gia_embedding_service
 from app.services.reranker_service import gia_reranker_service
+from app.services.llm_service import gia_llm_service
 
 model_lifecycle.register_audio_processor(gia_audio_processor)
 model_lifecycle.register_vad_service(gia_vad_service)
@@ -157,3 +180,4 @@ model_lifecycle.register_stt_service(gia_stt_service)
 model_lifecycle.register_tts_service(gia_tts_service)
 model_lifecycle.register_embedding_service(gia_embedding_service)
 model_lifecycle.register_reranker_service(gia_reranker_service)
+model_lifecycle.register_llm_service(gia_llm_service)

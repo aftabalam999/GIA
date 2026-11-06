@@ -1,34 +1,104 @@
-# Dependency directories
+# ==============================================================================
+# GIA Desktop Assistant - Git Ignore Rules
+# ==============================================================================
+
+# --- Node & Frontend Dependencies ---
 node_modules/
 **/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.pnpm-store/
+*.tsbuildinfo
 
-# Python Virtual Environments & Cache
+# --- Python Virtual Environments, Cache & Testing ---
 .venv/
 venv/
 env/
 ENV/
+**/.venv/
+**/venv/
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+**/.pytest_cache/
 .coverage
 htmlcov/
+*.egg-info/
+**/egg-info/
+.mypy_cache/
+.ruff_cache/
 
-# Rust / Tauri
+# --- Rust & Tauri Desktop Build Outputs ---
 target/
+**/target/
 **/src-tauri/target/
+**/src-tauri/gen/schemas/
+Cargo.lock.backup
 
-# Environment variables
+# --- Machine Learning Models, Heavy Binaries & Weights ---
+# (Prevent pushing multi-gigabyte safetensors / bin model weights to git)
+models/
+**/models/
+*.safetensors
+*.safetensors.*
+*.bin
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.tflite
+.cache/
+**/.cache/
+.huggingface/
+**/.huggingface/
+
+# --- Audio, Voice & Media Temporary Files ---
+*.wav
+*.mp3
+*.pcm
+*.webm
+*.ogg
+*.aac
+*.flac
+temp_audio/
+**/temp_audio/
+recordings/
+**/recordings/
+
+# --- Environment Configurations & Secrets ---
 .env
-.env.local
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
 
-# Compile outputs
+# --- Compilation & Distribution Artifacts ---
 dist/
 build/
 **/dist/
 **/build/
+dist-ssr/
+out/
 
-# IDE files
+# --- Databases & Local Storage ---
+*.sqlite
+*.sqlite3
+*.db
+*.rdb
+
+# --- Logs & Runtime Dumps ---
+*.log
+**/*.log
+logs/
+**/logs/
+
+# --- IDE & Editor Artifacts ---
 .idea/
 .vscode/
 *.suo
@@ -36,17 +106,15 @@ build/
 *.njsproj
 *.sln
 *.sw?
+*.sublime-project
+*.sublime-workspace
 
-# OS files
+# --- OS Metadata & Temporary Files ---
 .DS_Store
+**/.DS_Store
+._*
 Thumbs.db
+Desktop.ini
+.Spotlight-V100
+.Trashes
 .freebuff/
-
-# Log files
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-*.log
-

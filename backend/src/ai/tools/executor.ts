@@ -5,8 +5,16 @@ import { logger } from '../../shared/logger.js';
 import { MessageRepository } from '../../database/repositories/message.repository.js';
 import { ConversationRepository } from '../../database/repositories/conversation.repository.js';
 import { UserRepository } from '../../database/repositories/user.repository.js';
+import { PermissionManager } from '../permissions/permission.manager.js';
+import { ExecutionTicket } from '../permissions/permission.interface.js';
 
 import { ToolResult } from './tool.interface.js';
+
+export interface ToolExecutionContext {
+  ticket?: ExecutionTicket | string;
+  stepId?: number;
+  testBypass?: boolean;
+}
 
 export class ToolExecutor {
   /**
@@ -17,8 +25,25 @@ export class ToolExecutor {
     userId: string,
     toolName: string,
     rawArgs: any,
-    messageId: string | null = null
+    messageId: string | null = null,
+    context?: ToolExecutionContext
   ): Promise<ToolResult> {
+    // 0. Central Permission Gate check (Mandatory User Approval)
+    const isGateEnforced = PermissionManager.isGateEnforced();
+    if (context?.ticket || (isGateEnforced && !context?.testBypass)) {
+      const verification = await PermissionManager.verifyToolExecution(
+        userId,
+        toolName,
+        rawArgs,
+        context?.ticket,
+        context?.stepId
+      );
+      if (!verification.allowed) {
+        const errMessage = verification.reason || 'PERMISSION_DENIED: Explicit user approval required.';
+        await this.logToolCall(messageId, toolName, rawArgs, 'failed', null, errMessage);
+        return { success: false, error: errMessage };
+      }
+    }
     // 1. Fetch tool definition
     const tool = registry.get(toolName);
     if (!tool) {
@@ -45,7 +70,17 @@ export class ToolExecutor {
       }
 
       // Default authorized developer permissions for personal workspace
-      const userPermissions = ['read:system', 'open:apps', 'open:folders', 'run:commands'];
+      const userPermissions = [
+        'read:system',
+        'open:apps',
+        'close:apps',
+        'open:folders',
+        'read:files',
+        'write:files',
+        'delete:files',
+        'run:commands',
+        'capture:screen',
+      ];
       const hasAllPermissions = tool.permissions.every((p) => userPermissions.includes(p));
       if (!hasAllPermissions) {
         const missing = tool.permissions.filter((p) => !userPermissions.includes(p));
@@ -79,10 +114,33 @@ export class ToolExecutor {
 
       const result = await Promise.race([executionPromise, timeoutPromise]);
 
+      // 5. Verification logic (Phase 3)
+      let verification;
+      if (typeof tool.verify === 'function') {
+        try {
+          verification = await tool.verify(parsed.data, result, { userId });
+          if (!verification.verified) {
+            const verifyErr = `Action verification failed: ${verification.message}`;
+            await this.updateToolCall(callId, 'failed', result, verifyErr);
+            return { success: false, result, verification, error: verifyErr };
+          }
+        } catch (verifyEx: any) {
+          const verifyErr = `Action verification exception: ${verifyEx.message}`;
+          await this.updateToolCall(callId, 'failed', result, verifyErr);
+          return { success: false, result, error: verifyErr };
+        }
+      }
+
       // Update call logs as success
       await this.updateToolCall(callId, 'success', result);
 
-      return { success: true, result };
+      // Consume step in ticket if ticket & stepId provided
+      if (context?.ticket && context?.stepId !== undefined) {
+        const token = typeof context.ticket === 'string' ? context.ticket : context.ticket.ticketId;
+        await PermissionManager.recordStepConsumed(token, context.stepId);
+      }
+
+      return { success: true, result, verification };
     } catch (err: any) {
       logger.error({ msg: 'Tool execution failed', toolName, error: err.message });
       // Update logs as failed

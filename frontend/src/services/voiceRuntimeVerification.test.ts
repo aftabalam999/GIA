@@ -31,7 +31,7 @@ describe('GIA Voice Pipeline Runtime Verification Suite', () => {
   it('Test 1 — User command ("open VS Code") when Voice Mode is ON should process directly without wake word', async () => {
     let sttCount = 0;
     let agentCount = 0;
-    let geminiCount = 0;
+    let llmCount = 0;
     let ttsCount = 0;
 
     const vsm = new VoiceStateMachine({
@@ -41,7 +41,7 @@ describe('GIA Voice Pipeline Runtime Verification Suite', () => {
       },
       fetchChatApi: async () => {
         agentCount++;
-        geminiCount++;
+        llmCount++;
         return { assistantMessage: { content: 'Opening VS Code' } };
       },
       fetchTtsApi: async () => {
@@ -55,7 +55,7 @@ describe('GIA Voice Pipeline Runtime Verification Suite', () => {
 
     expect(sttCount).toBe(1);
     expect(agentCount).toBe(1);
-    expect(geminiCount).toBe(1);
+    expect(llmCount).toBe(1);
     expect(ttsCount).toBe(1);
     expect(vsm.state).toBe('LISTENING');
   });
@@ -63,7 +63,7 @@ describe('GIA Voice Pipeline Runtime Verification Suite', () => {
   it('Test 2 — Conversational query ("explain APIs") should trigger full voice pipeline directly', async () => {
     let sttCount = 0;
     let agentCount = 0;
-    let geminiCount = 0;
+    let llmCount = 0;
     let ttsCount = 0;
 
     const vsm = new VoiceStateMachine({
@@ -73,7 +73,7 @@ describe('GIA Voice Pipeline Runtime Verification Suite', () => {
       },
       fetchChatApi: async () => {
         agentCount++;
-        geminiCount++;
+        llmCount++;
         return { assistantMessage: { content: 'An API allows software to communicate.' } };
       },
       fetchTtsApi: async () => {
@@ -88,7 +88,7 @@ describe('GIA Voice Pipeline Runtime Verification Suite', () => {
 
     expect(sttCount).toBe(1);
     expect(agentCount).toBe(1);
-    expect(geminiCount).toBe(1);
+    expect(llmCount).toBe(1);
     expect(ttsCount).toBe(1);
     expect(vsm.state).toBe('LISTENING');
   });
@@ -96,7 +96,7 @@ describe('GIA Voice Pipeline Runtime Verification Suite', () => {
   it('Test 3 — Pure silence or empty transcription should cleanly return to LISTENING state', async () => {
     let sttCount = 0;
     let agentCount = 0;
-    let geminiCount = 0;
+    let llmCount = 0;
     let ttsCount = 0;
 
     const vsm = new VoiceStateMachine({
@@ -106,7 +106,7 @@ describe('GIA Voice Pipeline Runtime Verification Suite', () => {
       },
       fetchChatApi: async () => {
         agentCount++;
-        geminiCount++;
+        llmCount++;
         return { assistantMessage: { content: 'Hello' } };
       },
       fetchTtsApi: async () => {
@@ -121,7 +121,7 @@ describe('GIA Voice Pipeline Runtime Verification Suite', () => {
 
     expect(sttCount).toBe(1);
     expect(agentCount).toBe(0);
-    expect(geminiCount).toBe(0);
+    expect(llmCount).toBe(0);
     expect(ttsCount).toBe(0);
     expect(vsm.state).toBe('LISTENING');
   });

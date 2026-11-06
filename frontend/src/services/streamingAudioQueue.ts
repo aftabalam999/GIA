@@ -75,7 +75,7 @@ export class StreamingAudioQueue {
   }
 
   /**
-   * Signals that Gemini response generation and text chunking have concluded.
+   * Signals that local LLM response generation and text chunking have concluded.
    */
   public markStreamComplete(): void {
     if (this.isCancelled) return;

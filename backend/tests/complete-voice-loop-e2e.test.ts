@@ -233,4 +233,62 @@ describe('GIA Phase 11: Complete Voice Loop E2E Verification Suite', () => {
     // Both reached identical assistant output structures and FSM execution nodes!
     expect(voiceResult.assistantMessage.role).toBe('assistant');
   });
+
+  it('should enforce wake-word requirement and acoustic gating in the voice loop', async () => {
+    let commandExecuted = false;
+    const mockChatApi = vi.fn().mockImplementation(async (convoId: string, text: string) => {
+      commandExecuted = true;
+      return {
+        userMessage: { id: 'u1', role: 'user', content: text },
+        assistantMessage: { id: 'a1', role: 'assistant', content: 'Command executed.' },
+      };
+    });
+
+    const mockTtsApi = vi.fn().mockImplementation(async () => Buffer.from('RIFF1234WAVE'));
+
+    const wakeWordVsm = new VoiceStateMachine({
+      onStateChange: (s) => stateHistory.push(s),
+      requireWakeWord: true,
+      fetchTranscribeApi: vi.fn()
+        .mockResolvedValueOnce({ text: 'Delete all system files' }) // Unauthorized
+        .mockResolvedValueOnce({ text: 'Hey GIA, check disk status' }), // Authorized
+      fetchChatApi: mockChatApi,
+      fetchTtsApi: mockTtsApi,
+      playAudioApi: (buf) => player.play(buf),
+    });
+
+    await wakeWordVsm.startVoiceMode(testConvoId, 'jwt-token-123', false);
+
+    // 1. Unauthorized speech without wake word
+    wakeWordVsm.handleSpeechStart();
+    await wakeWordVsm.processSpeechUtterance(new Uint8Array([1, 1, 1]) as any);
+
+    // Command should NOT execute without wake word
+    expect(commandExecuted).toBe(false);
+    expect(mockChatApi).not.toHaveBeenCalled();
+    // System returns cleanly to LISTENING without command execution
+    expect(wakeWordVsm.state).toBe('LISTENING');
+
+    // 2. Authorized speech with wake word "Hey GIA"
+    wakeWordVsm.handleSpeechStart();
+    const authorizedPromise = wakeWordVsm.processSpeechUtterance(new Uint8Array([2, 2, 2]) as any);
+
+    for (let i = 0; i < 50; i++) {
+      if (player.state === 'PLAYING') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    expect(commandExecuted).toBe(true);
+    expect(mockChatApi).toHaveBeenCalledTimes(1);
+    expect(wakeWordVsm.state).toBe('PLAYING');
+
+    // Acoustic gating: during PLAYING state, mic is in barge-in guard mode and not standard listening
+    expect(player.state).toBe('PLAYING');
+
+    player.simulatePlaybackCompletion();
+    await authorizedPromise;
+
+    expect(wakeWordVsm.state).toBe('LISTENING');
+    await wakeWordVsm.stopVoiceMode();
+  });
 });

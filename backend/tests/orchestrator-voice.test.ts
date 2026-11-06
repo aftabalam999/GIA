@@ -194,5 +194,87 @@ describe('GIA Phase 7: STT + AI Orchestrator Integration Suite', () => {
       expect(lastUserMsg?.content).toBe('Afiya What is the current time?');
       expect((lastUserMsg?.metadata as any).inputType).toBe('voice');
     });
+
+    it('should reject voice command execution when GIA wake word is absent', async () => {
+      const mockTranscription = {
+        text: 'delete all documents immediately',
+        duration: 1.2,
+        confidence: 0.95,
+        language: 'en',
+        segments: [{ start: 0, end: 1.2, text: 'delete all documents immediately', confidence: 0.95 }],
+        processing_time: 0.1,
+      };
+
+      vi.spyOn(aiServiceClient, 'transcribe').mockResolvedValue(mockTranscription);
+
+      const boundary = '----WebKitFormBoundaryNoWakeWord';
+      const payloadParts = [
+        `--${boundary}`,
+        'Content-Disposition: form-data; name="file"; filename="test.wav"',
+        'Content-Type: audio/wav',
+        '',
+        'RIFF....WAVEfmt ....data....',
+        `--${boundary}--`,
+        '',
+      ].join('\r\n');
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/conversations/${convoId}/messages/voice`,
+        headers: {
+          authorization: `Bearer ${userToken}`,
+          'content-type': `multipart/form-data; boundary=${boundary}`,
+        },
+        payload: payloadParts,
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.ignored).toBe(true);
+      expect(body.authorized).toBe(false);
+      expect(body.reason).toContain('Wake-word authorization required');
+    });
+
+    it('should acknowledge and authorize stand-alone wake word "Hey GIA"', async () => {
+      const mockTranscription = {
+        text: 'Hey GIA',
+        duration: 0.8,
+        confidence: 0.99,
+        language: 'en',
+        segments: [{ start: 0, end: 0.8, text: 'Hey GIA', confidence: 0.99 }],
+        processing_time: 0.1,
+      };
+
+      vi.spyOn(aiServiceClient, 'transcribe').mockResolvedValue(mockTranscription);
+
+      const boundary = '----WebKitFormBoundaryWakeOnly';
+      const payloadParts = [
+        `--${boundary}`,
+        'Content-Disposition: form-data; name="file"; filename="test.wav"',
+        'Content-Type: audio/wav',
+        '',
+        'RIFF....WAVEfmt ....data....',
+        `--${boundary}--`,
+        '',
+      ].join('\r\n');
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/conversations/${convoId}/messages/voice`,
+        headers: {
+          authorization: `Bearer ${userToken}`,
+          'content-type': `multipart/form-data; boundary=${boundary}`,
+        },
+        payload: payloadParts,
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.authorized).toBe(true);
+      expect(body.userMessage.content).toBe('Hey GIA');
+      expect(body.assistantMessage.content).toContain("I'm listening");
+    });
   });
 });

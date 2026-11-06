@@ -177,7 +177,10 @@ User Message: "${messageText}"`;
 
     try {
       const response = await LLMGateway.generate({
-        messages: [{ role: 'user', content: prompt }]
+        messages: [{ role: 'user', content: prompt }],
+        responseFormat: 'json',
+        maxTokens: 250,
+        enableThinking: false,
       }, { conversationId });
 
       const parsed = JSON.parse(response.content.trim());
@@ -221,13 +224,14 @@ User Message: "${messageText}"`;
     queryText: string,
     limit = 5,
     threshold = 0.5,
-    category?: string
+    category?: string,
+    metadataFilter?: Record<string, any>
   ): Promise<any[]> {
     try {
       const embeddingProvider = getEmbeddingProvider();
       const embedding = await embeddingProvider.embed(queryText);
       const vectorStore = new PostgresVectorStore();
-      return await vectorStore.searchMemories(userId, embedding, limit, threshold, category);
+      return await vectorStore.searchMemories(userId, embedding, limit, threshold, category, metadataFilter);
     } catch (err: any) {
       throw new AppError(`Semantic search failed: ${err.message}`, 500, { originalError: err.message });
     }

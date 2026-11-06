@@ -1,11 +1,15 @@
 from fastapi import APIRouter, Depends
-from app.api.routes import health, audio, vad, stt, tts, embeddings, reranker
+from app.api.routes import health, audio, vad, stt, tts, embeddings, reranker, llm
 from app.core.auth import verify_internal_api_key
 
 api_router = APIRouter()
 
-# Unauthenticated public health check
+# Unauthenticated public health & info checks
 api_router.include_router(health.router)
+
+# Local Qwen LLM Endpoints (/api/llm and /llm)
+api_router.include_router(llm.router, prefix="/api/llm")
+api_router.include_router(llm.router, prefix="/llm")
 
 # Protected internal AI service endpoints requiring X-Internal-API-Key header
 protected_dependencies = [Depends(verify_internal_api_key)]
