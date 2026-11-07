@@ -71,11 +71,16 @@ export class DesktopAudioPlayer {
    */
   private getOrCreateAudioContext(): AudioContext {
     if (!this._audioContext || this._audioContext.state === 'closed') {
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const AudioContextClass =
+        (typeof window !== 'undefined' ? (window.AudioContext || (window as any).webkitAudioContext) : null) ||
+        (globalThis as any).AudioContext;
       if (!AudioContextClass) {
         throw new Error('Web Audio API is not supported in this environment');
       }
       this._audioContext = new AudioContextClass();
+    }
+    if (!this._audioContext) {
+      throw new Error('Failed to create AudioContext');
     }
     if (this._audioContext.state === 'suspended') {
       this._audioContext.resume();

@@ -2,11 +2,13 @@ import io
 import wave
 import math
 import logging
-import numpy as np
 from enum import Enum
 from typing import Optional, Tuple
+import numpy as np
+
 from app.schemas.vad import VADEventType, VADConfig, VADResult
 from app.services.base_vad import VoiceActivityDetector
+from app.services.silero_vad import SileroVADEngine, SILERO_SAMPLE_RATE
 from app.services.audio_processor import (
     GIAAudioProcessor,
     NormalizedAudio,
@@ -23,21 +25,37 @@ class InternalVADState(str, Enum):
 
 class GIAVoiceActivityDetector(VoiceActivityDetector):
     """
-    Independent Voice Activity Detection (VAD) Engine & State Machine.
-    Supports continuous voice session tracking, detecting speech start, continuation,
-    end-of-speech silence timeouts, excessive silence, and maximum utterance caps.
+    Unified Voice Activity Detection (VAD) Engine & State Machine.
+    - Uses local Silero ONNX deep-learning model to evaluate speech probability.
+    - Maintains recurrent LSTM hidden state across audio streaming frames.
+    - Fallbacks gracefully to RMS energy detection if Silero model is disabled.
+    - Tracks speech start, active continuation, trailing silence termination,
+      continuous silence timeouts, and maximum utterance caps.
     """
-    def __init__(self, config: Optional[VADConfig] = None, processor: Optional[GIAAudioProcessor] = None):
+
+    def __init__(
+        self,
+        config: Optional[VADConfig] = None,
+        processor: Optional[GIAAudioProcessor] = None,
+        silero_engine: Optional[SileroVADEngine] = None
+    ):
         self.config = config or VADConfig()
         self.processor = processor or GIAAudioProcessor()
+        self.silero_engine = silero_engine or SileroVADEngine()
         self._ready = True
         self.reset_state()
 
     def is_ready(self) -> bool:
+        """Returns True if the VAD engine is operational."""
+        if self.config.use_silero:
+            return self._ready and self.silero_engine.is_ready()
         return self._ready
 
     def reset_state(self) -> None:
-        """Resets the state machine buffers without ending the voice mode session."""
+        """Resets the state machine buffers and Silero recurrent hidden states."""
+        if self.silero_engine:
+            self.silero_engine.reset_state()
+
         self._state = InternalVADState.LISTENING_FOR_SPEECH
         self._utterance_pcm_buffer = bytearray()
         self._pending_speech_pcm_buffer = bytearray()
@@ -50,25 +68,45 @@ class GIAVoiceActivityDetector(VoiceActivityDetector):
     def _compute_chunk_metrics(
         self,
         audio_chunk: bytes,
-        sample_rate: int = 16000
-    ) -> Tuple[np.ndarray, float, float, bool]:
+        sample_rate: int = CANONICAL_SAMPLE_RATE
+    ) -> Tuple[np.ndarray, float, float, bool, float]:
         """
-        Parses raw PCM or container chunk, computes duration (ms), RMS volume (dB),
-        and returns boolean is_speech flag based on configured threshold.
+        Parses raw PCM or container chunk, validates sample rate and byte alignment,
+        computes duration (ms), RMS volume (dB), Silero speech probability (0.0 - 1.0),
+        and returns boolean is_speech flag.
         """
+        if sample_rate <= 0:
+            raise AudioProcessingException(f"Invalid audio sample rate: {sample_rate} Hz")
+
+        if self.config.use_silero and sample_rate != SILERO_SAMPLE_RATE:
+            raise AudioProcessingException(
+                f"Silero VAD requires sample rate {SILERO_SAMPLE_RATE} Hz, received {sample_rate} Hz"
+            )
+
         if not audio_chunk or len(audio_chunk) == 0:
             raise AudioProcessingException("VAD frame input is empty")
 
-        # Extract int16 PCM array
+        # Parse audio bytes
         try:
             if audio_chunk.startswith(b"RIFF"):
                 with wave.open(io.BytesIO(audio_chunk), 'rb') as wav_file:
+                    wav_sr = wav_file.getframerate()
+                    if wav_sr != sample_rate:
+                        if self.config.use_silero and wav_sr != SILERO_SAMPLE_RATE:
+                            raise AudioProcessingException(
+                                f"WAV container sample rate {wav_sr} Hz does not match Silero {SILERO_SAMPLE_RATE} Hz"
+                            )
+                        sample_rate = wav_sr
                     n_frames = wav_file.getnframes()
                     frames = wav_file.readframes(n_frames)
                     audio_np = np.frombuffer(frames, dtype=np.int16)
             else:
+                if len(audio_chunk) % 2 != 0:
+                    raise AudioProcessingException("Audio chunk byte length must be even for 16-bit PCM")
                 audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
         except Exception as e:
+            if isinstance(e, AudioProcessingException):
+                raise
             logger.warning(f"Failed to parse VAD chunk PCM: {e}")
             raise AudioProcessingException(f"Invalid audio chunk for VAD: {str(e)}")
 
@@ -79,20 +117,38 @@ class GIAVoiceActivityDetector(VoiceActivityDetector):
         duration_ms = (total_samples / sample_rate) * 1000.0
         samples_float32 = audio_np.astype(np.float32) / 32768.0
 
+        # Compute RMS volume
         rms = float(np.sqrt(np.mean(samples_float32 ** 2))) if total_samples > 0 else 0.0
         rms_db = float(20.0 * math.log10(rms)) if rms > 1e-7 else -100.0
-        is_speech = rms_db >= self.config.silence_threshold_db
 
-        return audio_np, duration_ms, rms_db, is_speech
+        # Evaluate Speech Activity
+        speech_prob = 0.0
+        if self.config.use_silero and self.silero_engine and self.silero_engine.is_ready():
+            try:
+                max_prob, _, _ = self.silero_engine.process_audio_chunk(
+                    samples_float32,
+                    sample_rate=sample_rate
+                )
+                speech_prob = max_prob
+                is_speech = speech_prob >= self.config.speech_threshold
+            except Exception as e:
+                logger.warning(f"Silero inference error ({e}), falling back to RMS energy check")
+                is_speech = rms_db >= self.config.silence_threshold_db
+                speech_prob = 1.0 if is_speech else 0.0
+        else:
+            is_speech = rms_db >= self.config.silence_threshold_db
+            speech_prob = 1.0 if is_speech else 0.0
+
+        return audio_np, duration_ms, rms_db, is_speech, speech_prob
 
     async def detect_speech(
         self,
         audio_chunk: bytes,
-        sample_rate: int = 16000
+        sample_rate: int = CANONICAL_SAMPLE_RATE
     ) -> bool:
-        """Evaluates an audio frame for speech energy."""
+        """Evaluates an audio frame for speech activity."""
         try:
-            _, _, _, is_speech = self._compute_chunk_metrics(audio_chunk, sample_rate)
+            _, _, _, is_speech, _ = self._compute_chunk_metrics(audio_chunk, sample_rate)
             return is_speech
         except Exception:
             return False
@@ -100,13 +156,15 @@ class GIAVoiceActivityDetector(VoiceActivityDetector):
     def process_chunk(
         self,
         audio_chunk: bytes,
-        sample_rate: int = 16000
+        sample_rate: int = CANONICAL_SAMPLE_RATE
     ) -> VADResult:
         """
         Evaluates incoming audio frame through the continuous VAD state machine.
         """
         try:
-            audio_np, duration_ms, rms_db, is_speech = self._compute_chunk_metrics(audio_chunk, sample_rate)
+            audio_np, duration_ms, rms_db, is_speech, speech_prob = self._compute_chunk_metrics(
+                audio_chunk, sample_rate
+            )
         except AudioProcessingException:
             return VADResult(
                 event=VADEventType.INVALID_AUDIO,
@@ -114,7 +172,8 @@ class GIAVoiceActivityDetector(VoiceActivityDetector):
                 rms_db=-100.0,
                 duration_ms=0.0,
                 utterance_completed=False,
-                speech_duration_ms=0.0
+                speech_duration_ms=0.0,
+                speech_probability=0.0
             )
 
         pcm_bytes = audio_np.tobytes()
@@ -179,7 +238,8 @@ class GIAVoiceActivityDetector(VoiceActivityDetector):
             rms_db=round(rms_db, 2),
             duration_ms=round(duration_ms, 2),
             utterance_completed=utterance_completed,
-            speech_duration_ms=round(self._accumulated_speech_ms, 2)
+            speech_duration_ms=round(self._accumulated_speech_ms, 2),
+            speech_probability=round(speech_prob, 4)
         )
 
     def _finalize_utterance(self) -> None:

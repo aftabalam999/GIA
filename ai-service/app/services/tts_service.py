@@ -268,4 +268,7 @@ class GIATextToSpeechService(TextToSpeechService):
         logger.info(f"Synthesized local fallback TTS audio: {len(text)} chars -> {len(pcm_data)} PCM bytes ({duration:.2f}s)")
         return wav_io.getvalue()
 
-gia_tts_service = GIATextToSpeechService()
+# Expose local Kokoro TTS Service as canonical TTS provider
+from app.services.kokoro_tts import KokoroTTSService, gia_kokoro_service
+
+gia_tts_service = gia_kokoro_service

@@ -17,16 +17,29 @@ class Settings(BaseSettings):
 
     # Provider / Model Engine Identifiers (Configurable abstractions)
     STT_PROVIDER: str = "whisper"
-    STT_MODEL_NAME: str = "tiny"
-    STT_MODEL_PATH: str = "ai-service/models/stt/whisper-tiny"
-    STT_DEVICE: str = "cpu"
-    STT_COMPUTE_TYPE: str = "int8"
+    STT_MODEL_NAME: str = "small"
+    STT_MODEL_PATH: str = "models/STT/ggml-small-q5_1.bin"
+    STT_DEVICE: str = "auto"
+    STT_COMPUTE_TYPE: str = "q5_1"
     STT_TIMEOUT_SECONDS: float = 30.0
     STT_LOCAL_FILES_ONLY: bool = True
-    TTS_PROVIDER: str = "local"
-    TTS_MODEL_NAME: str = "local-say"
-    TTS_VOICE: str = "Samantha"
-    VAD_PROVIDER: str = "webrtc"
+    TTS_PROVIDER: str = "kokoro"
+    TTS_MODEL_NAME: str = "kokoro-v1_0"
+    TTS_MODEL_PATH: str = "models/TTS/kokoro-v1_0.pth"
+    TTS_CONFIG_PATH: str = "models/TTS/config.json"
+    TTS_VOICES_DIR: str = "models/TTS/voices"
+    TTS_VOICE_EN: str = "af_heart"
+    TTS_VOICE_HI: str = "hf_alpha"
+    TTS_VOICE: str = "af_heart"
+    TTS_DEVICE: str = "auto"
+    TTS_SAMPLE_RATE: int = 24000
+    TTS_MAX_TEXT_LENGTH: int = 2000
+    TTS_TIMEOUT_SECONDS: float = 30.0
+    VAD_PROVIDER: str = "silero"
+    VAD_MODEL_PATH: str = "models/silero-vad/model.onnx"
+    VAD_THRESHOLD: float = 0.5
+    VAD_SAMPLE_RATE: int = 16000
+    VAD_USE_SILERO: bool = True
 
     # Embedding Settings (Local Sentence Transformers)
     EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"

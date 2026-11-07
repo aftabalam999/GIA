@@ -2,7 +2,7 @@ import logging
 from typing import Optional
 from fastapi import APIRouter, Response, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from app.services.tts_service import gia_tts_service
+from app.services.kokoro_tts import gia_kokoro_service
 from app.schemas.tts import TTSSynthesizeRequest, TTSStatusResponse
 from app.core.exceptions import (
     AIServiceException,
@@ -21,28 +21,31 @@ async def synthesize_speech(
 ):
     """
     Synthesizes input text into a WAV audio stream suitable for desktop playback.
+    Supports English ('af_heart') and Hindi ('hf_alpha') with automatic language detection.
     """
-    if not gia_tts_service.is_ready():
-        raise ModelNotReadyException("TTS engine is not initialized or ready")
+    if not gia_kokoro_service.is_ready():
+        raise ModelNotReadyException("Kokoro TTS engine is not initialized or ready")
 
     if stream:
         return StreamingResponse(
-            gia_tts_service.synthesize_stream(
+            gia_kokoro_service.synthesize_stream(
                 text=req.text,
                 voice=req.voice,
+                speed=req.speed,
                 language=req.language
             ),
             media_type="audio/wav",
             headers={
                 "Content-Disposition": "attachment; filename=synthesized_stream.wav",
-                "X-Audio-Sample-Rate": str(gia_tts_service.sample_rate)
+                "X-Audio-Sample-Rate": str(gia_kokoro_service.sample_rate)
             }
         )
 
     try:
-        audio_bytes = await gia_tts_service.synthesize(
+        audio_bytes, meta = await gia_kokoro_service.synthesize_with_metadata(
             text=req.text,
             voice=req.voice,
+            speed=req.speed,
             language=req.language
         )
         return Response(
@@ -51,7 +54,12 @@ async def synthesize_speech(
             headers={
                 "Content-Disposition": "attachment; filename=synthesized.wav",
                 "Content-Length": str(len(audio_bytes)),
-                "X-Audio-Sample-Rate": str(gia_tts_service.sample_rate)
+                "X-Audio-Sample-Rate": str(meta.sample_rate),
+                "X-TTS-Language": meta.language,
+                "X-TTS-Voice": meta.voice,
+                "X-TTS-Speed": str(meta.speed),
+                "X-TTS-Duration": str(meta.duration_seconds),
+                "X-TTS-Device": meta.device,
             }
         )
     except AIServiceException:
@@ -65,4 +73,4 @@ async def get_tts_status():
     """
     Returns TTS model readiness, configuration, device, and status details.
     """
-    return gia_tts_service.get_status()
+    return gia_kokoro_service.get_status()

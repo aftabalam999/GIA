@@ -39,7 +39,7 @@ export class PlanRepository {
     const sql = `
       SELECT * FROM task_plans
       WHERE conversation_id = $1
-        AND status IN ('awaiting_approval', 'draft', 'modifying')
+        AND status IN ('awaiting_approval', 'draft', 'modifying', 'approved', 'executing')
       ORDER BY updated_at DESC
       LIMIT 1
     `;
@@ -54,8 +54,13 @@ export class PlanRepository {
       throw new Error(`Task plan with id ${id} not found`);
     }
 
+    if (updates.status === 'approved' && (existing.status === 'cancelled' || existing.status === 'rejected')) {
+      throw new Error(`Cannot approve plan: plan has already been ${existing.status}`);
+    }
+
     const merged = { ...existing, ...updates };
     const newVersion = (updates.steps || updates.objective) ? (existing.version + 1) : existing.version;
+    const approvalGuard = updates.status === 'approved' ? "AND status NOT IN ('cancelled', 'rejected')" : '';
 
     const sql = `
       UPDATE task_plans
@@ -68,7 +73,7 @@ export class PlanRepository {
           metadata = $7,
           version = $8,
           updated_at = NOW()
-      WHERE id = $9
+      WHERE id = $9 ${approvalGuard}
       RETURNING *
     `;
 
@@ -83,6 +88,11 @@ export class PlanRepository {
       newVersion,
       id,
     ]);
+
+    if (res.rows.length === 0) {
+      const current = await this.findById(id);
+      throw new Error(`Plan update failed: current status is '${current?.status || 'unknown'}'`);
+    }
 
     return this.mapRow(res.rows[0]);
   }

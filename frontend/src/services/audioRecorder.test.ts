@@ -18,6 +18,7 @@ describe('AudioRecorderService VAD Pause Guard Unit Tests', () => {
 
     mockMediaStream = {
       getTracks: vi.fn().mockReturnValue([{ stop: vi.fn() }]),
+      getAudioTracks: vi.fn().mockReturnValue([{ readyState: 'live', stop: vi.fn(), onended: null }]),
     };
 
     mockMediaRecorder = {
@@ -103,5 +104,60 @@ describe('AudioRecorderService VAD Pause Guard Unit Tests', () => {
     expect(onSpeechStartMock).toHaveBeenCalledTimes(1);
 
     recorder.stop();
+  });
+
+  it('should verify audio frame reception and update hasReceivedFrames', async () => {
+    const recorder = new AudioRecorderService();
+    expect(recorder.hasReceivedFrames).toBe(false);
+
+    await recorder.start();
+
+    // Trigger an animation frame to simulate audio frame reception
+    if (animCallback) {
+      (animCallback as Function)();
+    }
+
+    expect(recorder.hasReceivedFrames).toBe(true);
+
+    recorder.stop();
+    expect(recorder.hasReceivedFrames).toBe(false);
+  });
+
+  it('should prevent duplicate start operations without creating duplicate streams', async () => {
+    const recorder = new AudioRecorderService();
+    await recorder.start();
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(1);
+
+    // Second start invocation while already recording
+    await recorder.start();
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(1);
+
+    recorder.stop();
+  });
+
+  it('should handle track ended / disconnection events safely', async () => {
+    const onErrorMock = vi.fn();
+    const track = { readyState: 'live', stop: vi.fn(), onended: null as any };
+    mockMediaStream.getAudioTracks = vi.fn().mockReturnValue([track]);
+
+    const recorder = new AudioRecorderService({
+      onError: onErrorMock,
+    });
+
+    await recorder.start();
+    expect(typeof track.onended).toBe('function');
+
+    // Simulate hardware disconnection
+    track.onended();
+
+    expect(onErrorMock).toHaveBeenCalledWith('Microphone input device disconnected.');
+  });
+
+  it('should reject start if media stream has no audio tracks and native fallback is denied', async () => {
+    mockMediaStream.getAudioTracks = vi.fn().mockReturnValue([]);
+    (navigator.mediaDevices.getUserMedia as any).mockRejectedValue(new Error('Device error'));
+
+    const recorder = new AudioRecorderService();
+    await expect(recorder.start()).rejects.toThrow();
   });
 });

@@ -36,15 +36,34 @@ export interface ApprovalRequest {
   planId: string;
   planVersion: number;
   userId: string;
+  conversationId?: string;
   channel: ApprovalChannel;
   explicitConfirmation?: boolean;
   voiceTranscript?: string;
   sensitiveConfirmations?: Record<string, boolean>; // Key format: "step_<id>_<OPERATION_TYPE>"
-  isAssistantVoice?: boolean; // Must be false!
+  isAssistantVoice?: boolean; // Client flag (untrusted for authorization decisions)
+  voiceSessionId?: string;
+  transcriptTimestamp?: number;
+  approvalNonce?: string;
+  challengeToken?: string;
+}
+
+export interface VoiceApprovalChallenge {
+  challengeId: string;
+  challengeToken: string;
+  planId: string;
+  planVersion: number;
+  userId: string;
+  conversationId: string;
+  createdAt: number;
+  expiresAt: number;
+  consumed: boolean;
+  revoked?: boolean;
 }
 
 export interface ExecutionTicket {
   ticketId: string;
+  ticketToken?: string;
   planId: string;
   planVersion: number;
   userId: string;

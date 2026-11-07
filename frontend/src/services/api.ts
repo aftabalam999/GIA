@@ -62,7 +62,8 @@ async function apiRequest(path: string, method: string, token?: string, body?: a
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.error?.message || data?.message || `Request failed with status ${response.status}`);
+    const errorMsg = data?.error?.message || data?.message || (typeof data?.error === 'string' ? data.error : null) || `Request failed with status ${response.status}`;
+    throw new Error(errorMsg);
   }
   return data;
 }
@@ -268,7 +269,9 @@ export async function fetchHealthStatus(): Promise<HealthResponse> {
 // VOICE API ENDPOINTS
 export async function transcribeAudio(token: string, audioBlob: Blob | Buffer): Promise<any> {
   const formData = new FormData();
-  formData.append('file', audioBlob as Blob, 'recording.wav');
+  const mime = (audioBlob as Blob)?.type || '';
+  const ext = mime.includes('mp4') ? 'mp4' : mime.includes('webm') ? 'webm' : mime.includes('ogg') ? 'ogg' : 'wav';
+  formData.append('file', audioBlob as Blob, `recording.${ext}`);
 
   const response = await fetch(`${BACKEND_URL}/api/v1/voice/transcribe`, {
     method: 'POST',
@@ -374,6 +377,7 @@ export interface ExecutionPlan {
 
 export interface ExecutionTicket {
   ticketId: string;
+  ticketToken?: string;
   ticket_token?: string;
   planId: string;
   planVersion: number;
@@ -486,6 +490,3 @@ export async function sendVoicePlanCommand(token: string, conversationId: string
     isAssistantVoice,
   });
 }
-
-
-

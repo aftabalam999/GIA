@@ -276,7 +276,7 @@ describe('PHASE 5: Comprehensive Security Audit of GIA Plan-First Architecture',
       method: 'POST',
       url: `/api/v1/conversations/${testConvoId}/plans/${planV1.id}/execute`,
       headers: { authorization: `Bearer ${testUser.token}` },
-      payload: { ticketToken: ticketV1.ticketId, planVersion: 2 },
+      payload: { ticketToken: ticketV1.ticketToken || ticketV1.ticketId, planVersion: 2 },
     });
     expect(execWithStaleTicket.statusCode).toBe(403);
 
@@ -285,7 +285,7 @@ describe('PHASE 5: Comprehensive Security Audit of GIA Plan-First Architecture',
       method: 'POST',
       url: `/api/v1/conversations/${testConvoId}/plans/${planV1.id}/execute`,
       headers: { authorization: `Bearer ${testUser.token}` },
-      payload: { ticketToken: ticketV1.ticketId, planVersion: 1 },
+      payload: { ticketToken: ticketV1.ticketToken || ticketV1.ticketId, planVersion: 1 },
     });
     expect(execMismatch.statusCode).toBe(400); // Plan version mismatch
   });
@@ -466,7 +466,7 @@ describe('PHASE 5: Comprehensive Security Audit of GIA Plan-First Architecture',
       method: 'POST',
       url: `/api/v1/conversations/${testConvoId}/plans/${plan.id}/execute`,
       headers: { authorization: `Bearer ${testUser.token}` },
-      payload: { ticketToken: ticket.ticketId, planVersion: plan.version },
+      payload: { ticketToken: ticket.ticketToken || ticket.ticketId, planVersion: plan.version },
     });
     expect(execRes1.statusCode).toBe(200);
 
@@ -475,7 +475,7 @@ describe('PHASE 5: Comprehensive Security Audit of GIA Plan-First Architecture',
       method: 'POST',
       url: `/api/v1/conversations/${testConvoId}/plans/${plan.id}/execute`,
       headers: { authorization: `Bearer ${testUser.token}` },
-      payload: { ticketToken: ticket.ticketId, planVersion: plan.version },
+      payload: { ticketToken: ticket.ticketToken || ticket.ticketId, planVersion: plan.version },
     });
 
     // Blocked: Plan is already in completed status, not approved
@@ -555,7 +555,7 @@ describe('PHASE 5: Comprehensive Security Audit of GIA Plan-First Architecture',
       url: `/api/v1/conversations/${testConvoId}/plans/${multiPlan.id}/execute`,
       headers: { authorization: `Bearer ${testUser.token}` },
       payload: {
-        ticketToken: ticketResult.ticket!.ticketId,
+        ticketToken: ticketResult.ticket!.ticketToken || ticketResult.ticket!.ticketId,
         planVersion: 1,
       },
     });

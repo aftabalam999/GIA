@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { query } from '../../database/client.js';
+import { pool, query } from '../../database/client.js';
 import { PlanRepository } from '../planner/plan.repository.js';
 import { ExecutionPlan, PlanStep } from '../planner/planner.interface.js';
 import {
@@ -11,6 +11,7 @@ import {
   SensitiveOperationType,
   VoiceApprovalParseResult,
   ToolVerificationResult,
+  VoiceApprovalChallenge,
 } from './permission.interface.js';
 import { AuthorizationError, NotFoundError } from '../../shared/errors.js';
 import { logger } from '../../shared/logger.js';
@@ -19,11 +20,26 @@ export class PermissionManager {
   // Plan approval expiration TTL (10 minutes)
   public static readonly APPROVAL_TTL_MS = 10 * 60 * 1000;
 
+  // Voice approval challenge TTL (60 seconds)
+  public static readonly CHALLENGE_TTL_MS = 60 * 1000;
+
   // Gate enforcement flag (active by default in production)
   private static _gateEnforced: boolean = process.env.NODE_ENV !== 'test' || process.env.STRICT_APPROVAL_GATE === 'true';
 
   // In-memory execution ticket cache (synchronized with database)
   private static tickets = new Map<string, ExecutionTicket>();
+
+  // Consumed voice approval transcripts to prevent replaying voice commands
+  private static consumedVoiceTranscripts = new Set<string>();
+
+  // In-memory challenge storage (challengeToken -> VoiceApprovalChallenge)
+  private static challenges = new Map<string, VoiceApprovalChallenge>();
+
+  // In-memory mapping from planId -> active challengeToken
+  private static planActiveChallenges = new Map<string, string>();
+
+  // Global challenge enforcement toggle
+  private static _challengeEnforced: boolean = false;
 
   public static isGateEnforced(): boolean {
     if (process.env.STRICT_APPROVAL_GATE === 'true') return true;
@@ -32,6 +48,161 @@ export class PermissionManager {
 
   public static setGateEnforced(enforced: boolean): void {
     this._gateEnforced = enforced;
+  }
+
+  public static isChallengeEnforced(): boolean {
+    return this._challengeEnforced;
+  }
+
+  public static setChallengeEnforced(enforced: boolean): void {
+    this._challengeEnforced = enforced;
+  }
+
+  /**
+   * Generate a cryptographically secure, single-use approval challenge nonce
+   * bound to user, conversation, plan ID, and plan version with a 60-second TTL.
+   * Persisted to PostgreSQL for multi-instance concurrency and restart resilience.
+   */
+  public static async createApprovalChallenge(
+    planId: string,
+    userId: string,
+    conversationId: string,
+    planVersion: number
+  ): Promise<VoiceApprovalChallenge> {
+    const existingToken = this.planActiveChallenges.get(planId);
+    if (existingToken) {
+      const existing = this.challenges.get(existingToken);
+      if (existing) {
+        existing.consumed = true;
+      }
+    }
+
+    // Invalidate existing active challenges for this plan in DB
+    await query(
+      `
+      UPDATE voice_approval_challenges
+      SET revoked = true, revoked_at = NOW()
+      WHERE plan_id = $1 AND consumed = false AND revoked = false
+      `,
+      [planId]
+    );
+
+    const challengeId = crypto.randomUUID();
+    const challengeToken = `gia_chal_${crypto.randomBytes(16).toString('hex')}`;
+    const createdAt = Date.now();
+    const expiresAt = createdAt + this.CHALLENGE_TTL_MS;
+
+    const challenge: VoiceApprovalChallenge = {
+      challengeId,
+      challengeToken,
+      planId,
+      planVersion,
+      userId,
+      conversationId,
+      createdAt,
+      expiresAt,
+      consumed: false,
+    };
+
+    // Persist challenge in PostgreSQL (fails closed if DB unavailable)
+    await query(
+      `
+      INSERT INTO voice_approval_challenges (
+        id, challenge_token, plan_id, plan_version, user_id, conversation_id,
+        created_at, expires_at, consumed, revoked
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7 / 1000.0), to_timestamp($8 / 1000.0), false, false)
+      `,
+      [
+        challengeId,
+        challengeToken,
+        planId,
+        planVersion,
+        userId,
+        conversationId,
+        createdAt,
+        expiresAt,
+      ]
+    );
+
+    this.challenges.set(challengeToken, challenge);
+    this.planActiveChallenges.set(planId, challengeToken);
+
+    logger.info({
+      msg: 'Server-side voice approval challenge generated and persisted',
+      challengeId,
+      planId,
+      planVersion,
+      userId,
+      conversationId,
+      expiresAt,
+    });
+
+    return challenge;
+  }
+
+  /**
+   * Look up a challenge by its token (checking in-memory cache then PostgreSQL).
+   */
+  public static async getChallenge(token: string): Promise<VoiceApprovalChallenge | undefined> {
+    let challenge = this.challenges.get(token);
+    if (!challenge) {
+      try {
+        const res = await query<any>(
+          `SELECT * FROM voice_approval_challenges WHERE challenge_token = $1`,
+          [token]
+        );
+        if (res.rows.length > 0) {
+          const row = res.rows[0];
+          challenge = {
+            challengeId: row.id,
+            challengeToken: row.challenge_token,
+            planId: row.plan_id,
+            planVersion: row.plan_version,
+            userId: row.user_id,
+            conversationId: row.conversation_id,
+            createdAt: new Date(row.created_at).getTime(),
+            expiresAt: new Date(row.expires_at).getTime(),
+            consumed: row.consumed,
+            revoked: row.revoked,
+          };
+          this.challenges.set(token, challenge);
+        }
+      } catch (err: any) {
+        logger.debug({ msg: 'DB getChallenge error', err: err.message });
+      }
+    }
+    return challenge;
+  }
+
+  /**
+   * Revoke/invalidate any pending challenges for a plan.
+   */
+  public static async revokePlanChallenges(planId: string, reason: string): Promise<void> {
+    const activeToken = this.planActiveChallenges.get(planId);
+    if (activeToken) {
+      const challenge = this.challenges.get(activeToken);
+      if (challenge) {
+        challenge.consumed = true;
+      }
+      this.planActiveChallenges.delete(planId);
+    }
+    for (const [token, chal] of this.challenges.entries()) {
+      if (chal.planId === planId) {
+        chal.consumed = true;
+      }
+    }
+
+    await query(
+      `
+      UPDATE voice_approval_challenges
+      SET revoked = true, revoked_at = NOW()
+      WHERE plan_id = $1 AND consumed = false AND revoked = false
+      `,
+      [planId]
+    );
+
+    logger.info({ msg: 'Plan approval challenges revoked', planId, reason });
   }
 
   /**
@@ -324,44 +495,7 @@ export class PermissionManager {
    * 12. Never reuse approval for a different task
    */
   public static async requestApproval(request: ApprovalRequest): Promise<ApprovalResult> {
-    // Rule 10: LLM / Assistant cannot approve plans
-    if ((request.channel as any) === 'model' || request.isAssistantVoice) {
-      logger.warn({ msg: 'Security violation: Assistant or LLM attempted self-approval', request });
-      return {
-        success: false,
-        state: 'rejected',
-        message: request.isAssistantVoice
-          ? 'Security violation: Assistant TTS voice output cannot approve actions.'
-          : 'Security violation: Assistant or LLM cannot approve its own plan.',
-      };
-    }
-
-    // Rule 1: Silence is never approval
-    if (!request.explicitConfirmation && !request.voiceTranscript) {
-      return {
-        success: false,
-        state: 'pending',
-        message: 'Approval denied: Silence or absence of explicit confirmation is never approval.',
-      };
-    }
-
-    // Voice command channel handling
-    if (request.channel === 'voice_command') {
-      const voiceParse = this.parseVoiceApproval(request.voiceTranscript || '', request.isAssistantVoice);
-      if (!voiceParse.isValid) {
-        return {
-          success: false,
-          state: 'pending',
-          message: voiceParse.reason || 'Approval denied: Invalid voice command.',
-        };
-      }
-      if (voiceParse.isRejection) {
-        return await this.rejectPlan(request.planId, request.userId, 'Explicitly rejected via voice command');
-      }
-      // If voice parsed as approval, proceed
-    }
-
-    // Fetch plan
+    // 1. Fetch plan first to establish plan binding, ownership, and conversation context
     const plan = await PlanRepository.findById(request.planId);
     if (!plan) {
       throw new NotFoundError(`Task plan with id ${request.planId} not found`);
@@ -372,12 +506,26 @@ export class PermissionManager {
       throw new AuthorizationError('Access denied: You do not have permission to approve this plan.');
     }
 
+    // Conversation binding: plan must belong to the active conversation
+    if (request.conversationId && plan.conversation_id !== request.conversationId) {
+      throw new AuthorizationError('Access denied: Plan does not belong to this conversation.');
+    }
+
     // Rule 4: A rejected plan must never execute
     if (plan.status === 'rejected') {
       return {
         success: false,
         state: 'rejected',
         message: 'Approval denied: A rejected plan must never execute. Please generate a new task plan.',
+      };
+    }
+
+    // Plan must not be cancelled
+    if (plan.status === 'cancelled') {
+      return {
+        success: false,
+        state: 'cancelled',
+        message: 'Approval denied: A cancelled plan cannot be approved.',
       };
     }
 
@@ -401,8 +549,220 @@ export class PermissionManager {
       };
     }
 
-    // Sensitive Operations Assessment & Step-Specific Confirmation Gate
+    // Rule 10: LLM / Assistant cannot approve plans
+    if ((request.channel as any) === 'model' || request.isAssistantVoice) {
+      logger.warn({ msg: 'Security violation: Assistant or LLM attempted self-approval', planId: plan.id, userId: request.userId });
+      return {
+        success: false,
+        state: 'rejected',
+        message: request.isAssistantVoice
+          ? 'Security violation: Assistant TTS voice output cannot approve actions.'
+          : 'Security violation: Assistant or LLM cannot approve its own plan.',
+      };
+    }
+
+    // Rule 1: Silence is never approval
+    if (!request.explicitConfirmation && !request.voiceTranscript) {
+      return {
+        success: false,
+        state: 'pending',
+        message: 'Approval denied: Silence or absence of explicit confirmation is never approval.',
+      };
+    }
+
+    // Sensitive Operations Assessment
     const sensitivities = this.assessPlanSensitivities(plan);
+    const hasSensitiveOperations = Array.from(sensitivities.values()).some((s) => s.isSensitive);
+
+    // Rule 13: High-impact actions REQUIRE explicit UI interaction.
+    // Client-provided audio transcripts cannot guarantee audio provenance or cryptographic identity.
+    // Therefore, voice commands are strictly prohibited from approving sensitive operations.
+    if (request.channel === 'voice_command' && hasSensitiveOperations) {
+      logger.warn({
+        msg: 'Approval blocked: Voice command channel cannot authorize sensitive operations',
+        planId: plan.id,
+        userId: request.userId,
+      });
+      return {
+        success: false,
+        state: 'pending',
+        message: 'Approval blocked: High-impact actions require trusted explicit UI confirmation. Voice commands cannot authorize sensitive operations.',
+      };
+    }
+
+    let challenge: VoiceApprovalChallenge | undefined;
+    let requiresChallenge = false;
+
+    // Voice command channel handling
+    if (request.channel === 'voice_command') {
+      const activeChalToken = this.planActiveChallenges.get(request.planId);
+      requiresChallenge = this._challengeEnforced || Boolean(activeChalToken) || Boolean(request.challengeToken);
+
+      if (requiresChallenge) {
+        const token = request.challengeToken || request.approvalNonce;
+        if (!token) {
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Missing server-issued voice approval challenge token.',
+          };
+        }
+
+        challenge = this.challenges.get(token);
+        if (!challenge) {
+          const dbRes = await query<any>(
+            `SELECT * FROM voice_approval_challenges WHERE challenge_token = $1`,
+            [token]
+          );
+          if (dbRes.rows.length > 0) {
+            const row = dbRes.rows[0];
+            challenge = {
+              challengeId: row.id,
+              challengeToken: row.challenge_token,
+              planId: row.plan_id,
+              planVersion: row.plan_version,
+              userId: row.user_id,
+              conversationId: row.conversation_id,
+              createdAt: new Date(row.created_at).getTime(),
+              expiresAt: new Date(row.expires_at).getTime(),
+              consumed: row.consumed,
+              revoked: row.revoked,
+            };
+            this.challenges.set(token, challenge);
+          }
+        }
+
+        if (!challenge) {
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Invalid voice approval challenge token.',
+          };
+        }
+
+        // Rule: Revocation check (modified, rejected, or cancelled plan)
+        if (challenge.revoked) {
+          return {
+            success: false,
+            state: 'modified',
+            message: 'Approval denied: Challenge has been revoked. A modified or revoked plan requires a fresh challenge.',
+          };
+        }
+
+        // Rule: Single-use check (atomic replay protection)
+        if (challenge.consumed) {
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Challenge has already been consumed. Replay attacks are prohibited.',
+          };
+        }
+
+        // Rule: Authoritative server-side expiration (ignores forged client timestamps)
+        if (Date.now() > challenge.expiresAt) {
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Voice approval challenge has expired (exceeded 60-second window).',
+          };
+        }
+
+        // Rule: User binding
+        if (challenge.userId !== request.userId) {
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Challenge user mismatch. Approval challenges cannot be transferred.',
+          };
+        }
+
+        // Rule: Conversation binding
+        if (
+          (request.conversationId && challenge.conversationId !== request.conversationId) ||
+          challenge.conversationId !== plan.conversation_id
+        ) {
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Challenge conversation mismatch.',
+          };
+        }
+
+        // Rule: Plan binding
+        if (challenge.planId !== request.planId || challenge.planId !== plan.id) {
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Challenge plan mismatch.',
+          };
+        }
+
+        // Rule: Plan version binding
+        if (challenge.planVersion !== request.planVersion || challenge.planVersion !== plan.version) {
+          return {
+            success: false,
+            state: 'modified',
+            message: `Approval denied: Challenge plan version mismatch (challenge is for v${challenge.planVersion}, plan is v${plan.version}). A modified plan requires a fresh challenge.`,
+          };
+        }
+
+        // Rule: Plan must still be in pending / awaiting_approval state
+        if (!['pending', 'awaiting_approval', 'modified'].includes(plan.status)) {
+          return {
+            success: false,
+            state: plan.status as ApprovalState,
+            message: `Approval denied: Plan is in '${plan.status}' state and cannot be approved.`,
+          };
+        }
+      }
+
+      const voiceParse = this.parseVoiceApproval(request.voiceTranscript || '', request.isAssistantVoice);
+      if (!voiceParse.isValid) {
+        return {
+          success: false,
+          state: 'pending',
+          message: voiceParse.reason || 'Approval denied: Invalid voice command.',
+        };
+      }
+      if (voiceParse.isRejection) {
+        return await this.rejectPlan(request.planId, request.userId, 'Explicitly rejected via voice command');
+      }
+
+      // Check stale transcripts and pre-prompt timing
+      const planCreatedAtMs = new Date(plan.created_at || Date.now()).getTime();
+      if (request.transcriptTimestamp) {
+        if (Date.now() - request.transcriptTimestamp > 60000) {
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Stale voice transcript. Voice approval expired (exceeded 60s freshness window).',
+          };
+        }
+        if (request.transcriptTimestamp < planCreatedAtMs - 1000) {
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Stale voice transcript. Approval must originate after the approval prompt was issued.',
+          };
+        }
+      }
+
+      // Replay prevention
+      const transcriptSig = crypto
+        .createHash('sha256')
+        .update(`${request.userId}:${request.planId}:${request.voiceTranscript || ''}:${request.voiceSessionId || ''}:${request.approvalNonce || ''}:${request.challengeToken || ''}`)
+        .digest('hex');
+
+      if (this.consumedVoiceTranscripts.has(transcriptSig)) {
+        return {
+          success: false,
+          state: 'pending',
+          message: 'Approval denied: Replayed voice approval detected. Each voice approval transcript can only be used once.',
+        };
+      }
+    }
+
+    // Step-Specific Sensitive Confirmations Gate (for web_ui)
     const missingConfirmations: string[] = [];
     const confirmedSensitives: Record<string, boolean> = {};
 
@@ -428,76 +788,194 @@ export class PermissionManager {
       };
     }
 
-    // Update Plan in Database to approved
-    const updatedPlan = await PlanRepository.update(plan.id, {
-      status: 'approved',
-      approval: {
+    // Concurrency check: Re-verify plan has not been rejected, cancelled, or expired concurrently in DB
+    const freshPlanCheck = await PlanRepository.findById(plan.id);
+    if (!freshPlanCheck || ['cancelled', 'rejected', 'expired'].includes(freshPlanCheck.status)) {
+      return {
+        success: false,
+        state: (freshPlanCheck?.status || 'cancelled') as ApprovalState,
+        message: `Approval denied: Plan status was changed concurrently to '${freshPlanCheck?.status}'.`,
+      };
+    }
+
+    // ATOMIC DATABASE TRANSACTION
+    // Challenge consumption, plan status transition, and ticket creation occur atomically
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Acquire row-level lock on task_plans to prevent concurrent races
+      const planLockRes = await client.query(
+        `SELECT * FROM task_plans WHERE id = $1 FOR UPDATE`,
+        [plan.id]
+      );
+      if (planLockRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        throw new NotFoundError(`Task plan with id ${plan.id} not found`);
+      }
+      const lockedPlan = planLockRes.rows[0];
+
+      if (['cancelled', 'rejected', 'expired'].includes(lockedPlan.status)) {
+        await client.query('ROLLBACK');
+        return {
+          success: false,
+          state: lockedPlan.status as ApprovalState,
+          message: `Approval denied: Plan status was changed concurrently to '${lockedPlan.status}'.`,
+        };
+      }
+
+      if (lockedPlan.version !== request.planVersion) {
+        await client.query('ROLLBACK');
+        return {
+          success: false,
+          state: 'modified',
+          message: `Approval denied: Plan version mismatch (requested v${request.planVersion}, current plan is v${lockedPlan.version}). A modified plan requires fresh approval.`,
+        };
+      }
+
+      // 2. If voice_command with challenge, atomically consume the challenge within the transaction
+      if (request.channel === 'voice_command' && requiresChallenge) {
+        const token = request.challengeToken || request.approvalNonce;
+        const updateChalRes = await client.query(
+          `
+          UPDATE voice_approval_challenges
+          SET consumed = true, consumed_at = NOW()
+          WHERE challenge_token = $1
+            AND consumed = false
+            AND revoked = false
+            AND expires_at > NOW()
+          RETURNING *;
+          `,
+          [token]
+        );
+
+        if (updateChalRes.rowCount === 0) {
+          await client.query('ROLLBACK');
+          if (challenge) challenge.consumed = true;
+          return {
+            success: false,
+            state: 'pending',
+            message: 'Approval denied: Challenge has already been consumed. Replay attacks are prohibited.',
+          };
+        }
+      }
+
+      // 3. Atomically update task_plans status to 'approved'
+      const approvalFeedback = request.voiceTranscript
+        ? `Approved via voice command: "${request.voiceTranscript}"`
+        : 'Approved via web UI';
+
+      const approvalPayload = {
         required: true,
         approved: true,
         approved_at: new Date().toISOString(),
-        feedback: request.voiceTranscript
-          ? `Approved via voice command: "${request.voiceTranscript}"`
-          : 'Approved via web UI',
-      },
-    });
+        feedback: approvalFeedback,
+      };
 
-    // Generate unique single-use execution ticket
-    const ticketId = crypto.randomUUID();
-    const ticketToken = `gia_ticket_${crypto.randomBytes(16).toString('hex')}`;
-    const issuedAt = Date.now();
-    const expiresAt = issuedAt + this.APPROVAL_TTL_MS;
+      const updatePlanRes = await client.query(
+        `
+        UPDATE task_plans
+        SET status = 'approved',
+            approval = $1,
+            updated_at = NOW()
+        WHERE id = $2 AND status NOT IN ('cancelled', 'rejected', 'expired')
+        RETURNING *;
+        `,
+        [JSON.stringify(approvalPayload), plan.id]
+      );
 
-    const ticket: ExecutionTicket = {
-      ticketId,
-      planId: plan.id,
-      planVersion: plan.version,
-      userId: request.userId,
-      issuedAt,
-      expiresAt,
-      approvedSteps: plan.steps.map((s) => s.step_id),
-      confirmedSensitiveOperations: confirmedSensitives,
-      usedSteps: [],
-    };
+      if (updatePlanRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return {
+          success: false,
+          state: 'cancelled',
+          message: 'Approval denied: Plan status could not be transitioned to approved.',
+        };
+      }
 
-    // Persist approval record in database
-    await query(
-      `
-      INSERT INTO plan_approvals (
-        id, plan_id, plan_version, user_id, channel, status,
-        sensitive_confirmations, ticket_token, expires_at
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9 / 1000.0))
-      `,
-      [
+      // 4. Generate and persist single-use cryptographic execution ticket
+      const ticketId = crypto.randomUUID();
+      const ticketToken = `gia_ticket_${crypto.randomBytes(16).toString('hex')}`;
+      const issuedAt = Date.now();
+      const expiresAt = issuedAt + this.APPROVAL_TTL_MS;
+
+      await client.query(
+        `
+        INSERT INTO plan_approvals (
+          id, plan_id, plan_version, user_id, channel, status,
+          sensitive_confirmations, ticket_token, expires_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9 / 1000.0))
+        `,
+        [
+          ticketId,
+          plan.id,
+          plan.version,
+          request.userId,
+          request.channel,
+          'approved',
+          JSON.stringify(confirmedSensitives),
+          ticketToken,
+          expiresAt,
+        ]
+      );
+
+      // 5. Commit transaction atomically
+      await client.query('COMMIT');
+
+      // 6. Post-commit in-memory cache updates
+      if (challenge) {
+        challenge.consumed = true;
+      }
+      this.planActiveChallenges.delete(request.planId);
+
+      if (request.channel === 'voice_command') {
+        const transcriptSig = crypto
+          .createHash('sha256')
+          .update(`${request.userId}:${request.planId}:${request.voiceTranscript || ''}:${request.voiceSessionId || ''}:${request.approvalNonce || ''}:${request.challengeToken || ''}`)
+          .digest('hex');
+        this.consumedVoiceTranscripts.add(transcriptSig);
+      }
+
+      const ticket: ExecutionTicket = {
         ticketId,
-        plan.id,
-        plan.version,
-        request.userId,
-        request.channel,
-        'approved',
-        JSON.stringify(confirmedSensitives),
         ticketToken,
+        planId: plan.id,
+        planVersion: plan.version,
+        userId: request.userId,
+        issuedAt,
         expiresAt,
-      ]
-    );
+        approvedSteps: plan.steps.map((s) => s.step_id),
+        confirmedSensitiveOperations: confirmedSensitives,
+        usedSteps: [],
+      };
+      this.tickets.set(ticketToken, ticket);
 
-    // Cache ticket in-memory for lightning fast runtime verification
-    this.tickets.set(ticketToken, ticket);
-    this.tickets.set(ticketId, ticket);
+      logger.info({
+        msg: 'Plan approval decision processed transactionally',
+        planId: plan.id,
+        version: plan.version,
+        userId: request.userId,
+        channel: request.channel,
+        status: 'approved',
+        stepCount: plan.steps.length,
+        hasSensitiveOperations,
+        ticketToken,
+      });
 
-    logger.info({
-      msg: 'Plan approval granted. Execution ticket issued.',
-      planId: plan.id,
-      version: plan.version,
-      ticketToken,
-    });
-
-    return {
-      success: true,
-      state: 'approved',
-      message: `Plan "${updatedPlan.objective}" (v${updatedPlan.version}) has been explicitly approved for execution.`,
-      ticket,
-    };
+      return {
+        success: true,
+        state: 'approved',
+        message: `Plan "${plan.objective}" (v${plan.version}) has been explicitly approved for execution.`,
+        ticket,
+      };
+    } catch (err: any) {
+      await client.query('ROLLBACK');
+      logger.error({ msg: 'Database transaction error in requestApproval', err: err.message });
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   /**
@@ -608,9 +1086,16 @@ export class PermissionManager {
 
     if (typeof ticketOrToken === 'string') {
       tokenStr = ticketOrToken;
+      // Enforce cryptographic token validation: A raw UUID or non-cryptographic identifier cannot authorize execution
+      if (!tokenStr.startsWith('gia_ticket_')) {
+        return {
+          allowed: false,
+          reason: 'PERMISSION_DENIED: Execution requires a valid cryptographic ticket token (gia_ticket_...). A raw UUID or identifier cannot authorize execution.',
+        };
+      }
       ticket = this.tickets.get(ticketOrToken);
       if (!ticket) {
-        // Query database for ticket
+        // Query database for ticket strictly by ticket_token (no UUID bypass)
         const res = await query<any>(
           `SELECT * FROM plan_approvals WHERE ticket_token = $1 AND status = 'approved' AND revoked_at IS NULL`,
           [ticketOrToken]
@@ -620,6 +1105,7 @@ export class PermissionManager {
           const expMs = new Date(row.expires_at).getTime();
           ticket = {
             ticketId: row.id,
+            ticketToken: row.ticket_token,
             planId: row.plan_id,
             planVersion: row.plan_version,
             userId: row.user_id,
@@ -633,6 +1119,9 @@ export class PermissionManager {
             usedSteps: [],
           };
           this.tickets.set(tokenStr, ticket);
+          if (row.ticket_token) {
+            this.tickets.set(row.ticket_token, ticket);
+          }
         }
       }
     } else {
@@ -641,6 +1130,25 @@ export class PermissionManager {
     }
 
     if (!ticket) {
+      // Check if ticket exists in database and if the associated plan was rejected
+      try {
+        const revokedRes = await query<any>(
+          `SELECT p.status as plan_status, pa.status as approval_status 
+           FROM plan_approvals pa 
+           LEFT JOIN task_plans p ON pa.plan_id = p.id 
+           WHERE pa.ticket_token = $1`,
+          [tokenStr]
+        );
+        if (revokedRes.rows.length > 0 && revokedRes.rows[0].plan_status === 'rejected') {
+          return {
+            allowed: false,
+            reason: 'PERMISSION_DENIED: Plan was rejected. Rejected plans must never execute.',
+          };
+        }
+      } catch (err: any) {
+        // Ignore check error and return generic denied
+      }
+
       return {
         allowed: false,
         reason: 'PERMISSION_DENIED: Invalid or revoked execution ticket.',
@@ -689,12 +1197,52 @@ export class PermissionManager {
         };
       }
 
+      // Rule 8: Plan version integrity check on execution ticket
+      if (plan.version !== ticket.planVersion) {
+        return {
+          allowed: false,
+          reason: `PERMISSION_DENIED: Plan version mismatch (ticket was issued for v${ticket.planVersion}, current plan is v${plan.version}). A modified plan requires fresh approval.`,
+        };
+      }
+
       const step = plan.steps.find((s) => s.step_id === stepId);
       if (!step) {
         return {
           allowed: false,
           reason: `PERMISSION_DENIED: Step ${stepId} not found in approved task plan.`,
         };
+      }
+
+      // Rule: Tool name integrity (supports launch_application / open_application alias)
+      const isAppLaunchAlias =
+        (step.tool_name === 'open_application' && toolName === 'launch_application') ||
+        (step.tool_name === 'launch_application' && toolName === 'open_application');
+
+      if (step.tool_name && toolName !== 'plan_engine' && !isAppLaunchAlias && step.tool_name !== toolName) {
+        return {
+          allowed: false,
+          reason: `PERMISSION_DENIED: Tool name mismatch. Expected "${step.tool_name}", but received "${toolName}".`,
+        };
+      }
+
+      // Rule: Argument integrity (prevents modified execution arguments)
+      if (step.tool_args && args && toolName !== 'plan_engine') {
+        const expectedKeys = Object.keys(step.tool_args);
+        let argsTampered = false;
+        for (const k of expectedKeys) {
+          if (args[k] !== undefined && step.tool_args[k] !== undefined) {
+            if (String(args[k]) !== String(step.tool_args[k])) {
+              argsTampered = true;
+              break;
+            }
+          }
+        }
+        if (argsTampered) {
+          return {
+            allowed: false,
+            reason: 'PERMISSION_DENIED: Execution argument tampering detected. Arguments do not match approved plan step.',
+          };
+        }
       }
 
       // Check sensitive operations confirmation for this step
@@ -752,6 +1300,9 @@ export class PermissionManager {
    * Revoke all tickets for a given plan.
    */
   private static async revokePlanTickets(planId: string, reason: string): Promise<void> {
+    // Invalidate associated challenges
+    await this.revokePlanChallenges(planId, reason);
+
     // Database update
     await query(
       `
@@ -775,5 +1326,9 @@ export class PermissionManager {
    */
   public static resetState(): void {
     this.tickets.clear();
+    this.consumedVoiceTranscripts.clear();
+    this.challenges.clear();
+    this.planActiveChallenges.clear();
+    this._challengeEnforced = false;
   }
 }

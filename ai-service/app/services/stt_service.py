@@ -2,9 +2,9 @@ import math
 import time
 import asyncio
 import logging
-import tempfile
-import os
 from typing import Tuple, Optional, List
+import numpy as np
+
 from app.core.config import settings
 from app.schemas.stt import (
     STTModelState,
@@ -13,7 +13,8 @@ from app.schemas.stt import (
     STTStatusResponse
 )
 from app.services.base_stt import SpeechToTextService
-from app.services.audio_processor import gia_audio_processor
+from app.services.whisper_ggml import WhisperGGMLEngine, WHISPER_SAMPLE_RATE
+from app.services.audio_processor import gia_audio_processor, NormalizedAudio
 from app.core.exceptions import (
     ModelNotReadyException,
     TranscriptionException,
@@ -25,24 +26,30 @@ logger = logging.getLogger("ai_service.stt_service")
 
 class WhisperSTTService(SpeechToTextService):
     """
-    Isolated Speech-to-Text (STT) Service wrapping ML inference engines (Faster-Whisper / PyTorch).
-    Maintains clean model lifecycle management (UNINITIALIZED -> LOADING -> READY / FAILED),
-    loads weights ONCE, supports CPU/GPU execution, handles concurrency safely, and exposes structured results.
+    Speech-to-Text (STT) Service wrapping local Whisper GGML models via whisper.cpp.
+    - Loads quantized GGML weights ONCE into memory with Apple Silicon Metal acceleration.
+    - Manages clean lifecycle transitions (UNINITIALIZED -> LOADING -> READY / FAILED).
+    - Supports English, Hindi, mixed speech, and automatic language detection.
+    - Integrates directly with Silero VAD by ingesting NormalizedAudio utterances without file I/O.
+    - Guards inference with timeout protection, concurrency locks, and structured error reporting.
     """
+
     def __init__(
         self,
         model_name: Optional[str] = None,
+        model_path: Optional[str] = None,
         device: Optional[str] = None,
         compute_type: Optional[str] = None,
         timeout_seconds: Optional[float] = None
     ):
-        self.model_name = model_name or settings.STT_MODEL_NAME
-        self.device = device or settings.STT_DEVICE
-        self.compute_type = compute_type or settings.STT_COMPUTE_TYPE
-        self.timeout_seconds = timeout_seconds or settings.STT_TIMEOUT_SECONDS
-        
+        self.model_name = model_name or getattr(settings, "STT_MODEL_NAME", "small")
+        self.model_path = model_path or getattr(settings, "STT_MODEL_PATH", "models/STT/ggml-small-q5_1.bin")
+        self.device = device or getattr(settings, "STT_DEVICE", "auto")
+        self.compute_type = compute_type or getattr(settings, "STT_COMPUTE_TYPE", "q5_1")
+        self.timeout_seconds = timeout_seconds or getattr(settings, "STT_TIMEOUT_SECONDS", 30.0)
+
         self._state: STTModelState = STTModelState.UNINITIALIZED
-        self._model = None
+        self._engine: WhisperGGMLEngine = WhisperGGMLEngine(model_path=self.model_path)
         self._init_error: Optional[str] = None
         self._lifecycle_lock = asyncio.Lock()
         self._inference_lock = asyncio.Lock()
@@ -52,7 +59,7 @@ class WhisperSTTService(SpeechToTextService):
         return self._state
 
     def is_ready(self) -> bool:
-        return self._state == STTModelState.READY
+        return self._state == STTModelState.READY and self._engine.is_ready()
 
     def get_status(self) -> STTStatusResponse:
         return STTStatusResponse(
@@ -64,63 +71,109 @@ class WhisperSTTService(SpeechToTextService):
             error=self._init_error
         )
 
-    def _resolve_model_path(self) -> str:
-        """Resolves local model directory path if available."""
-        from pathlib import Path
-        model_path_str = getattr(settings, "STT_MODEL_PATH", "ai-service/models/stt/whisper-tiny")
-        path = Path(model_path_str)
-        if path.is_absolute() and path.exists():
-            return str(path)
-        if path.exists():
-            return str(path.resolve())
-        base_dir = Path(__file__).resolve().parent.parent.parent
-        candidate = base_dir / model_path_str
-        if candidate.exists():
-            return str(candidate.resolve())
-        candidate_sub = base_dir / "models" / "stt" / "whisper-tiny"
-        if candidate_sub.exists():
-            return str(candidate_sub.resolve())
-        return self.model_name
-
     async def initialize(self) -> None:
-        """Initializes and loads the STT model weights ONCE into memory."""
+        """Initializes and loads the Whisper GGML model weights ONCE into memory."""
         async with self._lifecycle_lock:
-            if self._state == STTModelState.READY:
+            if self.is_ready():
                 return
 
             self._state = STTModelState.LOADING
             self._init_error = None
-            resolved_target = self._resolve_model_path()
-            logger.info(f"Loading STT model from '{resolved_target}' on device '{self.device}' ({self.compute_type})...")
+            logger.info(f"Initializing Whisper STT model '{self.model_name}' ({self.compute_type}) on device '{self.device}'...")
 
             try:
-                from faster_whisper import WhisperModel
-                
                 loop = asyncio.get_running_loop()
-                def _load_model():
-                    return WhisperModel(
-                        resolved_target,
-                        device=self.device,
-                        compute_type=self.compute_type,
-                        local_files_only=getattr(settings, "STT_LOCAL_FILES_ONLY", True),
-                        download_root=None
-                    )
-
-                self._model = await loop.run_in_executor(None, _load_model)
+                await loop.run_in_executor(None, self._engine.initialize)
                 self._state = STTModelState.READY
-                logger.info(f"STT model '{self.model_name}' successfully loaded and READY.")
+                logger.info(f"Whisper STT model '{self.model_name}' successfully loaded and READY.")
             except Exception as e:
-                logger.error(f"Failed to initialize STT model '{self.model_name}': {e}")
+                logger.error(f"Failed to initialize Whisper STT model '{self.model_name}': {e}")
                 self._init_error = str(e)
                 self._state = STTModelState.FAILED
+                raise
 
     async def shutdown(self) -> None:
-        """Tears down and releases STT model memory."""
+        """Tears down and releases Whisper model memory."""
         async with self._lifecycle_lock:
-            logger.info(f"Shutting down STT model '{self.model_name}'...")
-            self._model = None
+            logger.info(f"Shutting down Whisper STT model '{self.model_name}'...")
+            self._engine.shutdown()
             self._state = STTModelState.UNINITIALIZED
             self._init_error = None
+
+    async def transcribe_utterance(
+        self,
+        utterance: NormalizedAudio,
+        language: Optional[str] = None
+    ) -> StructuredTranscriptionResult:
+        """
+        Directly transcribes a completed NormalizedAudio utterance from Silero VAD.
+        Eliminates disk I/O and container re-encoding by passing float32 samples directly to Whisper.
+        """
+        if not self.is_ready():
+            raise ModelNotReadyException(
+                f"STT model is not ready to serve requests (State: {self._state.value}). Error: {self._init_error or 'None'}"
+            )
+
+        if utterance.sample_rate != WHISPER_SAMPLE_RATE:
+            raise AudioProcessingException(
+                f"Whisper STT requires sample rate {WHISPER_SAMPLE_RATE} Hz, received {utterance.sample_rate} Hz"
+            )
+
+        start_time = time.perf_counter()
+
+        # Handle silent utterance safely
+        if utterance.is_silent or len(utterance.samples_float32) == 0:
+            processing_time = round(time.perf_counter() - start_time, 4)
+            return StructuredTranscriptionResult(
+                text="",
+                language=language or "en",
+                confidence=0.0,
+                duration=utterance.duration_seconds,
+                segments=[],
+                processing_time=processing_time
+            )
+
+        loop = asyncio.get_running_loop()
+
+        def _run_inference():
+            return self._engine.transcribe_samples(
+                audio_samples_f32=utterance.samples_float32,
+                language=language
+            )
+
+        async def _execute_with_lock():
+            async with self._inference_lock:
+                return await loop.run_in_executor(None, _run_inference)
+
+        try:
+            full_text, detected_lang, confidence, segments = await asyncio.wait_for(
+                _execute_with_lock(),
+                timeout=self.timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"STT transcription timed out after {self.timeout_seconds} seconds")
+            raise TranscriptionTimeoutException(
+                f"Speech transcription timed out after {self.timeout_seconds} seconds"
+            )
+        except Exception as e:
+            if isinstance(e, (ModelNotReadyException, AudioProcessingException, TranscriptionTimeoutException)):
+                raise
+            logger.error(f"STT utterance transcription failure: {e}", exc_info=True)
+            raise TranscriptionException(f"Speech transcription failed: {str(e)}")
+
+        processing_time = round(time.perf_counter() - start_time, 4)
+        logger.info(
+            f"[AUDIO_PIPELINE] STT transcribed {utterance.duration_seconds}s audio in {processing_time}s "
+            f"(lang: {detected_lang}, confidence: {confidence:.2f}, text_chars: {len(full_text)})"
+        )
+        return StructuredTranscriptionResult(
+            text=full_text,
+            language=detected_lang,
+            confidence=confidence,
+            duration=utterance.duration_seconds,
+            segments=segments,
+            processing_time=processing_time
+        )
 
     async def transcribe_structured(
         self,
@@ -129,120 +182,24 @@ class WhisperSTTService(SpeechToTextService):
         language: Optional[str] = None
     ) -> StructuredTranscriptionResult:
         """
-        Main structured transcription entrypoint.
-        Validates readiness, normalizes audio, and executes inference safely.
+        Transcribes raw audio bytes (WAV, MP3, WebM, OGG, FLAC, PCM).
+        Validates payload, normalizes audio to 16 kHz Mono float32, and runs inference.
         """
         if not self.is_ready():
             raise ModelNotReadyException(
                 f"STT model is not ready to serve requests (State: {self._state.value}). Error: {self._init_error or 'None'}"
             )
 
-        start_time = time.perf_counter()
-
-        # Phase 3 Audio Normalization Pipeline
+        # Normalize audio input via canonical audio processor
+        logger.info(
+            f"[AUDIO_PIPELINE] Decoding {len(audio_bytes)} bytes ('{filename}'), language={language or 'auto'}..."
+        )
         normalized = gia_audio_processor.decode_and_normalize(raw_bytes=audio_bytes, filename=filename)
-
-        # Handle silent audio safely
-        if normalized.is_silent:
-            processing_time = round(time.perf_counter() - start_time, 4)
-            return StructuredTranscriptionResult(
-                text="",
-                language=language or "en",
-                confidence=0.0,
-                duration=normalized.duration_seconds,
-                segments=[],
-                processing_time=processing_time
-            )
-
-        # Write normalized PCM bytes to temporary file for Whisper decoding
-        temp_wav_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
-                temp_wav_path = temp_wav.name
-                
-                import wave
-                with wave.open(temp_wav_path, 'wb') as wav_file:
-                    wav_file.setnchannels(normalized.channels)
-                    wav_file.setsampwidth(2)
-                    wav_file.setframerate(normalized.sample_rate)
-                    wav_file.writeframes(normalized.pcm_bytes)
-
-            loop = asyncio.get_running_loop()
-
-            def _run_inference():
-                segments_raw, info = self._model.transcribe(
-                    temp_wav_path,
-                    language=language,
-                    beam_size=5,
-                    word_timestamps=False
-                )
-                segments_list = list(segments_raw)
-                return segments_list, info
-
-            async def _execute_with_lock():
-                async with self._inference_lock:
-                    return await loop.run_in_executor(None, _run_inference)
-
-            # Apply timeout protection around model inference execution
-            try:
-                segments_raw, info = await asyncio.wait_for(
-                    _execute_with_lock(),
-                    timeout=self.timeout_seconds
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"STT transcription timed out after {self.timeout_seconds} seconds")
-                raise TranscriptionTimeoutException(
-                    f"Speech transcription timed out after {self.timeout_seconds} seconds"
-                )
-
-            parsed_segments: List[TranscriptionSegment] = []
-            full_text_parts: List[str] = []
-
-            for seg in segments_raw:
-                avg_logprob = getattr(seg, 'avg_logprob', 0.0)
-                # Map log probability to 0.0 - 1.0 confidence score
-                try:
-                    conf = round(min(1.0, max(0.0, math.exp(avg_logprob))), 2)
-                except Exception:
-                    conf = 1.0
-
-                parsed_segments.append(
-                    TranscriptionSegment(
-                        start=round(seg.start, 2),
-                        end=round(seg.end, 2),
-                        text=seg.text.strip(),
-                        confidence=conf
-                    )
-                )
-                if seg.text.strip():
-                    full_text_parts.append(seg.text.strip())
-
-            full_text = " ".join(full_text_parts)
-            detected_language = getattr(info, 'language', language or 'en')
-            lang_prob = getattr(info, 'language_probability', 1.0)
-            overall_confidence = round(min(1.0, max(0.0, float(lang_prob))), 2)
-            processing_time = round(time.perf_counter() - start_time, 4)
-
-            return StructuredTranscriptionResult(
-                text=full_text,
-                language=detected_language,
-                confidence=overall_confidence,
-                duration=normalized.duration_seconds,
-                segments=parsed_segments,
-                processing_time=processing_time
-            )
-
-        except Exception as e:
-            if isinstance(e, (ModelNotReadyException, AudioProcessingException, TranscriptionTimeoutException)):
-                raise
-            logger.error(f"STT transcription failure: {e}", exc_info=True)
-            raise TranscriptionException(f"Speech transcription failed: {str(e)}")
-        finally:
-            if temp_wav_path and os.path.exists(temp_wav_path):
-                try:
-                    os.remove(temp_wav_path)
-                except Exception:
-                    pass
+        logger.info(
+            f"[AUDIO_PIPELINE] Normalized: {normalized.duration_seconds}s @ {normalized.sample_rate}Hz mono, "
+            f"rms={normalized.rms_db}dB, silent={normalized.is_silent}"
+        )
+        return await self.transcribe_utterance(utterance=normalized, language=language)
 
     async def transcribe(
         self,
@@ -250,9 +207,8 @@ class WhisperSTTService(SpeechToTextService):
         filename: str = "audio.wav",
         language: Optional[str] = None
     ) -> Tuple[str, float, str, float]:
-        """Adapter method fulfilling the Phase 2 SpeechToTextService interface contract."""
+        """Adapter method fulfilling the SpeechToTextService interface contract."""
         res = await self.transcribe_structured(audio_bytes, filename=filename, language=language)
         return (res.text, res.confidence, res.language, res.duration)
 
 gia_stt_service = WhisperSTTService()
-

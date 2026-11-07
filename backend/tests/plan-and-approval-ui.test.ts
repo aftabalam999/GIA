@@ -310,7 +310,7 @@ describe('PHASE 4: GIA Plan and Approval User Interface & Unified Multi-Modal Ga
         url: `/api/v1/conversations/${testConvoId}/plans/${plan.id}/execute`,
         headers: { authorization: `Bearer ${testUser.token}` },
         payload: {
-          ticketToken: ticket.ticketId,
+          ticketToken: ticket.ticketToken || ticket.ticketId,
           planVersion: plan.version,
         },
       });

@@ -52,10 +52,27 @@ export async function voiceRoutes(fastify: FastifyInstance) {
         const requestId = request.id;
         const correlationId = (request.headers['x-correlation-id'] as string) || requestId;
 
+        fastify.log.info({
+          event: 'AUDIO_PIPELINE_TRANSCRIPTION_REQUEST',
+          filename: filePart.filename || 'audio.wav',
+          bytes: buffer.length,
+          mimetype: filePart.mimetype,
+          language,
+          requestId,
+        }, '[AUDIO_PIPELINE] Forwarding audio payload to Python AI Service');
+
         const result = await aiServiceClient.transcribe(buffer, filePart.filename || 'audio.wav', language, {
           requestId,
           correlationId,
         });
+
+        fastify.log.info({
+          event: 'AUDIO_PIPELINE_TRANSCRIPTION_RESPONSE',
+          duration: (result as any)?.duration,
+          confidence: (result as any)?.confidence,
+          language: (result as any)?.language,
+          requestId,
+        }, '[AUDIO_PIPELINE] Transcription completed successfully');
 
         return reply.status(200).send({
           success: true,

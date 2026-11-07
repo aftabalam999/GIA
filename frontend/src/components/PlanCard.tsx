@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import * as api from '../services/api.js';
 
-interface PlanCardProps {
+export interface PlanCardProps {
   plan: api.ExecutionPlan;
   execution?: api.PlanExecutionResult | null;
   isLoading?: boolean;
@@ -10,6 +10,7 @@ interface PlanCardProps {
   onModify: (planId: string, feedback: string) => Promise<void>;
   onCancel: (planId: string) => Promise<void>;
   onExecute: (planId: string, version: number) => Promise<void>;
+  onDismiss?: () => void;
 }
 
 export const PlanCard: React.FC<PlanCardProps> = ({
@@ -21,6 +22,7 @@ export const PlanCard: React.FC<PlanCardProps> = ({
   onModify,
   onCancel,
   onExecute,
+  onDismiss,
 }) => {
   const [showModifyInput, setShowModifyInput] = useState(false);
   const [modifyFeedback, setModifyFeedback] = useState('');
@@ -143,7 +145,29 @@ export const PlanCard: React.FC<PlanCardProps> = ({
             </span>
             <span className="steps-count-tag">{plan.steps.length} atomic steps</span>
           </div>
-          {getStatusBadge()}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {getStatusBadge()}
+            {onDismiss && (
+              <button
+                type="button"
+                className="plan-close-btn"
+                onClick={onDismiss}
+                title="Dismiss Plan"
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: 'var(--text-secondary, #94a3b8)',
+                  cursor: 'pointer',
+                  fontSize: '16px',
+                  padding: '2px 6px',
+                  borderRadius: '4px',
+                  lineHeight: 1,
+                }}
+              >
+                ✕
+              </button>
+            )}
+          </div>
         </div>
 
         <h3 className="plan-objective">
@@ -366,12 +390,33 @@ export const PlanCard: React.FC<PlanCardProps> = ({
         )}
 
         {(isCompleted || isFailed || isCancelled || isRejected || isExpired) && (
-          <div className="plan-finished-status-label">
-            {isCompleted && '✨ Plan execution completed and verified.'}
-            {isFailed && '⚠️ Plan execution failed. Re-planning required.'}
-            {isCancelled && 'Plan was cancelled by user.'}
-            {isRejected && 'Plan was rejected and cannot be executed.'}
-            {isExpired && 'Plan approval expired. Fresh plan required.'}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', gap: '12px', flexWrap: 'wrap' }}>
+            <div className="plan-finished-status-label">
+              {isCompleted && '✨ Plan execution completed and verified.'}
+              {isFailed && '⚠️ Plan execution failed. Re-planning required.'}
+              {isCancelled && 'Plan was cancelled by user.'}
+              {isRejected && 'Plan was rejected and cannot be executed.'}
+              {isExpired && 'Plan approval expired. Fresh plan required.'}
+            </div>
+            {onDismiss && (
+              <button
+                type="button"
+                className="btn-dismiss-plan"
+                onClick={onDismiss}
+                style={{
+                  background: 'rgba(255, 255, 255, 0.08)',
+                  border: '1px solid var(--glass-border, rgba(255, 255, 255, 0.15))',
+                  color: '#fff',
+                  borderRadius: '6px',
+                  padding: '6px 14px',
+                  cursor: 'pointer',
+                  fontSize: '0.8rem',
+                  fontWeight: 500,
+                }}
+              >
+                ✕ Dismiss
+              </button>
+            )}
           </div>
         )}
       </div>
