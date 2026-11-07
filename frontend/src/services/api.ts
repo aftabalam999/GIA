@@ -62,7 +62,8 @@ async function apiRequest(path: string, method: string, token?: string, body?: a
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.error?.message || data?.message || `Request failed with status ${response.status}`);
+    const errorMsg = data?.error?.message || data?.message || (typeof data?.error === 'string' ? data.error : null) || `Request failed with status ${response.status}`;
+    throw new Error(errorMsg);
   }
   return data;
 }
@@ -374,6 +375,7 @@ export interface ExecutionPlan {
 
 export interface ExecutionTicket {
   ticketId: string;
+  ticketToken?: string;
   ticket_token?: string;
   planId: string;
   planVersion: number;
@@ -486,6 +488,3 @@ export async function sendVoicePlanCommand(token: string, conversationId: string
     isAssistantVoice,
   });
 }
-
-
-

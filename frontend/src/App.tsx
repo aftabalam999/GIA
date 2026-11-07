@@ -103,20 +103,20 @@ export default function App() {
         // Voice Approval Gate for Active Pending Plans
         const currentPlan = activePlanRef.current;
         if (currentPlan && (currentPlan.status === 'awaiting_approval' || currentPlan.status === 'pending')) {
-          if (/^(?:yes|y|proceed|approve|approved|go ahead|looks good|execute|run plan|confirm|do it|gia,?\s*(?:approve|proceed|execute))\b/i.test(lower)) {
+          if (/^(?:yes|y|proceed|approve|approved|go ahead|looks good|execute|run plan|confirm|do it|haan|karo|theek hai|sahi hai|gia,?\s*(?:approve|proceed|execute|karo))\b/i.test(lower)) {
             const vRes = await api.sendVoicePlanCommand(token, convoId, trimmed, false);
             if (vRes.success) {
               setActivePlan(vRes.plan);
               setActiveTicket(vRes.ticket);
-              const tTok = vRes.ticket?.ticketId || vRes.ticket?.ticket_token;
+              const tTok = vRes.ticket?.ticketToken || vRes.ticket?.ticketId || vRes.ticket?.ticket_token;
               if (tTok) {
-                handleExecutePlan(vRes.plan.id, vRes.plan.version, tTok);
+                await handleExecutePlan(vRes.plan.id, vRes.plan.version, tTok);
               }
-              return { role: 'assistant', content: 'Plan approved. Executing steps now.' };
+              return { role: 'assistant', content: 'Plan approved and executed successfully.' };
             }
           }
 
-          if (/^(?:no|n|cancel|reject|rejected|abort|stop|discard plan|forget it|gia,?\s*(?:reject|cancel))\b/i.test(lower)) {
+          if (/^(?:no|n|cancel|reject|rejected|abort|stop|discard plan|forget it|nahi|mat karo|cancel karo|gia,?\s*(?:reject|cancel|mat karo))\b/i.test(lower)) {
             const vRes = await api.sendVoicePlanCommand(token, convoId, trimmed, false);
             setActivePlan(vRes.plan);
             return { role: 'assistant', content: 'Plan cancelled. No actions were performed.' };
@@ -125,15 +125,26 @@ export default function App() {
 
         // Actionable instruction -> Create Plan First
         if (isActionableInstruction(trimmed)) {
-          const pRes = await api.createPlan(token, convoId, trimmed);
-          setActivePlan(pRes.plan);
-          return {
-            role: 'assistant',
-            content: `I have formulated an execution plan for: ${pRes.plan.objective}. Please review and say "Approve" before I execute.`,
-          };
+          setUiState('thinking');
+          try {
+            const pRes = await api.createPlan(token, convoId, trimmed);
+            setActivePlan(pRes.plan);
+            return {
+              role: 'assistant',
+              content: `I understood: ${pRes.plan.objective}. I have formulated an execution plan. May I execute this plan? Please say "Approve" or "Reject".`,
+            };
+          } finally {
+            setUiState('idle');
+          }
         }
 
-        return api.sendMessageAgent(token, convoId, trimmed);
+        setUiState('thinking');
+        try {
+          const res = await api.sendMessageAgent(token, convoId, trimmed);
+          return res;
+        } finally {
+          setUiState('idle');
+        }
       },
       fetchTtsApi: (txt) => (token ? api.synthesizeSpeech(token, txt) : Promise.reject('No token')),
       playAudioApi: (buf) => player.play(buf),
@@ -418,7 +429,15 @@ export default function App() {
       lower.includes('chrome') ||
       lower.includes('youtube') ||
       lower.includes('terminal') ||
-      lower.includes('calculator')
+      lower.includes('calculator') ||
+      lower.includes('खोलो') ||
+      lower.includes('kholo') ||
+      lower.includes('चलाओ') ||
+      lower.includes('chalao') ||
+      lower.includes('ओपन') ||
+      lower.includes('open karo') ||
+      lower.includes('बनाओ') ||
+      lower.includes('banao')
     );
   }
 
@@ -497,7 +516,7 @@ export default function App() {
       setActiveTicket(res.ticket);
 
       // Automatically execute approved plan once ticket is issued
-      const ticketTok = res.ticket?.ticketId || res.ticket?.ticket_token;
+      const ticketTok = res.ticket?.ticketToken || res.ticket?.ticketId || res.ticket?.ticket_token;
       if (ticketTok) {
         await handleExecutePlan(res.plan.id, res.plan.version, ticketTok);
       }
@@ -510,7 +529,7 @@ export default function App() {
 
   async function handleExecutePlan(planId: string, version: number, ticketToken?: string) {
     if (!token || !activeConvoId) return;
-    const tokenToUse = ticketToken || activeTicket?.ticketId || activeTicket?.ticket_token;
+    const tokenToUse = ticketToken || activeTicket?.ticketToken || activeTicket?.ticketId || activeTicket?.ticket_token;
     if (!tokenToUse) {
       setChatError('No valid approval ticket found. Plan must be approved first.');
       return;
@@ -522,7 +541,11 @@ export default function App() {
       const res = await api.executePlan(token, activeConvoId, planId, tokenToUse, version);
       setPlanExecution(res.execution);
       const updatedPlan = await api.getActivePlan(token, activeConvoId);
-      setActivePlan(updatedPlan);
+      if (updatedPlan) {
+        setActivePlan(updatedPlan);
+      } else if (res.execution) {
+        setActivePlan((prev) => prev ? { ...prev, status: res.execution.status as any } : null);
+      }
 
       // Refresh messages
       const refreshed = await api.getMessages(token, activeConvoId);
@@ -706,13 +729,13 @@ export default function App() {
     // 1. Plan Approval / Rejection / Modification Gate for Active Pending Plans
     if (activePlan && (activePlan.status === 'awaiting_approval' || activePlan.status === 'pending')) {
       // 1a. Explicit Plan Approval Command
-      if (/^(?:yes|y|proceed|approve|approved|go ahead|looks good|execute|run plan|confirm|do it|gia,?\s*(?:approve|proceed|execute))\b/i.test(lower)) {
+      if (/^(?:yes|y|proceed|approve|approved|go ahead|looks good|execute|run plan|confirm|do it|haan|karo|theek hai|sahi hai|gia,?\s*(?:approve|proceed|execute|karo))\b/i.test(lower)) {
         await handleApprovePlan(activePlan.id, activePlan.version);
         return;
       }
 
       // 1b. Explicit Plan Rejection / Cancellation Command
-      if (/^(?:no|n|cancel|reject|rejected|abort|stop|discard plan|forget it|gia,?\s*(?:reject|cancel))\b/i.test(lower)) {
+      if (/^(?:no|n|cancel|reject|rejected|abort|stop|discard plan|forget it|nahi|mat karo|cancel karo|gia,?\s*(?:reject|cancel|mat karo))\b/i.test(lower)) {
         await handleRejectPlan(activePlan.id, trimmed);
         return;
       }
@@ -1113,43 +1136,58 @@ export default function App() {
       {/* DETECTED DYNAMIC STATE INTERFACE OVERLAYS */}
       
       {/* COMPOSER FOOTER BAR */}
-      {activeConvoId && (
-        <footer className="composer-bar backdrop-blur">
-          {/* Continuous Voice Mode Active State Banner */}
-          {isVoiceModeActive && (
-            <div className={`state-banner voice-banner voice-${voiceState.toLowerCase()}`}>
-              <div className="spinner" />
-              <span>
-                {voiceState === 'STARTING' && '⚙️ Starting voice mode...'}
-                {voiceState === 'LISTENING' && '🎙️ Listening... (Speak now)'}
-                {voiceState === 'SPEECH_DETECTED' && '🗣️ Speech detected'}
-                {voiceState === 'TRANSCRIBING' && '⚡ Transcribing Python STT...'}
-                {voiceState === 'PROCESSING' && '🤖 Orchestrating response...'}
-                {voiceState === 'SYNTHESIZING' && '🔊 Synthesizing Python TTS...'}
-                {voiceState === 'PLAYING' && '🔊 GIA speaking... 🔇 (Mic muted - Feedback blocked)'}
-                {voiceState === 'STOPPING' && '⏹️ Stopping voice mode...'}
-              </span>
+      {activeConvoId && (() => {
+        const currentVoiceInteractionState: 'IDLE' | 'LISTENING' | 'PROCESSING' | 'THINKING' | 'AWAITING_APPROVAL' | 'EXECUTING' | 'SPEAKING' | 'ERROR' = (() => {
+          if (chatError) return 'ERROR';
+          if (!isVoiceModeActive) return 'IDLE';
+          if (voiceState === 'PLAYING' || voiceState === 'SYNTHESIZING') return 'SPEAKING';
+          if (uiState === 'executing' || (activePlan && activePlan.status === 'executing')) return 'EXECUTING';
+          if (activePlan && (activePlan.status === 'awaiting_approval' || activePlan.status === 'pending')) return 'AWAITING_APPROVAL';
+          if (uiState === 'thinking') return 'THINKING';
+          if (voiceState === 'TRANSCRIBING' || voiceState === 'SPEECH_DETECTED') return 'PROCESSING';
+          if (voiceState === 'PROCESSING') return 'THINKING';
+          if (voiceState === 'LISTENING') return 'LISTENING';
+          return 'IDLE';
+        })();
 
-              <div className="voice-controls-group">
-                {voiceState === 'PLAYING' && (
-                  <button
-                    type="button"
-                    className="pause-voice-btn"
-                    onClick={() => {
-                      if (playbackState === 'PLAYING') audioPlayerRef.current?.pause();
-                      else if (playbackState === 'PAUSED') audioPlayerRef.current?.resume();
-                    }}
-                  >
-                    {playbackState === 'PAUSED' ? '▶️ Resume' : '⏸️ Pause'}
+        return (
+          <footer className="composer-bar backdrop-blur">
+            {/* Continuous Voice Mode Active State Banner */}
+            {isVoiceModeActive && (
+              <div className={`state-banner voice-banner voice-${currentVoiceInteractionState.toLowerCase()}`}>
+                <div className="spinner" />
+                <span>
+                  <strong style={{ marginRight: '6px' }}>[{currentVoiceInteractionState}]</strong>
+                  {currentVoiceInteractionState === 'IDLE' && 'Voice mode idle.'}
+                  {currentVoiceInteractionState === 'LISTENING' && '🎙️ Listening... (Speak now in English, Hindi, or Hinglish)'}
+                  {currentVoiceInteractionState === 'PROCESSING' && '⚡ Processing speech (Silero VAD & Whisper STT)...'}
+                  {currentVoiceInteractionState === 'THINKING' && '🧠 Thinking & Orchestrating with Local Qwen LLM...'}
+                  {currentVoiceInteractionState === 'AWAITING_APPROVAL' && '⏳ Execution Plan Formulated — Awaiting Approval (Say "Approve" or "Reject")'}
+                  {currentVoiceInteractionState === 'EXECUTING' && '⚙️ Executing approved plan with PlanExecutionEngine...'}
+                  {currentVoiceInteractionState === 'SPEAKING' && '🔊 GIA speaking via Kokoro TTS... 🔇 (Microphone muted)'}
+                  {currentVoiceInteractionState === 'ERROR' && `⚠️ Error: ${chatError}`}
+                </span>
+
+                <div className="voice-controls-group">
+                  {currentVoiceInteractionState === 'SPEAKING' && (
+                    <button
+                      type="button"
+                      className="pause-voice-btn"
+                      onClick={() => {
+                        if (playbackState === 'PLAYING') audioPlayerRef.current?.pause();
+                        else if (playbackState === 'PAUSED') audioPlayerRef.current?.resume();
+                      }}
+                    >
+                      {playbackState === 'PAUSED' ? '▶️ Resume' : '⏸️ Pause'}
+                    </button>
+                  )}
+
+                  <button type="button" className="stop-voice-btn" onClick={toggleVoiceMode}>
+                    ⏹️ Stop Voice Mode
                   </button>
-                )}
-
-                <button type="button" className="stop-voice-btn" onClick={toggleVoiceMode}>
-                  ⏹️ Stop Voice Mode
-                </button>
+                </div>
               </div>
-            </div>
-          )}
+            )}
 
           {/* Inline Active State Banners */}
           {uiState === 'executing' && (
@@ -1203,7 +1241,8 @@ export default function App() {
 
           </form>
         </footer>
-      )}
+        );
+      })()}
 
       {/* UNIFIED MENU & SETTINGS DRAWER (One Modal for Chats, Documents, Memories, and System) */}
       {showMenuModal && (

@@ -43,6 +43,7 @@ export async function agentRoutes(fastify: FastifyInstance, options: FastifyPlug
         planId: activePlan.id,
         planVersion: activePlan.version,
         userId,
+        conversationId,
         channel: 'web_ui',
         explicitConfirmation: true,
       });
@@ -55,6 +56,8 @@ export async function agentRoutes(fastify: FastifyInstance, options: FastifyPlug
         );
         return reply.status(400).send({
           success: false,
+          error: { message: approvalResult.message, statusCode: 400 },
+          message: approvalResult.message,
           userMessage,
           assistantMessage,
           plan: await PlanRepository.findById(activePlan.id),
@@ -65,7 +68,7 @@ export async function agentRoutes(fastify: FastifyInstance, options: FastifyPlug
         planId: activePlan.id,
         planVersion: activePlan.version,
         userId,
-        ticketToken: approvalResult.ticket.ticketId,
+        ticketToken: (approvalResult.ticket.ticketToken || approvalResult.ticket.ticketId)!,
       });
 
       const assistantMessage = await MessageRepository.create(

@@ -312,7 +312,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
           planId: plan.id,
           planVersion: 1, // out of date!
           userId,
-          ticketToken: approved.ticket!.ticketId,
+          ticketToken: (approved.ticket!.ticketToken || approved.ticket!.ticketId)!,
         })
       ).rejects.toThrow(/Version mismatch/);
     });
@@ -332,7 +332,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
           planId: plan.id,
           planVersion: plan.version,
           userId: user2Id, // Intruder user ID
-          ticketToken: approved.ticket!.ticketId,
+          ticketToken: (approved.ticket!.ticketToken || approved.ticket!.ticketId)!,
         })
       ).rejects.toThrow(/Access denied/);
     });
@@ -352,7 +352,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
         planId: plan.id,
         planVersion: plan.version,
         userId,
-        ticketToken: approved.ticket!.ticketId,
+        ticketToken: (approved.ticket!.ticketToken || approved.ticket!.ticketId)!,
       });
 
       // Immediate second parallel attempt on same planId must be rejected
@@ -365,7 +365,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
           planId: plan.id,
           planVersion: plan.version,
           userId,
-          ticketToken: approved.ticket!.ticketId,
+          ticketToken: (approved.ticket!.ticketToken || approved.ticket!.ticketId)!,
         })
       ).rejects.toThrow(/Only approved plans can be executed/);
     });
@@ -387,7 +387,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
         planId: plan.id,
         planVersion: plan.version,
         userId,
-        ticketToken: approved.ticket!.ticketId,
+        ticketToken: (approved.ticket!.ticketToken || approved.ticket!.ticketId)!,
       });
 
       expect(result.status).toBe('completed');
@@ -451,7 +451,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
         planId: planWithFailure.id,
         planVersion: planWithFailure.version,
         userId,
-        ticketToken: approved.ticket!.ticketId,
+        ticketToken: (approved.ticket!.ticketToken || approved.ticket!.ticketId)!,
       });
 
       // Honest failure status
@@ -531,7 +531,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
         planId: plan.id,
         planVersion: plan.version,
         userId,
-        ticketToken: approval.ticket!.ticketId,
+        ticketToken: (approval.ticket!.ticketToken || approval.ticket!.ticketId)!,
       });
 
       expect(executionResult.status).toBe('completed');
@@ -567,7 +567,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
         url: `/api/v1/conversations/${conversationId}/plans/${plan.id}/execute`,
         headers: { authorization: `Bearer ${userToken}` },
         payload: {
-          ticketToken: approval.ticket!.ticketId,
+          ticketToken: (approval.ticket!.ticketToken || approval.ticket!.ticketId)!,
           planVersion: plan.version,
         },
       });
@@ -593,7 +593,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
         planId: plan.id,
         planVersion: plan.version,
         userId,
-        ticketToken: approval.ticket!.ticketId,
+        ticketToken: (approval.ticket!.ticketToken || approval.ticket!.ticketId)!,
       });
 
       const res = await app.inject({
@@ -623,7 +623,7 @@ describe('PHASE 3: Approved Plan Execution Engine & Centralized Tool Registry Su
         planId: plan.id,
         planVersion: plan.version,
         userId,
-        ticketToken: approval.ticket!.ticketId,
+        ticketToken: (approval.ticket!.ticketToken || approval.ticket!.ticketId)!,
       });
 
       const res = await app.inject({

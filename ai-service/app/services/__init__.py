@@ -6,6 +6,7 @@ from app.services.audio_processor import GIAAudioProcessor, NormalizedAudio, gia
 from app.services.audio_buffer import AudioChunkBuffer
 from app.services.vad_service import GIAVoiceActivityDetector, gia_vad_service
 from app.services.stt_service import WhisperSTTService, gia_stt_service
+from app.services.kokoro_tts import KokoroTTSEngine, KokoroTTSService, gia_kokoro_service
 
 __all__ = [
     "SpeechToTextService",
@@ -20,4 +21,7 @@ __all__ = [
     "gia_vad_service",
     "WhisperSTTService",
     "gia_stt_service",
+    "KokoroTTSEngine",
+    "KokoroTTSService",
+    "gia_kokoro_service",
 ]

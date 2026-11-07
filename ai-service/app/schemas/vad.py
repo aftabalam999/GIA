@@ -16,6 +16,9 @@ class VADConfig(BaseModel):
     min_audio_duration_ms: float = Field(100.0, description="Minimum frame chunk duration in ms")
     max_utterance_duration_ms: float = Field(30000.0, description="Maximum duration in ms of a single utterance segment")
     max_silence_timeout_ms: float = Field(10000.0, description="Duration of continuous silence in ms to trigger EXCESSIVE_SILENCE")
+    speech_threshold: float = Field(0.5, description="Silero speech probability threshold (0.0 to 1.0) above which a frame is classified as speech")
+    use_silero: bool = Field(True, description="Whether to use Silero ONNX deep learning VAD or fallback to energy VAD")
+    sample_rate: int = Field(16000, description="Audio sample rate in Hz (Silero VAD standard is 16000)")
 
 class VADResult(BaseModel):
     event: VADEventType = Field(..., description="VAD state machine event")
@@ -24,3 +27,4 @@ class VADResult(BaseModel):
     duration_ms: float = Field(..., description="Processed frame duration in milliseconds")
     utterance_completed: bool = Field(False, description="True if a full speech segment was completed")
     speech_duration_ms: float = Field(0.0, description="Total speech duration of the current utterance in ms")
+    speech_probability: float = Field(0.0, description="Speech probability calculated by Silero VAD (0.0 to 1.0)")

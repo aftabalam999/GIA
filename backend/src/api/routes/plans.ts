@@ -83,6 +83,42 @@ export async function planRoutes(fastify: FastifyInstance) {
     });
   });
 
+  // 3b. Issue server-side voice approval challenge
+  fastify.post('/conversations/:id/plans/:planId/challenge', async (request: FastifyRequest<{
+    Params: { id: string; planId: string };
+  }>, reply: FastifyReply) => {
+    const userId = request.user.id;
+    const conversationId = request.params.id;
+    const { planId } = request.params;
+
+    const convo = await ConversationRepository.findById(conversationId);
+    if (!convo) throw new NotFoundError('Conversation not found');
+    if (convo.user_id !== userId) throw new AuthorizationError('Access denied');
+
+    const plan = await PlanRepository.findById(planId);
+    if (!plan) throw new NotFoundError('Task plan not found');
+    if (plan.conversation_id !== conversationId) throw new AuthorizationError('Plan mismatch');
+
+    if (!['pending', 'awaiting_approval', 'modified'].includes(plan.status)) {
+      return reply.status(400).send({
+        success: false,
+        message: `Cannot issue challenge for plan in '${plan.status}' state.`,
+      });
+    }
+
+    const challenge = await PermissionManager.createApprovalChallenge(
+      planId,
+      userId,
+      conversationId,
+      plan.version
+    );
+
+    return reply.status(200).send({
+      success: true,
+      challenge,
+    });
+  });
+
   // 4. Approve plan via Centralized Permission Manager
   fastify.post('/conversations/:id/plans/:planId/approve', async (request: FastifyRequest<{
     Params: { id: string; planId: string };
@@ -93,6 +129,10 @@ export async function planRoutes(fastify: FastifyInstance) {
       voiceTranscript?: string;
       sensitiveConfirmations?: Record<string, boolean>;
       isAssistantVoice?: boolean;
+      voiceSessionId?: string;
+      transcriptTimestamp?: number;
+      approvalNonce?: string;
+      challengeToken?: string;
     };
   }>, reply: FastifyReply) => {
     const userId = request.user.id;
@@ -112,11 +152,16 @@ export async function planRoutes(fastify: FastifyInstance) {
       planId,
       planVersion: body.planVersion ?? plan.version,
       userId,
+      conversationId,
       channel: body.channel || 'web_ui',
       explicitConfirmation: body.explicitConfirmation ?? true,
       voiceTranscript: body.voiceTranscript,
       sensitiveConfirmations: body.sensitiveConfirmations,
       isAssistantVoice: body.isAssistantVoice,
+      voiceSessionId: body.voiceSessionId,
+      transcriptTimestamp: body.transcriptTimestamp,
+      approvalNonce: body.approvalNonce,
+      challengeToken: body.challengeToken || body.approvalNonce,
     });
 
     if (!approvalResult.success) {
@@ -170,7 +215,7 @@ export async function planRoutes(fastify: FastifyInstance) {
   // 6. Voice command approval processing endpoint
   fastify.post('/conversations/:id/plans/voice-command', async (request: FastifyRequest<{
     Params: { id: string };
-    Body: { transcript: string; isAssistantVoice?: boolean };
+    Body: { transcript: string; isAssistantVoice?: boolean; challengeToken?: string; approvalNonce?: string };
   }>, reply: FastifyReply) => {
     const userId = request.user.id;
     const conversationId = request.params.id;
@@ -178,6 +223,8 @@ export async function planRoutes(fastify: FastifyInstance) {
     const schema = z.object({
       transcript: z.string().min(1),
       isAssistantVoice: z.boolean().optional(),
+      challengeToken: z.string().optional(),
+      approvalNonce: z.string().optional(),
     });
     const parsed = schema.safeParse(request.body);
     if (!parsed.success) {
@@ -200,9 +247,11 @@ export async function planRoutes(fastify: FastifyInstance) {
       planId: activePlan.id,
       planVersion: activePlan.version,
       userId,
+      conversationId,
       channel: 'voice_command',
       voiceTranscript: parsed.data.transcript,
       isAssistantVoice: parsed.data.isAssistantVoice,
+      challengeToken: parsed.data.challengeToken || parsed.data.approvalNonce,
     });
 
     const updatedPlan = await PlanRepository.findById(activePlan.id);
@@ -227,7 +276,7 @@ export async function planRoutes(fastify: FastifyInstance) {
 
     const schema = z.object({
       ticketToken: z.string().min(1, 'Approval ticket token is required'),
-      planVersion: z.number().int().optional(),
+      planVersion: z.number().int().optional().nullable(),
     });
     const parsed = schema.safeParse(request.body);
     if (!parsed.success) {
