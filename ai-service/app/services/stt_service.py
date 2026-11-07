@@ -162,6 +162,10 @@ class WhisperSTTService(SpeechToTextService):
             raise TranscriptionException(f"Speech transcription failed: {str(e)}")
 
         processing_time = round(time.perf_counter() - start_time, 4)
+        logger.info(
+            f"[AUDIO_PIPELINE] STT transcribed {utterance.duration_seconds}s audio in {processing_time}s "
+            f"(lang: {detected_lang}, confidence: {confidence:.2f}, text_chars: {len(full_text)})"
+        )
         return StructuredTranscriptionResult(
             text=full_text,
             language=detected_lang,
@@ -187,7 +191,14 @@ class WhisperSTTService(SpeechToTextService):
             )
 
         # Normalize audio input via canonical audio processor
+        logger.info(
+            f"[AUDIO_PIPELINE] Decoding {len(audio_bytes)} bytes ('{filename}'), language={language or 'auto'}..."
+        )
         normalized = gia_audio_processor.decode_and_normalize(raw_bytes=audio_bytes, filename=filename)
+        logger.info(
+            f"[AUDIO_PIPELINE] Normalized: {normalized.duration_seconds}s @ {normalized.sample_rate}Hz mono, "
+            f"rms={normalized.rms_db}dB, silent={normalized.is_silent}"
+        )
         return await self.transcribe_utterance(utterance=normalized, language=language)
 
     async def transcribe(

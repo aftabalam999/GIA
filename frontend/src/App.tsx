@@ -119,6 +119,12 @@ export default function App() {
           if (/^(?:no|n|cancel|reject|rejected|abort|stop|discard plan|forget it|nahi|mat karo|cancel karo|gia,?\s*(?:reject|cancel|mat karo))\b/i.test(lower)) {
             const vRes = await api.sendVoicePlanCommand(token, convoId, trimmed, false);
             setActivePlan(vRes.plan);
+            const planIdToClear = vRes.plan?.id || currentPlan.id;
+            setTimeout(() => {
+              setActivePlan((curr) => (curr?.id === planIdToClear ? null : curr));
+              setPlanExecution(null);
+              setActiveTicket(null);
+            }, 1500);
             return { role: 'assistant', content: 'Plan cancelled. No actions were performed.' };
           }
         }
@@ -166,6 +172,7 @@ export default function App() {
       audioRecorderRef.current?.stop();
       await voiceMachineRef.current.stopVoiceMode();
     } else {
+      setChatError(null);
       setIsVoiceModeActive(true);
       await voiceMachineRef.current.startVoiceMode(activeConvoId, token);
       try {
@@ -272,15 +279,22 @@ export default function App() {
         localStorage.setItem('gia_mic_permission', 'granted');
         setMicPermissionStatus('granted');
         setShowMicModal(false);
+        setChatError(null);
+        return;
+      } else {
+        localStorage.setItem('gia_mic_permission', 'rejected');
+        setMicPermissionStatus('rejected');
+        setShowMicModal(false);
+        setChatError(`Microphone access ${nativeRes.status.toLowerCase()}: ${nativeRes.message}`);
         return;
       }
-    } catch {
-      // ignore
+    } catch (err: any) {
+      localStorage.setItem('gia_mic_permission', 'rejected');
+      setMicPermissionStatus('rejected');
+      setShowMicModal(false);
+      setChatError(`Microphone permission error: ${err.message || String(err)}`);
+      return;
     }
-
-    localStorage.setItem('gia_mic_permission', 'granted');
-    setMicPermissionStatus('granted');
-    setShowMicModal(false);
   }
 
   function handleRejectMicPermission() {
@@ -550,6 +564,15 @@ export default function App() {
       // Refresh messages
       const refreshed = await api.getMessages(token, activeConvoId);
       setMessages(refreshed);
+
+      // Auto-remove plan after completed or failed execution
+      if (res.execution?.status === 'completed' || res.execution?.status === 'failed') {
+        setTimeout(() => {
+          setActivePlan((curr) => (curr?.id === planId ? null : curr));
+          setPlanExecution((curr) => (curr?.planId === planId ? null : curr));
+          setActiveTicket(null);
+        }, 2500);
+      }
     } catch (err: any) {
       setChatError('Plan execution failed: ' + (err.message || err));
       await loadActivePlan(activeConvoId);
@@ -568,6 +591,11 @@ export default function App() {
       setActivePlan(res.plan);
       setActiveTicket(null);
       setPlanExecution(null);
+
+      // Auto-remove rejected plan after brief confirmation feedback
+      setTimeout(() => {
+        setActivePlan((curr) => (curr?.id === planId ? null : curr));
+      }, 1500);
     } catch (err: any) {
       setChatError('Plan rejection failed: ' + (err.message || err));
     } finally {
@@ -598,11 +626,22 @@ export default function App() {
       await api.cancelPlan(token, activeConvoId, planId);
       const updatedPlan = await api.getActivePlan(token, activeConvoId);
       setActivePlan(updatedPlan);
+      setTimeout(() => {
+        setActivePlan((curr) => (curr?.id === planId ? null : curr));
+        setPlanExecution(null);
+        setActiveTicket(null);
+      }, 1500);
     } catch (err: any) {
       setChatError('Cancel failed: ' + (err.message || err));
     } finally {
       setIsPlanLoading(false);
     }
+  }
+
+  function handleDismissPlan() {
+    setActivePlan(null);
+    setPlanExecution(null);
+    setActiveTicket(null);
   }
 
   async function selectConversation(id: string) {
@@ -894,6 +933,14 @@ export default function App() {
           if (res.execution) {
             setPlanExecution(res.execution);
           }
+          if (['completed', 'failed', 'rejected', 'cancelled'].includes(res.plan.status)) {
+            const planIdToClear = res.plan.id;
+            setTimeout(() => {
+              setActivePlan((curr) => (curr?.id === planIdToClear ? null : curr));
+              setPlanExecution(null);
+              setActiveTicket(null);
+            }, 2500);
+          }
         }
         const refreshed = await api.getMessages(token, targetConvoId);
         setMessages(refreshed);
@@ -1120,6 +1167,7 @@ export default function App() {
                   onModify={handleModifyPlan}
                   onCancel={handleCancelPlan}
                   onExecute={(planId, version) => handleExecutePlan(planId, version)}
+                  onDismiss={handleDismissPlan}
                 />
               </div>
             )}

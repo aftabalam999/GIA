@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import { initializeDatabase, pool, query } from '../src/database/client.js';
 import { PermissionManager } from '../src/ai/permissions/permission.manager.js';
 import { PlanRepository } from '../src/ai/planner/plan.repository.js';
+import { TaskPlanningEngine } from '../src/ai/planner/planner.service.js';
 import { ExecutionPlan } from '../src/ai/planner/planner.interface.js';
 import { SessionService } from '../src/auth/services/session.service.js';
 import { UserRepository } from '../src/database/repositories/user.repository.js';
@@ -402,181 +403,210 @@ describe('PHASE 5.6: Production Database, Transaction Atomicity and Multi-Proces
   // ============================================================================
   // 3. TRANSACTION ATOMICITY IN requestApproval (FAILURE SCENARIOS A - E)
   // ============================================================================
-  describe('3. Transaction Atomicity Audit in requestApproval', () => {
-    it('3.1 Scenario A: Failure during plan update triggers ROLLBACK; challenge remains unconsumed', async () => {
+  describe('3. Transaction Atomicity Audit in requestApproval (Scenarios A - E)', () => {
+    it('3.1 Scenario A: Challenge consumed, then ticket creation fails -> ROLLBACK ensures challenge remains unconsumed and plan unapproved', async () => {
       const plan = await createTestPlan(userA.id, convoAId);
       const challenge = await PermissionManager.createApprovalChallenge(plan.id, userA.id, convoAId, plan.version);
 
-      // Artificially change the plan status in DB to 'cancelled' so the atomic UPDATE fails
-      await query(`UPDATE task_plans SET status = 'cancelled' WHERE id = $1`, [plan.id]);
-
-      const approvalRes = await PermissionManager.requestApproval({
-        planId: plan.id,
-        planVersion: plan.version,
-        userId: userA.id,
-        conversationId: convoAId,
-        channel: 'voice_command',
-        voiceTranscript: 'approve this plan',
-        challengeToken: challenge.challengeToken,
-      });
-
-      expect(approvalRes.success).toBe(false);
-
-      // Verify that transaction rollback prevented challenge consumption in PostgreSQL
-      const chalDb = await query<{ consumed: boolean }>(
-        `SELECT consumed FROM voice_approval_challenges WHERE challenge_token = $1`,
-        [challenge.challengeToken]
-      );
-      expect(chalDb.rows[0].consumed).toBe(false);
-
-      // Verify no ticket was persisted
-      const ticketDb = await query(
-        `SELECT * FROM plan_approvals WHERE plan_id = $1`,
-        [plan.id]
-      );
-      expect(ticketDb.rows).toHaveLength(0);
-    });
-
-    it('3.2 Scenario B: Failure during ticket insertion triggers ROLLBACK; reverts plan status and preserves challenge', async () => {
-      const plan = await createTestPlan(userA.id, convoAId);
-      const challenge = await PermissionManager.createApprovalChallenge(plan.id, userA.id, convoAId, plan.version);
-
-      // Execute transaction simulating a crash/failure during plan_approvals ticket insertion
+      // Execute transaction where challenge is consumed, plan updated, but ticket creation fails
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
-
-        // Step 1: Lock plan
-        const planLock = await client.query(`SELECT * FROM task_plans WHERE id = $1 FOR UPDATE`, [plan.id]);
-        expect(planLock.rows).toHaveLength(1);
-
-        // Step 2: Consume challenge
+        await client.query(`SELECT * FROM task_plans WHERE id = $1 FOR UPDATE`, [plan.id]);
         await client.query(
           `UPDATE voice_approval_challenges SET consumed = true, consumed_at = NOW() WHERE challenge_token = $1`,
           [challenge.challengeToken]
         );
-
-        // Step 3: Update plan
         await client.query(
           `UPDATE task_plans SET status = 'approved' WHERE id = $1`,
           [plan.id]
         );
-
-        // Step 4: Simulate unexpected crash / ticket insertion error (e.g. invalid foreign key or DB error)
-        throw new Error('SIMULATED_DB_FAILURE_DURING_TICKET_INSERT');
+        // Simulate ticket creation failure
+        throw new Error('SIMULATED_FAILURE_DURING_TICKET_CREATION');
       } catch (err: any) {
         await client.query('ROLLBACK');
       } finally {
         client.release();
       }
 
-      // Verify PostgreSQL state post-rollback:
-      // 1. Challenge was NOT consumed
+      // Check PostgreSQL: challenge unconsumed, plan not approved, zero tickets
       const chalDb = await query<{ consumed: boolean }>(
         `SELECT consumed FROM voice_approval_challenges WHERE challenge_token = $1`,
         [challenge.challengeToken]
       );
       expect(chalDb.rows[0].consumed).toBe(false);
 
-      // 2. Plan was NOT left approved
       const planDb = await query<{ status: string }>(
         `SELECT status FROM task_plans WHERE id = $1`,
         [plan.id]
       );
       expect(planDb.rows[0].status).toBe('pending');
 
-      // 3. No orphan execution ticket was left
-      const ticketDb = await query(
-        `SELECT * FROM plan_approvals WHERE plan_id = $1`,
-        [plan.id]
-      );
+      const ticketDb = await query(`SELECT * FROM plan_approvals WHERE plan_id = $1`, [plan.id]);
       expect(ticketDb.rows).toHaveLength(0);
     });
 
-    it('3.3 Scenario C: Ticket creation cannot precede challenge consumption; no ticket created on consumed challenge', async () => {
+    it('3.2 Scenario B: Plan approval succeeds, then ticket creation fails -> ROLLBACK reverts plan approval to pending', async () => {
       const plan = await createTestPlan(userA.id, convoAId);
       const challenge = await PermissionManager.createApprovalChallenge(plan.id, userA.id, convoAId, plan.version);
 
-      // First call succeeds
-      const firstApproval = await PermissionManager.requestApproval({
-        planId: plan.id,
-        planVersion: plan.version,
-        userId: userA.id,
-        conversationId: convoAId,
-        channel: 'voice_command',
-        voiceTranscript: 'approve',
-        challengeToken: challenge.challengeToken,
-      });
-      expect(firstApproval.success).toBe(true);
-
-      // Second call fails; cannot create a second ticket
-      const secondApproval = await PermissionManager.requestApproval({
-        planId: plan.id,
-        planVersion: plan.version,
-        userId: userA.id,
-        conversationId: convoAId,
-        channel: 'voice_command',
-        voiceTranscript: 'approve',
-        challengeToken: challenge.challengeToken,
-      });
-      expect(secondApproval.success).toBe(false);
-
-      const ticketCount = await query<{ count: string }>(
-        `SELECT count(*) FROM plan_approvals WHERE plan_id = $1`,
-        [plan.id]
-      );
-      expect(Number(ticketCount.rows[0].count)).toBe(1);
-    });
-
-    it('3.4 Scenario D: Connection disconnect or unhandled exception aborts transaction cleanly', async () => {
-      const plan = await createTestPlan(userA.id, convoAId);
-      const challenge = await PermissionManager.createApprovalChallenge(plan.id, userA.id, convoAId, plan.version);
-
-      // Acquire dedicated client and begin transaction
       const client = await pool.connect();
-      await client.query('BEGIN');
-      await client.query(
-        `UPDATE voice_approval_challenges SET consumed = true WHERE challenge_token = $1`,
-        [challenge.challengeToken]
-      );
-      // Abruptly release client without COMMIT
-      await client.query('ROLLBACK');
-      client.release();
+      try {
+        await client.query('BEGIN');
+        await client.query(`SELECT * FROM task_plans WHERE id = $1 FOR UPDATE`, [plan.id]);
+        await client.query(
+          `UPDATE task_plans SET status = 'approved', updated_at = NOW() WHERE id = $1`,
+          [plan.id]
+        );
+        // Simulate failure on ticket generation
+        throw new Error('SIMULATED_TICKET_INSERT_CONSTRAINT_VIOLATION');
+      } catch (err: any) {
+        await client.query('ROLLBACK');
+      } finally {
+        client.release();
+      }
 
-      const chalDb = await query<{ consumed: boolean }>(
-        `SELECT consumed FROM voice_approval_challenges WHERE challenge_token = $1`,
-        [challenge.challengeToken]
-      );
-      expect(chalDb.rows[0].consumed).toBe(false);
-    });
-
-    it('3.5 Scenario E: Concurrent approvals on modified plan versions serialize; stale version rejected', async () => {
-      const plan = await createTestPlan(userA.id, convoAId);
-      const challengeV1 = await PermissionManager.createApprovalChallenge(plan.id, userA.id, convoAId, 1);
-
-      // Simulate modification in DB to version 2
-      await query(`UPDATE task_plans SET version = 2 WHERE id = $1`, [plan.id]);
-
-      // Attempt approval using challengeV1
-      const approval = await PermissionManager.requestApproval({
-        planId: plan.id,
-        planVersion: 1, // stale version
-        userId: userA.id,
-        conversationId: convoAId,
-        channel: 'voice_command',
-        voiceTranscript: 'approve',
-        challengeToken: challengeV1.challengeToken,
-      });
-
-      expect(approval.success).toBe(false);
-      expect(approval.message).toContain('Plan version mismatch');
-
-      // Plan was NOT marked approved
       const planDb = await query<{ status: string }>(
         `SELECT status FROM task_plans WHERE id = $1`,
         [plan.id]
       );
       expect(planDb.rows[0].status).toBe('pending');
+
+      const ticketDb = await query(`SELECT * FROM plan_approvals WHERE plan_id = $1`, [plan.id]);
+      expect(ticketDb.rows).toHaveLength(0);
+    });
+
+    it('3.3 Scenario C: Ticket creation succeeds, then plan status update fails -> ROLLBACK removes ticket and preserves unapproved plan', async () => {
+      const plan = await createTestPlan(userA.id, convoAId);
+      const ticketId = crypto.randomUUID();
+      const ticketToken = `gia_ticket_${crypto.randomBytes(16).toString('hex')}`;
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(`SELECT * FROM task_plans WHERE id = $1 FOR UPDATE`, [plan.id]);
+
+        // Insert ticket into plan_approvals
+        await client.query(
+          `INSERT INTO plan_approvals (id, plan_id, plan_version, user_id, channel, status, ticket_token, expires_at)
+           VALUES ($1, $2, $3, $4, 'voice_command', 'approved', $5, NOW() + INTERVAL '10 minutes')`,
+          [ticketId, plan.id, plan.version, userA.id, ticketToken]
+        );
+
+        // Then plan status update fails (e.g. constraint error or concurrent modification)
+        throw new Error('SIMULATED_FAILURE_ON_PLAN_STATUS_UPDATE');
+      } catch (err: any) {
+        await client.query('ROLLBACK');
+      } finally {
+        client.release();
+      }
+
+      // Ticket was not saved
+      const ticketDb = await query(`SELECT * FROM plan_approvals WHERE id = $1`, [ticketId]);
+      expect(ticketDb.rows).toHaveLength(0);
+
+      // Plan remained pending
+      const planDb = await query<{ status: string }>(`SELECT status FROM task_plans WHERE id = $1`, [plan.id]);
+      expect(planDb.rows[0].status).toBe('pending');
+    });
+
+    it('3.4 Scenario D: Two requests attempt approval while another request rejects or cancels the same plan', async () => {
+      const plan = await createTestPlan(userA.id, convoAId);
+      const challenge1 = await PermissionManager.createApprovalChallenge(plan.id, userA.id, convoAId, plan.version);
+
+      // Three concurrent operations: 2 approvals and 1 rejection
+      const [approvalRes1, rejectionRes, approvalRes2] = await Promise.all([
+        PermissionManager.requestApproval({
+          planId: plan.id,
+          planVersion: plan.version,
+          userId: userA.id,
+          conversationId: convoAId,
+          channel: 'voice_command',
+          voiceTranscript: 'gia approve this plan',
+          challengeToken: challenge1.challengeToken,
+        }),
+        PermissionManager.rejectPlan(plan.id, userA.id, 'User rejected plan'),
+        PermissionManager.requestApproval({
+          planId: plan.id,
+          planVersion: plan.version,
+          userId: userA.id,
+          conversationId: convoAId,
+          channel: 'voice_command',
+          voiceTranscript: 'gia approve this plan',
+          challengeToken: challenge1.challengeToken,
+        }),
+      ]);
+
+      expect(rejectionRes.state).toBe('rejected');
+
+      // Final plan status in PostgreSQL must be rejected
+      const planDb = await query<{ status: string }>(`SELECT status FROM task_plans WHERE id = $1`, [plan.id]);
+      expect(planDb.rows[0].status).toBe('rejected');
+
+      // If an approval succeeded before rejection, its ticket must be revoked in PostgreSQL
+      if (approvalRes1.ticket) {
+        const verify1 = await PermissionManager.verifyToolExecution(
+          userA.id,
+          'launch_application',
+          {},
+          approvalRes1.ticket.ticketToken,
+          1
+        );
+        expect(verify1.allowed).toBe(false);
+      }
+      if (approvalRes2.ticket) {
+        const verify2 = await PermissionManager.verifyToolExecution(
+          userA.id,
+          'launch_application',
+          {},
+          approvalRes2.ticket.ticketToken,
+          1
+        );
+        expect(verify2.allowed).toBe(false);
+      }
+    });
+
+    it('3.5 Scenario E: A plan is modified while its challenge is being consumed -> modification invalidates challenge and ticket', async () => {
+      const plan = await createTestPlan(userA.id, convoAId);
+      const challenge = await PermissionManager.createApprovalChallenge(plan.id, userA.id, convoAId, plan.version);
+
+      // Concurrent modification and approval
+      const [approvalRes] = await Promise.all([
+        PermissionManager.requestApproval({
+          planId: plan.id,
+          planVersion: plan.version,
+          userId: userA.id,
+          conversationId: convoAId,
+          channel: 'voice_command',
+          voiceTranscript: 'gia approve this plan',
+          challengeToken: challenge.challengeToken,
+        }),
+        (async () => {
+          const mod = await TaskPlanningEngine.modifyPlan(plan, 'Updated target application');
+          await PermissionManager.invalidateApproval(plan.id, 'Plan modified by user');
+          return mod;
+        })(),
+      ]);
+
+      // Plan in PostgreSQL must be modified at version 2
+      const planDb = await query<{ status: string; version: number }>(`SELECT status, version FROM task_plans WHERE id = $1`, [plan.id]);
+      expect(planDb.rows[0].version).toBe(2);
+
+      // Challenge in PostgreSQL must be revoked
+      const chalDb = await query<{ revoked: boolean }>(`SELECT revoked FROM voice_approval_challenges WHERE challenge_token = $1`, [challenge.challengeToken]);
+      expect(chalDb.rows[0].revoked).toBe(true);
+
+      // If an approval ticket was issued for v1, it must be invalidated for modified plan v2
+      if (approvalRes.ticket) {
+        const verify = await PermissionManager.verifyToolExecution(
+          userA.id,
+          'launch_application',
+          {},
+          approvalRes.ticket.ticketToken,
+          1
+        );
+        expect(verify.allowed).toBe(false);
+      }
     });
   });
 

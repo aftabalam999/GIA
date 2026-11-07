@@ -153,6 +153,19 @@ export class LocalVAD {
             this.callbacks.onSpeechStart();
           }
         }
+      } else {
+        // Enforce maximum speech duration safety (e.g. 8000ms = 8s) to prevent continuous locking
+        const duration = this.speechStartTime ? nowTimestamp - this.speechStartTime : 0;
+        if (duration >= 8000) {
+          this.isSpeakingInternal = false;
+          this.speechStartTime = null;
+          this.lastAboveThresholdTime = null;
+          this.consecutiveSpeechMs = 0;
+          console.log('[VAD] speech-end');
+          if (this.callbacks.onSpeechEnd) {
+            this.callbacks.onSpeechEnd(duration);
+          }
+        }
       }
     } else {
       // Below threshold

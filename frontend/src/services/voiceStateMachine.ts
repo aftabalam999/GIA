@@ -53,6 +53,7 @@ export class VoiceStateMachine {
   private _streamingQueue: StreamingAudioQueue | null = null;
   private _currentGenerationId: number = 0;
   private _isLiveMode: boolean = false;
+  private _speechDetectedTimeout: any = null;
 
   constructor(callbacks: VoiceStateMachineCallbacks = {}) {
     this._callbacks = callbacks;
@@ -184,6 +185,11 @@ export class VoiceStateMachine {
     this._isVoiceModeOn = false;
     this._currentGenerationId++;
 
+    if (this._speechDetectedTimeout) {
+      clearTimeout(this._speechDetectedTimeout);
+      this._speechDetectedTimeout = null;
+    }
+
     if (this._streamingQueue) {
       this._streamingQueue.cancel();
       this._streamingQueue = null;
@@ -215,6 +221,16 @@ export class VoiceStateMachine {
   public handleSpeechStart(): void {
     if (!this._isVoiceModeOn || this._state !== 'LISTENING') return;
     this.setState('SPEECH_DETECTED');
+
+    if (this._speechDetectedTimeout) {
+      clearTimeout(this._speechDetectedTimeout);
+    }
+    this._speechDetectedTimeout = setTimeout(() => {
+      if (this._state === 'SPEECH_DETECTED' && this._isVoiceModeOn) {
+        console.warn('[VOICE] Speech detected watchdog timeout, returning to LISTENING');
+        this.setState('LISTENING');
+      }
+    }, 8000);
   }
 
   /**
@@ -228,6 +244,11 @@ export class VoiceStateMachine {
 
     console.log('[VOICE] interrupted');
     this._currentGenerationId++;
+
+    if (this._speechDetectedTimeout) {
+      clearTimeout(this._speechDetectedTimeout);
+      this._speechDetectedTimeout = null;
+    }
 
     if (this._activeAbortController) {
       try {
@@ -258,6 +279,11 @@ export class VoiceStateMachine {
   public async processSpeechUtterance(audioBlob: Blob | Buffer): Promise<void> {
     if (!this._isVoiceModeOn || this._isProcessingUtterance || this._isLiveMode) return;
     if (this._state !== 'LISTENING' && this._state !== 'SPEECH_DETECTED') return;
+
+    if (this._speechDetectedTimeout) {
+      clearTimeout(this._speechDetectedTimeout);
+      this._speechDetectedTimeout = null;
+    }
 
     this._isProcessingUtterance = true;
     const utteranceGenId = ++this._currentGenerationId;
@@ -430,9 +456,26 @@ export class VoiceStateMachine {
         const chatRes = await this._callbacks.fetchChatApi(this._conversationId, commandText);
         if (this.checkInterrupted(utteranceGenId)) return;
 
-        assistantReplyText = chatRes?.assistantMessage?.content || chatRes?.data?.assistantMessage?.content || '';
+        assistantReplyText =
+          chatRes?.assistantMessage?.content ||
+          chatRes?.data?.assistantMessage?.content ||
+          chatRes?.content ||
+          '';
+
         if (this._callbacks.onAssistantResponse) {
-          this._callbacks.onAssistantResponse(chatRes.userMessage, chatRes.assistantMessage);
+          const userMsg = chatRes?.userMessage || {
+            id: Math.random().toString(),
+            role: 'user',
+            content: commandText,
+            created_at: new Date().toISOString(),
+          };
+          const assistantMsg = chatRes?.assistantMessage || {
+            id: Math.random().toString(),
+            role: 'assistant',
+            content: assistantReplyText,
+            created_at: new Date().toISOString(),
+          };
+          this._callbacks.onAssistantResponse(userMsg, assistantMsg);
         }
 
         if (assistantReplyText) {

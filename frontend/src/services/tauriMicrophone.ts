@@ -3,6 +3,7 @@
  * Manages desktop microphone state and native capture IPC communication with Tauri/Rust.
  */
 import { invoke } from '@tauri-apps/api/core';
+import { isTauriEnvironment } from './tauriServices.js';
 
 export type NativeMicState =
   | 'UNKNOWN'
@@ -44,9 +45,22 @@ export function base64ToBlob(base64: string, mimeType: string = 'audio/wav'): Bl
 }
 
 /**
- * Checks system microphone availability via Tauri native command.
+ * Checks system microphone availability via Tauri native command or browser mediaDevices.
  */
 export async function checkNativeMicrophonePermission(): Promise<MicPermissionResponse> {
+  if (!isTauriEnvironment()) {
+    if (typeof navigator !== 'undefined' && typeof navigator.mediaDevices?.getUserMedia === 'function') {
+      return {
+        status: 'GRANTED',
+        device_name: 'Browser Default Microphone',
+        message: 'Browser WebAudio capture available.',
+      };
+    }
+    return {
+      status: 'UNAVAILABLE',
+      message: 'Browser mediaDevices API not supported.',
+    };
+  }
   try {
     return await invoke<MicPermissionResponse>('check_microphone_permission');
   } catch (err: any) {
@@ -58,9 +72,31 @@ export async function checkNativeMicrophonePermission(): Promise<MicPermissionRe
 }
 
 /**
- * Requests explicit desktop microphone access via Tauri native command.
+ * Requests explicit desktop microphone access via Tauri native command or browser mediaDevices.
  */
 export async function requestNativeMicrophonePermission(): Promise<MicPermissionResponse> {
+  if (!isTauriEnvironment()) {
+    if (typeof navigator !== 'undefined' && typeof navigator.mediaDevices?.getUserMedia === 'function') {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((t) => t.stop());
+        return {
+          status: 'GRANTED',
+          device_name: 'Browser Default Microphone',
+          message: 'Browser microphone access acquired successfully.',
+        };
+      } catch (err: any) {
+        return {
+          status: 'DENIED',
+          message: `Browser microphone permission denied: ${err?.message || String(err)}`,
+        };
+      }
+    }
+    return {
+      status: 'UNAVAILABLE',
+      message: 'Browser mediaDevices API not supported.',
+    };
+  }
   try {
     return await invoke<MicPermissionResponse>('request_microphone_permission');
   } catch (err: any) {
