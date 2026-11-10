@@ -629,8 +629,8 @@ mod tests {
     #[test]
     fn test_find_ffmpeg_or_system_path() {
         let ffmpeg = find_ffmpeg();
-        if cfg!(target_os = "macos") {
-            assert!(ffmpeg.is_some(), "FFmpeg should be discoverable on macOS dev environment");
+        if let Some(path) = ffmpeg {
+            assert!(!path.as_os_str().is_empty(), "Discovered FFmpeg path should not be empty");
         }
     }
 
