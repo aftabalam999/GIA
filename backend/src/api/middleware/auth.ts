@@ -1,6 +1,9 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { AuthenticationError } from '../../shared/errors.js';
 import { SessionService } from '../../auth/services/session.service.js';
+import { UserRepository } from '../../database/repositories/user.repository.js';
+import { query } from '../../database/client.js';
+import { logger } from '../../shared/logger.js';
 
 // Extend `@fastify/jwt` User representation to avoid breaking route files typing
 declare module '@fastify/jwt' {
@@ -44,6 +47,21 @@ export async function authenticate(request: FastifyRequest, reply: FastifyReply)
   const session = await SessionService.lookupSession(sessionId);
   if (!session) {
     throw new AuthenticationError('Unauthorized: Invalid or expired session');
+  }
+
+  // Verify that the user exists in PostgreSQL to maintain database foreign key integrity
+  const user = await UserRepository.findById(session.userId);
+  if (!user) {
+    try {
+      await query(
+        `INSERT INTO users (id, email, password_hash, name, created_at, updated_at)
+         VALUES ($1, $2, 'scrypt_session_restored_hash', $3, NOW(), NOW())
+         ON CONFLICT (id) DO NOTHING`,
+        [session.userId, session.email, session.name || 'User']
+      );
+    } catch (e: any) {
+      logger.warn({ msg: 'Failed to auto-heal missing user record for active session', err: e.message });
+    }
   }
 
   // Attach session context to request

@@ -130,6 +130,7 @@ export async function sendMessageAgent(token: string, conversationId: string, co
   plan?: ExecutionPlan;
   presentation?: string;
   execution?: PlanExecutionResult;
+  speechText?: string;
 }> {
   const data = await apiRequest(`/api/v1/conversations/${conversationId}/messages/agent`, 'POST', token, { content });
   return {
@@ -139,6 +140,7 @@ export async function sendMessageAgent(token: string, conversationId: string, co
     plan: data.plan,
     presentation: data.presentation,
     execution: data.execution,
+    speechText: data.speechText,
   };
 }
 

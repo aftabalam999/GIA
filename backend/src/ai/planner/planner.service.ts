@@ -26,11 +26,47 @@ export class TaskPlanningEngine {
     // 1. Check for ambiguous instructions
     if (this.isAmbiguousInstruction(trimmed)) {
       const planId = randomUUID();
+      const trimmedLower = trimmed.toLowerCase();
+      const isFolderAmbiguous =
+        /\b(?:make|create|new|build|generate|add)\b(?:\s+(?:a|an|one|new|another|me|the|[0-9]+))*\s+(?:folder|directory)\b/i.test(trimmedLower) ||
+        /\b(?:folder|directory)\b.*\b(?:banao|bana\s+do|bana\s+de|create\s+karo|make|create)\b/i.test(trimmedLower);
+      const isBrowserAmbiguous =
+        /^(?:(?:can\s+you\s+|please\s+)?(?:open|launch|start)\s+(?:a|the|my)?\s*(?:web\s*)?browser\b)/i.test(trimmedLower);
+      const isSearchAmbiguous =
+        /^(?:(?:can\s+you\s+|please\s+)?search\s+(?:something\s+)?(?:on\s+(?:the\s+)?(?:internet|web|google)|online)?)$/i.test(trimmedLower) ||
+        trimmedLower === 'search something' ||
+        trimmedLower === 'search something on the internet' ||
+        trimmedLower === 'search the internet' ||
+        trimmedLower === 'search the web' ||
+        trimmedLower === 'search online';
+
+      let targetLocation = 'Desktop';
+      if (trimmedLower.includes('document')) targetLocation = 'Documents';
+      if (trimmedLower.includes('download')) targetLocation = 'Downloads';
+
+      let objective = trimmed;
+      if (isFolderAmbiguous) objective = `Create folder on ${targetLocation}`;
+      else if (isBrowserAmbiguous) objective = 'Open web browser';
+      else if (isSearchAmbiguous) objective = 'Search the web';
+
+      let description = 'Awaiting user clarification before proceeding with task planning';
+      let expectedOutcome = 'Clarification received from user';
+      if (isFolderAmbiguous) {
+        description = 'Awaiting folder name clarification from user';
+        expectedOutcome = 'Folder name provided by user';
+      } else if (isBrowserAmbiguous) {
+        description = 'Awaiting browser selection from user';
+        expectedOutcome = 'Browser choice provided by user';
+      } else if (isSearchAmbiguous) {
+        description = 'Awaiting search query from user';
+        expectedOutcome = 'Search query provided by user';
+      }
+
       const ambiguousPlan: ExecutionPlan = {
         id: planId,
         conversation_id: conversationId,
         user_id: userId,
-        objective: trimmed,
+        objective,
         status: 'awaiting_approval',
         is_ambiguous: true,
         clarification_question: this.generateClarificationQuestion(trimmed),
@@ -38,14 +74,14 @@ export class TaskPlanningEngine {
           {
             step_id: 1,
             action: 'await_clarification',
-            target: '',
-            description: 'Awaiting user clarification before proceeding with task planning',
+            target: isFolderAmbiguous ? targetLocation : '',
+            description,
             tool_name: undefined,
             tool_args: {},
             risk_level: 'low',
             requires_approval: true,
             depends_on: [],
-            expected_outcome: 'Clarification received from user',
+            expected_outcome: expectedOutcome,
           },
         ],
         approval: {
@@ -54,7 +90,18 @@ export class TaskPlanningEngine {
           approved_at: null,
           feedback: null,
         },
-        metadata: { original_instruction: trimmed },
+        metadata: {
+          original_instruction: trimmed,
+          ...(isFolderAmbiguous
+            ? { pending_action: 'create_directory', target_location: targetLocation, missing_param: 'folder_name' }
+            : {}),
+          ...(isBrowserAmbiguous
+            ? { pending_action: 'open_browser', missing_param: 'browser_name' }
+            : {}),
+          ...(isSearchAmbiguous
+            ? { pending_action: 'search_browser', missing_param: 'search_query' }
+            : {}),
+        },
         version: 1,
       };
 
@@ -215,6 +262,174 @@ Constraints:
    */
   static async modifyPlan(existingPlan: ExecutionPlan, userFeedback: string): Promise<ExecutionPlan> {
     const feedbackLower = userFeedback.toLowerCase().trim();
+
+    // 0a. Handle ambiguous browser selection resolution (e.g. user specifying "Chrome", "Brave", etc.)
+    if (existingPlan.is_ambiguous && existingPlan.metadata?.missing_param === 'browser_name') {
+      let browserName = userFeedback.trim().replace(/[.,!?;]+$/, '').trim();
+      browserName = browserName.replace(/^(?:open\s+|use\s+|launch\s+|the\s+)/i, '').trim();
+      browserName = browserName.replace(/^["']|["']$/g, '').trim();
+
+      const lower = browserName.toLowerCase();
+      const resolvedBrowser = ['chrome', 'google chrome'].includes(lower)
+        ? 'Google Chrome'
+        : ['brave', 'brave browser'].includes(lower)
+        ? 'Brave Browser'
+        : ['safari'].includes(lower)
+        ? 'Safari'
+        : ['default', 'default browser'].includes(lower)
+        ? 'Google Chrome'
+        : browserName || 'Google Chrome';
+
+      const resolvedSteps: PlanStep[] = [
+        {
+          step_id: 1,
+          action: 'open_browser',
+          target: resolvedBrowser,
+          description: `Launch ${resolvedBrowser} on desktop`,
+          tool_name: 'open_browser',
+          tool_args: { browser: resolvedBrowser },
+          risk_level: 'low',
+          requires_approval: true,
+          depends_on: [],
+          expected_outcome: `${resolvedBrowser} launched and active`,
+        },
+        {
+          step_id: 2,
+          action: 'verify_browser',
+          target: resolvedBrowser,
+          description: `Verify ${resolvedBrowser} is running`,
+          tool_name: undefined,
+          tool_args: { browser: resolvedBrowser },
+          risk_level: 'low',
+          requires_approval: true,
+          depends_on: [1],
+          expected_outcome: `${resolvedBrowser} process verified`,
+        },
+      ];
+
+      return PlanRepository.update(existingPlan.id, {
+        objective: `Launch ${resolvedBrowser}`,
+        status: 'awaiting_approval',
+        is_ambiguous: false,
+        clarification_question: null,
+        steps: resolvedSteps,
+        approval: { required: true, approved: false, approved_at: null, feedback: userFeedback },
+        metadata: {
+          ...existingPlan.metadata,
+          missing_param: null,
+          browser_name: resolvedBrowser,
+          resolved_at: new Date().toISOString(),
+        },
+      });
+    }
+
+    // 0b. Handle ambiguous search query resolution (e.g. user specifying search query)
+    if (existingPlan.is_ambiguous && existingPlan.metadata?.missing_param === 'search_query') {
+      let query = userFeedback.trim().replace(/[.,!?;]+$/, '').trim();
+      query = query.replace(/^(?:search\s+(?:for\s+)?|look\s+up\s+|find\s+)/i, '').trim();
+      query = query.replace(/^["']|["']$/g, '').trim();
+
+      const browser = (existingPlan.metadata?.browser_name as string) || undefined;
+      const resolvedSteps: PlanStep[] = [
+        {
+          step_id: 1,
+          action: 'search_browser',
+          target: query,
+          description: `Search for "${query}" on web browser`,
+          tool_name: 'search_browser',
+          tool_args: { query, engine: 'google', browser },
+          risk_level: 'low',
+          requires_approval: true,
+          depends_on: [],
+          expected_outcome: `Web browser navigated to search results for "${query}"`,
+        },
+        {
+          step_id: 2,
+          action: 'verify_browser',
+          target: query,
+          description: `Verify browser search for "${query}"`,
+          tool_name: undefined,
+          tool_args: { query, browser },
+          risk_level: 'low',
+          requires_approval: true,
+          depends_on: [1],
+          expected_outcome: 'Search results displayed in browser',
+        },
+      ];
+
+      return PlanRepository.update(existingPlan.id, {
+        objective: `Search "${query}" on web browser`,
+        status: 'awaiting_approval',
+        is_ambiguous: false,
+        clarification_question: null,
+        steps: resolvedSteps,
+        approval: { required: true, approved: false, approved_at: null, feedback: userFeedback },
+        metadata: {
+          ...existingPlan.metadata,
+          missing_param: null,
+          search_query: query,
+          resolved_at: new Date().toISOString(),
+        },
+      });
+    }
+
+    // 0c. Handle ambiguous folder name resolution (e.g. user specifying folder name)
+    if (existingPlan.metadata?.missing_param === 'folder_name' || (existingPlan.is_ambiguous && !existingPlan.metadata?.missing_param)) {
+      let folderName = userFeedback.trim();
+      // Strip trailing punctuation
+      folderName = folderName.replace(/[.,!?;]+$/, '').trim();
+      // Strip conversational prefixes
+      folderName = folderName
+        .replace(/^(?:name\s+it\s+|call\s+it\s+|named\s+|it['’]?s\s+|the\s+name\s+is\s+|folder\s+name\s+is\s+)/i, '')
+        .trim();
+      folderName = folderName.replace(/^["']|["']$/g, '').trim();
+
+      const targetLocation = (existingPlan.metadata?.target_location as string) || 'Desktop';
+
+      if (folderName.length > 0) {
+        const resolvedSteps: PlanStep[] = [
+          {
+            step_id: 1,
+            action: 'create_directory',
+            target: `${targetLocation}/${folderName}`,
+            description: `Create directory "${folderName}" on ${targetLocation}`,
+            tool_name: 'create_directory',
+            tool_args: { directoryPath: targetLocation, folderName },
+            risk_level: 'medium',
+            requires_approval: true,
+            depends_on: [],
+            expected_outcome: `Directory "${folderName}" created successfully on ${targetLocation}`,
+          },
+          {
+            step_id: 2,
+            action: 'verify_directory',
+            target: `${targetLocation}/${folderName}`,
+            description: `Verify directory "${folderName}" exists on disk`,
+            tool_name: undefined,
+            tool_args: { directoryPath: targetLocation, folderName },
+            risk_level: 'low',
+            requires_approval: true,
+            depends_on: [1],
+            expected_outcome: `Directory "${folderName}" verified on filesystem`,
+          },
+        ];
+
+        return PlanRepository.update(existingPlan.id, {
+          objective: `Create folder "${folderName}" on ${targetLocation}`,
+          status: 'awaiting_approval',
+          is_ambiguous: false,
+          clarification_question: null,
+          steps: resolvedSteps,
+          approval: { required: true, approved: false, approved_at: null, feedback: userFeedback },
+          metadata: {
+            ...existingPlan.metadata,
+            missing_param: null,
+            folder_name: folderName,
+            resolved_at: new Date().toISOString(),
+          },
+        });
+      }
+    }
 
     // 1. Check for step removal: "remove step 2", "delete the second step", "drop step 1"
     const removeMatch = feedbackLower.match(/(?:remove|delete|drop|omit)\s+(?:the\s+)?(?:step\s+(\d+)|second\s+step|third\s+step|first\s+step|last\s+step)/i);
@@ -443,7 +658,7 @@ Output the updated plan in JSON:
   /**
    * Classifies user input intent regarding task planning.
    */
-  static classifyIntent(userInput: string, hasActivePlan: boolean): PlanIntentResult {
+  static classifyIntent(userInput: string, hasActivePlan: boolean, activePlan?: ExecutionPlan): PlanIntentResult {
     const text = userInput.trim().toLowerCase();
 
     // 1. Approval triggers
@@ -473,7 +688,15 @@ Output the updated plan in JSON:
       };
     }
 
-    // 4. Modification triggers
+    // 4. Ambiguous plan clarification / missing parameter triggers
+    if (hasActivePlan && activePlan && (activePlan.is_ambiguous || activePlan.metadata?.missing_param)) {
+      return {
+        intent: 'modify_plan',
+        reason: 'User provided clarification for missing parameter in pending ambiguous plan.',
+      };
+    }
+
+    // 5. Modification triggers
     if (
       hasActivePlan &&
       (
@@ -529,11 +752,75 @@ Output the updated plan in JSON:
       'open the thing',
       'check it',
     ];
-    return ambiguousPhrases.includes(lower) || lower.length < 4;
+
+    if (ambiguousPhrases.includes(lower) || lower.length < 4) {
+      return true;
+    }
+
+    // Check if user is asking to create/make a folder or directory without providing the folder name
+    const isFolderCommand =
+      /\b(?:make|create|new|build|generate|add)\b(?:\s+(?:a|an|one|new|another|me|the|[0-9]+))*\s+(?:folder|directory)\b/i.test(lower) ||
+      /\b(?:folder|directory)\b.*\b(?:banao|bana\s+do|bana\s+de|create\s+karo|make|create)\b/i.test(lower);
+
+    if (isFolderCommand) {
+      // Check if folder name is provided via named/called/with name or direct word
+      const namedMatch = text.match(
+        /(?:named|called|with\s+(?:the\s+)?name(?:\s+of)?|naam(?:\s+se|\s+ka)?)\s+["']?([^"'\s.,;]+)["']?/i
+      );
+      if (namedMatch && namedMatch[1] && namedMatch[1].trim().length > 0) {
+        return false;
+      }
+      const directMatch = text.match(
+        /(?:make|create|new|build)\s+(?:a\s+|an\s+|one\s+|new\s+|another\s+|the\s+)?(?:folder|directory)\s+["']?([^"'\s]+)["']?(?:\s+(?:on|in|at)\s+(?:the\s+)?(?:desktop|downloads|documents))?/i
+      );
+      if (directMatch && directMatch[1]) {
+        const candidate = directMatch[1].trim().toLowerCase();
+        const skipWords = ['on', 'in', 'at', 'the', 'desktop', 'documents', 'downloads', 'named', 'called', 'here'];
+        if (!skipWords.includes(candidate)) {
+          return false;
+        }
+      }
+      return true; // Folder creation without a valid folder name is ambiguous!
+    }
+
+    // Generic browser opening without specifying which browser
+    const isGenericOpenBrowser =
+      /^(?:(?:can\s+you\s+|please\s+)?(?:open|launch|start)\s+(?:a|the|my)?\s*(?:web\s*)?browser\b)/i.test(lower) &&
+      !lower.includes('chrome') &&
+      !lower.includes('brave') &&
+      !lower.includes('safari') &&
+      !lower.includes('firefox') &&
+      !lower.includes('edge');
+    if (isGenericOpenBrowser) {
+      return true;
+    }
+
+    // Generic search without a specific query
+    const isGenericSearch =
+      /^(?:(?:can\s+you\s+|please\s+)?search\s+(?:something\s+)?(?:on\s+(?:the\s+)?(?:internet|web|google)|online)?)$/i.test(lower) ||
+      lower === 'search something' ||
+      lower === 'search something on the internet' ||
+      lower === 'search the internet' ||
+      lower === 'search the web' ||
+      lower === 'search online';
+    if (isGenericSearch) {
+      return true;
+    }
+
+    return false;
   }
 
   private static generateClarificationQuestion(text: string): string {
     const lower = text.toLowerCase();
+    if (lower.includes('folder') || lower.includes('directory')) {
+      return 'What would you like to name this folder?';
+    }
+    if (/browser/i.test(lower) && (lower.includes('open') || lower.includes('launch') || lower.includes('start'))) {
+      return 'Which browser would you like me to open? Google Chrome, Brave Browser, or your default browser?';
+    }
+    if (lower.includes('search')) {
+      return 'What would you like me to search for?';
+    }
     if (lower.includes('open') || lower.includes('launch')) {
       return 'Which specific application, file, or website would you like me to open?';
     }
@@ -553,6 +840,20 @@ Output the updated plan in JSON:
     lower = lower
       .replace(/^(?:can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?|please\s+|kindly\s+|gia,?\s*(?:please\s+)?|hey\s+gia,?\s*)/i, '')
       .trim();
+
+    // Browser tab commands and navigation controls
+    if (
+      lower.startsWith('new tab') ||
+      lower.startsWith('close tab') ||
+      lower.startsWith('go back') ||
+      lower.startsWith('go forward') ||
+      lower.startsWith('refresh') ||
+      lower.startsWith('reload') ||
+      lower === 'back' ||
+      lower === 'forward'
+    ) {
+      return true;
+    }
 
     // Pure questions or conversational chit-chat are NOT actionable instructions
     if (
@@ -584,6 +885,19 @@ Output the updated plan in JSON:
       lower.startsWith('visit ') ||
       lower.startsWith('browse ') ||
       lower.startsWith('search ') ||
+      lower.startsWith('create folder') ||
+      lower.startsWith('make folder') ||
+      lower.startsWith('make a folder') ||
+      lower.startsWith('create a folder') ||
+      lower.startsWith('new folder') ||
+      lower.startsWith('create directory') ||
+      lower.startsWith('make directory') ||
+      lower.startsWith('make a directory') ||
+      lower.startsWith('create a directory') ||
+      lower.startsWith('new directory') ||
+      /\b(?:make|create|new|build|generate|add)\b(?:\s+(?:a|an|one|new|another|me|the|[0-9]+))*\s+(?:folder|directory)\b/i.test(lower) ||
+      /\b(?:folder|directory)\b.*\b(?:banao|bana\s+do|bana\s+de|create\s+karo|make|create)\b/i.test(lower) ||
+      /\b(?:folder|directory)\s+creation\b/i.test(lower) ||
       lower.startsWith('create file') ||
       lower.startsWith('make file') ||
       lower.startsWith('write file') ||
@@ -613,141 +927,435 @@ Output the updated plan in JSON:
   private static generateDeterministicSteps(text: string): { objective: string; steps: PlanStep[] } | null {
     const lower = text.toLowerCase().trim();
 
-    // YouTube in Chrome / Web Browser pattern
-    if (lower.includes('youtube')) {
-      if (lower.includes('search')) {
+    // Folder / Directory Creation Patterns (e.g. "Make a folder on desktop named Jasin-Gia-test")
+    const isFolderCreation =
+      /\b(?:make|create|new|build|generate|add)\b(?:\s+(?:a|an|one|new|another|me|the|[0-9]+))*\s+(?:folder|directory)\b/i.test(lower) ||
+      /\b(?:folder|directory)\b.*\b(?:banao|bana\s+do|bana\s+de|create\s+karo|make|create)\b/i.test(lower) ||
+      /\b(?:folder|directory)\s+creation\b/i.test(lower);
+
+    if (isFolderCreation) {
+      let targetLocation = 'Desktop';
+      if (lower.includes('document')) targetLocation = 'Documents';
+      if (lower.includes('download')) targetLocation = 'Downloads';
+
+      let folderName: string | null = null;
+
+      // Pattern 1: ... named/called/with name "XYZ" or XYZ
+      const namedMatch = text.match(
+        /(?:named|called|with\s+(?:the\s+)?name(?:\s+of)?|naam(?:\s+se|\s+ka)?)\s+["']?([^"'\s.,;]+)["']?/i
+      );
+      if (namedMatch && namedMatch[1] && namedMatch[1].trim().length > 0) {
+        folderName = namedMatch[1].trim();
+      }
+
+      // Pattern 2: create folder XYZ on desktop / make folder XYZ
+      if (!folderName) {
+        const directMatch = text.match(
+          /(?:make|create|new|build)\s+(?:a\s+|an\s+|one\s+|new\s+|another\s+|the\s+)?(?:folder|directory)\s+["']?([^"'\s]+)["']?(?:\s+(?:on|in|at)\s+(?:the\s+)?(?:desktop|downloads|documents))?/i
+        );
+        if (directMatch && directMatch[1]) {
+          const candidate = directMatch[1].trim();
+          const skipWords = ['on', 'in', 'at', 'the', 'desktop', 'documents', 'downloads', 'named', 'called', 'here'];
+          if (!skipWords.includes(candidate.toLowerCase())) {
+            folderName = candidate;
+          }
+        }
+      }
+
+      if (folderName) {
+        folderName = folderName.replace(/[.,!?;]+$/, '').trim();
         return {
-          objective: 'Open Chrome and search YouTube',
+          objective: `Create folder "${folderName}" on ${targetLocation}`,
           steps: [
             {
               step_id: 1,
-              action: 'launch_application',
-              target: 'Google Chrome',
-              description: 'Launch Google Chrome',
-              tool_name: 'launch_application',
-              tool_args: { appName: 'Google Chrome' },
-              risk_level: 'low',
+              action: 'create_directory',
+              target: `${targetLocation}/${folderName}`,
+              description: `Create directory "${folderName}" on ${targetLocation}`,
+              tool_name: 'create_directory',
+              tool_args: { directoryPath: targetLocation, folderName },
+              risk_level: 'medium',
               requires_approval: true,
               depends_on: [],
-              expected_outcome: 'Google Chrome running',
+              expected_outcome: `Directory "${folderName}" created successfully on ${targetLocation}`,
             },
             {
               step_id: 2,
-              action: 'verify_application',
-              target: 'Google Chrome',
-              description: 'Verify Chrome is running',
+              action: 'verify_directory',
+              target: `${targetLocation}/${folderName}`,
+              description: `Verify directory "${folderName}" exists on disk`,
               tool_name: undefined,
-              tool_args: {},
+              tool_args: { directoryPath: targetLocation, folderName },
               risk_level: 'low',
               requires_approval: true,
               depends_on: [1],
-              expected_outcome: 'Chrome process verified',
-            },
-            {
-              step_id: 3,
-              action: 'focus_address_bar',
-              target: 'Google Chrome',
-              description: 'Focus browser window and address bar',
-              tool_name: 'interact_with_application',
-              tool_args: { appName: 'Google Chrome', action: 'activate' },
-              risk_level: 'low',
-              requires_approval: true,
-              depends_on: [2],
-              expected_outcome: 'Browser focused and active',
-            },
-            {
-              step_id: 4,
-              action: 'navigate_browser',
-              target: 'https://www.youtube.com',
-              description: 'Enter YouTube URL and navigate',
-              tool_name: 'navigate_browser',
-              tool_args: { url: 'https://www.youtube.com' },
-              risk_level: 'low',
-              requires_approval: true,
-              depends_on: [3],
-              expected_outcome: 'Navigated to YouTube',
-            },
-            {
-              step_id: 5,
-              action: 'search_browser',
-              target: 'YouTube',
-              description: 'Execute search query on YouTube',
-              tool_name: 'search_browser',
-              tool_args: { query: 'YouTube', engine: 'youtube' },
-              risk_level: 'low',
-              requires_approval: true,
-              depends_on: [4],
-              expected_outcome: 'Search results displayed',
-            },
-            {
-              step_id: 6,
-              action: 'verify_page_loaded',
-              target: 'https://www.youtube.com',
-              description: 'Verify the page loaded successfully',
-              tool_name: undefined,
-              tool_args: {},
-              risk_level: 'low',
-              requires_approval: true,
-              depends_on: [5],
-              expected_outcome: 'Page load verified',
+              expected_outcome: `Directory "${folderName}" verified on filesystem`,
             },
           ],
         };
       }
+    }
 
+    // --- BROWSER AUTOMATION INTENTS ---
+
+    // 1. Browser Tab Actions: New Tab
+    const newTabMatch = lower.match(/^(?:(?:can\s+you\s+|please\s+)?(?:open|create)\s+(?:(?:a|another|the)\s+)?new\s+tab(?:\s+in\s+([a-zA-Z0-9\s]+))?|new\s+tab(?:\s+in\s+([a-zA-Z0-9\s]+))?)$/i);
+    if (newTabMatch) {
+      const rawBrowser = (newTabMatch[1] || newTabMatch[2] || '').trim().toLowerCase();
+      const browser = rawBrowser ? (rawBrowser.includes('brave') ? 'Brave Browser' : 'Google Chrome') : undefined;
       return {
-        objective: 'Open YouTube in Google Chrome',
+        objective: `Open new tab in ${browser || 'browser'}`,
         steps: [
           {
             step_id: 1,
-            action: 'launch_application',
-            target: 'Google Chrome',
-            description: 'Launch Google Chrome',
-            tool_name: 'launch_application',
-            tool_args: { appName: 'Google Chrome' },
+            action: 'open_new_tab',
+            target: browser || 'Browser',
+            description: `Open new tab in ${browser || 'browser'}`,
+            tool_name: 'browser_tab_action',
+            tool_args: { action: 'new_tab', browser },
             risk_level: 'low',
             requires_approval: true,
             depends_on: [],
-            expected_outcome: 'Google Chrome process running and active',
+            expected_outcome: `New tab created in ${browser || 'browser'}`,
           },
           {
             step_id: 2,
-            action: 'wait_for_application',
-            target: 'Google Chrome',
-            description: 'Wait until Google Chrome is ready to accept navigation',
+            action: 'verify_browser',
+            target: browser || 'Browser',
+            description: 'Verify new browser tab',
+            tool_name: undefined,
+            tool_args: { browser },
+            risk_level: 'low',
+            requires_approval: true,
+            depends_on: [1],
+            expected_outcome: 'New tab active',
+          },
+        ],
+      };
+    }
+
+    // 2. Browser Tab Actions: Close Tab
+    const closeTabMatch = lower.match(/^(?:(?:can\s+you\s+|please\s+)?close\s+(?:(?:the|this)\s+)?(?:current\s+|active\s+)?tab(?:\s+in\s+([a-zA-Z0-9\s]+))?)$/i);
+    if (closeTabMatch) {
+      const rawBrowser = (closeTabMatch[1] || '').trim().toLowerCase();
+      const browser = rawBrowser ? (rawBrowser.includes('brave') ? 'Brave Browser' : 'Google Chrome') : undefined;
+      return {
+        objective: `Close active tab in ${browser || 'browser'}`,
+        steps: [
+          {
+            step_id: 1,
+            action: 'close_tab',
+            target: browser || 'Browser',
+            description: `Close active tab in ${browser || 'browser'}`,
+            tool_name: 'browser_tab_action',
+            tool_args: { action: 'close_tab', browser },
+            risk_level: 'low',
+            requires_approval: true,
+            depends_on: [],
+            expected_outcome: 'Active tab closed',
+          },
+          {
+            step_id: 2,
+            action: 'verify_browser',
+            target: browser || 'Browser',
+            description: 'Verify tab closure',
+            tool_name: undefined,
+            tool_args: { browser },
+            risk_level: 'low',
+            requires_approval: true,
+            depends_on: [1],
+            expected_outcome: 'Tab closed successfully',
+          },
+        ],
+      };
+    }
+
+    // 3. Browser History: Back
+    const backMatch = lower.match(/^(?:(?:can\s+you\s+|please\s+)?(?:go\s+back|browser\s+back|back(?:\s+in\s+browser)?))$/i);
+    if (backMatch) {
+      return {
+        objective: 'Navigate back in browser history',
+        steps: [
+          {
+            step_id: 1,
+            action: 'browser_back',
+            target: 'Browser History',
+            description: 'Navigate back in browser history',
+            tool_name: 'browser_tab_action',
+            tool_args: { action: 'back' },
+            risk_level: 'low',
+            requires_approval: true,
+            depends_on: [],
+            expected_outcome: 'Previous page loaded in history',
+          },
+          {
+            step_id: 2,
+            action: 'verify_browser',
+            target: 'Browser History',
+            description: 'Verify navigation back',
             tool_name: undefined,
             tool_args: {},
             risk_level: 'low',
             requires_approval: true,
             depends_on: [1],
-            expected_outcome: 'Google Chrome window initialized',
+            expected_outcome: 'History navigation completed',
           },
+        ],
+      };
+    }
+
+    // 4. Browser History: Forward
+    const forwardMatch = lower.match(/^(?:(?:can\s+you\s+|please\s+)?(?:go\s+forward|browser\s+forward|forward(?:\s+in\s+browser)?))$/i);
+    if (forwardMatch) {
+      return {
+        objective: 'Navigate forward in browser history',
+        steps: [
           {
-            step_id: 3,
-            action: 'navigate_browser',
-            target: 'https://www.youtube.com',
-            description: 'Navigate Chrome to YouTube',
-            tool_name: 'navigate_browser',
-            tool_args: { url: 'https://www.youtube.com' },
+            step_id: 1,
+            action: 'browser_forward',
+            target: 'Browser History',
+            description: 'Navigate forward in browser history',
+            tool_name: 'browser_tab_action',
+            tool_args: { action: 'forward' },
             risk_level: 'low',
             requires_approval: true,
-            depends_on: [2],
-            expected_outcome: 'YouTube homepage loaded in browser tab',
+            depends_on: [],
+            expected_outcome: 'Next page loaded in history',
           },
           {
-            step_id: 4,
+            step_id: 2,
             action: 'verify_browser',
-            target: 'https://www.youtube.com',
-            description: 'Verify YouTube loaded successfully',
+            target: 'Browser History',
+            description: 'Verify navigation forward',
             tool_name: undefined,
             tool_args: {},
             risk_level: 'low',
             requires_approval: true,
-            depends_on: [3],
-            expected_outcome: 'Browser verification complete',
+            depends_on: [1],
+            expected_outcome: 'Forward navigation completed',
           },
         ],
       };
+    }
+
+    // 5. Browser Tab Actions: Refresh / Reload
+    const refreshMatch = lower.match(/^(?:(?:can\s+you\s+|please\s+)?(?:refresh|reload)\s+(?:the\s+|this\s+|current\s+|active\s+)?(?:page|tab|browser|website)(?:\s+in\s+([a-zA-Z0-9\s]+))?|(?:refresh|reload))$/i);
+    if (refreshMatch) {
+      const rawBrowser = (refreshMatch[1] || '').trim().toLowerCase();
+      const browser = rawBrowser ? (rawBrowser.includes('brave') ? 'Brave Browser' : 'Google Chrome') : undefined;
+      return {
+        objective: `Refresh active tab in ${browser || 'browser'}`,
+        steps: [
+          {
+            step_id: 1,
+            action: 'browser_refresh',
+            target: browser || 'Browser',
+            description: `Reload active tab in ${browser || 'browser'}`,
+            tool_name: 'browser_tab_action',
+            tool_args: { action: 'refresh', browser },
+            risk_level: 'low',
+            requires_approval: true,
+            depends_on: [],
+            expected_outcome: 'Active page refreshed',
+          },
+          {
+            step_id: 2,
+            action: 'verify_browser',
+            target: browser || 'Browser',
+            description: 'Verify tab refresh',
+            tool_name: undefined,
+            tool_args: { browser },
+            risk_level: 'low',
+            requires_approval: true,
+            depends_on: [1],
+            expected_outcome: 'Page reloaded successfully',
+          },
+        ],
+      };
+    }
+
+    // 6. Direct Browser Launch (e.g. "Open Chrome", "Launch Brave", "Open Safari", "Open default browser")
+    const browserLaunchMatch = lower.match(
+      /^(?:(?:can\s+you\s+|please\s+)?(?:open|launch|start)\s+(?:the\s+)?(chrome|google\s+chrome|brave|brave\s+browser|safari|default\s+browser))$/i
+    );
+    if (browserLaunchMatch) {
+      const b = browserLaunchMatch[1].toLowerCase();
+      const resolvedBrowser = b.includes('brave')
+        ? 'Brave Browser'
+        : b.includes('safari')
+        ? 'Safari'
+        : 'Google Chrome';
+
+      return {
+        objective: `Launch ${resolvedBrowser}`,
+        steps: [
+          {
+            step_id: 1,
+            action: 'open_browser',
+            target: resolvedBrowser,
+            description: `Launch ${resolvedBrowser} on desktop`,
+            tool_name: 'open_browser',
+            tool_args: { browser: resolvedBrowser },
+            risk_level: 'low',
+            requires_approval: true,
+            depends_on: [],
+            expected_outcome: `${resolvedBrowser} process launched and window active`,
+          },
+          {
+            step_id: 2,
+            action: 'verify_browser',
+            target: resolvedBrowser,
+            description: `Verify ${resolvedBrowser} is running on system`,
+            tool_name: undefined,
+            tool_args: { browser: resolvedBrowser },
+            risk_level: 'low',
+            requires_approval: true,
+            depends_on: [1],
+            expected_outcome: `${resolvedBrowser} running successfully`,
+          },
+        ],
+      };
+    }
+
+    // 7. Web Search / Search in Browser (e.g. "Search React documentation in Chrome", "Search YouTube in Chrome", "Search React hooks in Brave", "Search React documentation")
+    const searchInBrowserMatch = text.match(
+      /^(?:(?:can\s+you\s+|please\s+)?search\s+(?:for\s+)?(.+?)\s+(?:in|on|with|using)\s+(chrome|google\s+chrome|brave|brave\s+browser|safari|default\s+browser|browser))$/i
+    );
+    const inBrowserSearchMatch = text.match(
+      /^(?:(?:in|on)\s+(chrome|google\s+chrome|brave|brave\s+browser|safari)\s+search\s+(?:for\s+)?(.+))$/i
+    );
+    const generalSearchMatch = text.match(
+      /^(?:(?:can\s+you\s+|please\s+)?search\s+(?:for\s+|the\s+web\s+for\s+)?(.+))$/i
+    );
+
+    if (searchInBrowserMatch || inBrowserSearchMatch || generalSearchMatch) {
+      let query = '';
+      let targetBrowser: string | undefined = undefined;
+
+      if (searchInBrowserMatch) {
+        query = searchInBrowserMatch[1].trim();
+        const b = searchInBrowserMatch[2].toLowerCase();
+        if (b.includes('brave')) targetBrowser = 'Brave Browser';
+        else if (b.includes('chrome')) targetBrowser = 'Google Chrome';
+        else if (b.includes('safari')) targetBrowser = 'Safari';
+      } else if (inBrowserSearchMatch) {
+        const b = inBrowserSearchMatch[1].toLowerCase();
+        if (b.includes('brave')) targetBrowser = 'Brave Browser';
+        else if (b.includes('chrome')) targetBrowser = 'Google Chrome';
+        else if (b.includes('safari')) targetBrowser = 'Safari';
+        query = inBrowserSearchMatch[2].trim();
+      } else if (generalSearchMatch) {
+        query = generalSearchMatch[1].trim();
+      }
+
+      if (
+        query &&
+        !query.toLowerCase().startsWith('file') &&
+        !query.toLowerCase().startsWith('directory') &&
+        query.toLowerCase() !== 'something' &&
+        query.toLowerCase() !== 'something on the internet'
+      ) {
+        const browserLabel = targetBrowser || 'default browser';
+        return {
+          objective: `Search "${query}" on ${browserLabel}`,
+          steps: [
+            {
+              step_id: 1,
+              action: targetBrowser ? 'search_in_browser' : 'search_web',
+              target: query,
+              description: `Search for "${query}" on web browser${targetBrowser ? ` using ${targetBrowser}` : ''}`,
+              tool_name: 'search_browser',
+              tool_args: { query, engine: 'google', browser: targetBrowser },
+              risk_level: 'low',
+              requires_approval: true,
+              depends_on: [],
+              expected_outcome: `Web browser navigated to search results for "${query}"`,
+            },
+            {
+              step_id: 2,
+              action: 'verify_browser',
+              target: query,
+              description: `Verify browser search for "${query}"`,
+              tool_name: undefined,
+              tool_args: { query, browser: targetBrowser },
+              risk_level: 'low',
+              requires_approval: true,
+              depends_on: [1],
+              expected_outcome: 'Search results displayed in browser',
+            },
+          ],
+        };
+      }
+    }
+
+    // 8. Direct URL Navigation / Website Opening (e.g. "Open github.com in Brave", "Open github.com", "Open YouTube")
+    const openUrlInBrowserMatch = text.match(
+      /^(?:(?:can\s+you\s+|please\s+)?(?:open|navigate\s+to|visit)\s+(?:the\s+)?(?:website\s+|url\s+|link\s+)?([a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\/[^\s]*)?|https?:\/\/[^\s]+)\s+(?:in|on|with)\s+(chrome|google\s+chrome|brave|brave\s+browser|safari|browser))$/i
+    );
+    const directUrlMatch = text.match(
+      /^(?:(?:can\s+you\s+|please\s+)?(?:open|navigate\s+to|visit)\s+(?:the\s+)?(?:website\s+|url\s+|link\s+)?([a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\/[^\s]*)?|https?:\/\/[^\s]+))$/i
+    );
+    const knownWebsiteMatch = lower.match(
+      /^(?:(?:can\s+you\s+|please\s+)?(?:open|navigate\s+to|visit)\s+(youtube|reddit|twitter|github|google|facebook|wikipedia)(?:\s+(?:in|on)\s+(chrome|google\s+chrome|brave|brave\s+browser|safari|browser))?)$/i
+    );
+
+    if (openUrlInBrowserMatch || directUrlMatch || knownWebsiteMatch) {
+      let rawUrl = '';
+      let targetBrowser: string | undefined = undefined;
+
+      if (openUrlInBrowserMatch) {
+        rawUrl = openUrlInBrowserMatch[1].trim();
+        const b = openUrlInBrowserMatch[2].toLowerCase();
+        if (b.includes('brave')) targetBrowser = 'Brave Browser';
+        else if (b.includes('chrome')) targetBrowser = 'Google Chrome';
+        else if (b.includes('safari')) targetBrowser = 'Safari';
+      } else if (directUrlMatch) {
+        rawUrl = directUrlMatch[1].trim();
+      } else if (knownWebsiteMatch) {
+        const site = knownWebsiteMatch[1].toLowerCase();
+        rawUrl = `https://www.${site}.com`;
+        const b = (knownWebsiteMatch[2] || '').toLowerCase();
+        if (b.includes('brave')) targetBrowser = 'Brave Browser';
+        else if (b.includes('chrome')) targetBrowser = 'Google Chrome';
+        else if (b.includes('safari')) targetBrowser = 'Safari';
+      }
+
+      if (rawUrl) {
+        const cleanUrl = rawUrl.startsWith('http://') || rawUrl.startsWith('https://')
+          ? rawUrl
+          : `https://${rawUrl}`;
+        const browserLabel = targetBrowser || 'browser';
+
+        return {
+          objective: `Open ${cleanUrl} in ${browserLabel}`,
+          steps: [
+            {
+              step_id: 1,
+              action: targetBrowser ? 'navigate_url' : 'open_website',
+              target: cleanUrl,
+              description: `Navigate ${browserLabel} to ${cleanUrl}`,
+              tool_name: 'navigate_browser',
+              tool_args: { url: cleanUrl, browser: targetBrowser },
+              risk_level: 'low',
+              requires_approval: true,
+              depends_on: [],
+              expected_outcome: `Navigated to ${cleanUrl}`,
+            },
+            {
+              step_id: 2,
+              action: 'verify_browser',
+              target: cleanUrl,
+              description: `Verify ${cleanUrl} loaded in browser`,
+              tool_name: undefined,
+              tool_args: { url: cleanUrl, browser: targetBrowser },
+              risk_level: 'low',
+              requires_approval: true,
+              depends_on: [1],
+              expected_outcome: 'Page load verified',
+            },
+          ],
+        };
+      }
     }
 
     // Single Application Launch (e.g. "Open Chrome", "Launch Terminal", "Open Spotify", "Open Calculator")
@@ -787,24 +1395,102 @@ Output the updated plan in JSON:
       }
     }
 
-    // VS Code Launch
+    // VS Code Launch / Open Folder in VS Code
     if (lower.includes('vs code') || lower.includes('vscode')) {
-      const isProjectExplicit = lower.includes('folder') || lower.includes('project') || lower.includes('workspace');
+      // Extract requested folder/project name dynamically from instruction
+      let requestedFolder: string | null = null;
+
+      // Pattern A: Quoted name: folder "New Go" / project "XYZ"
+      const quoteMatch = text.match(/(?:folder|project|workspace|directory)\s+["']([^"']+)["']/i);
+      if (quoteMatch) {
+        requestedFolder = quoteMatch[1].trim();
+      }
+
+      // Pattern B: Named/called: folder named XYZ / called XYZ
+      if (!requestedFolder) {
+        const namedMatch = text.match(
+          /(?:folder|project|workspace|directory)\s+(?:named|called|with\s+(?:the\s+)?name(?:\s+of)?)\s+["']?([^"'\s.,;]+)["']?/i
+        );
+        if (namedMatch) {
+          requestedFolder = namedMatch[1].trim();
+        }
+      }
+
+      // Pattern C: "open [the] folder [XYZ] [present on desktop] in/with VS Code"
+      if (!requestedFolder) {
+        const openFolderMatch = text.match(
+          /open\s+(?:the\s+)?(?:folder|project|workspace|directory)\s+["']?([^"'\r\n]+?)["']?(?:\s+(?:present\s+on|on|in|at)\s+(?:the\s+)?(?:desktop|downloads|documents))?\s+(?:in|with)\s+(?:vs\s*code|vscode|visual\s+studio\s+code)/i
+        );
+        if (openFolderMatch) {
+          const candidate = openFolderMatch[1].trim();
+          const skipWords = ['a', 'the', 'one', 'this', 'that', 'it', 'desktop', 'downloads', 'documents'];
+          if (
+            !skipWords.includes(candidate.toLowerCase()) &&
+            !candidate.toLowerCase().startsWith('on ') &&
+            !candidate.toLowerCase().startsWith('in ')
+          ) {
+            requestedFolder = candidate;
+          }
+        }
+      }
+
+      // Pattern D: "open XYZ folder in vs code"
+      if (!requestedFolder) {
+        const folderWordMatch = text.match(
+          /open\s+["']?([^"'\r\n]+?)["']?\s+(?:folder|project|workspace|directory)\s+(?:in|with)\s+(?:vs\s*code|vscode|visual\s+studio\s+code)/i
+        );
+        if (folderWordMatch) {
+          const candidate = folderWordMatch[1].trim();
+          const skipWords = ['a', 'the', 'one', 'this', 'that', 'it', 'desktop', 'downloads', 'documents'];
+          if (!skipWords.includes(candidate.toLowerCase())) {
+            requestedFolder = candidate;
+          }
+        }
+      }
+
+      // Pattern E: "open XYZ in vs code"
+      if (!requestedFolder) {
+        const openInMatch = text.match(
+          /open\s+["']?([^"'\r\n]+?)["']?\s+(?:in|with)\s+(?:vs\s*code|vscode|visual\s+studio\s+code)/i
+        );
+        if (openInMatch) {
+          let candidate = openInMatch[1]
+            .replace(/^(?:the\s+)?(?:folder|project|workspace|directory)\s+/i, '')
+            .trim();
+          candidate = candidate
+            .replace(/^(?:present\s+on|on|in|at)\s+(?:the\s+)?(?:desktop|downloads|documents)\s+/i, '')
+            .trim();
+          const skipWords = [
+            'a', 'the', 'one', 'this', 'that', 'it', 'desktop', 'downloads', 'documents', 'code', 'vscode'
+          ];
+          if (candidate && !skipWords.includes(candidate.toLowerCase())) {
+            requestedFolder = candidate;
+          }
+        }
+      }
+
+      const isProjectExplicit =
+        Boolean(requestedFolder) ||
+        lower.includes('folder') ||
+        lower.includes('project') ||
+        lower.includes('workspace');
+
       if (isProjectExplicit) {
+        const targetFolder = requestedFolder || 'GIA-AI';
         return {
-          objective: 'Open project in Visual Studio Code',
+          objective: `Open "${targetFolder}" in Visual Studio Code`,
           steps: [
             {
               step_id: 1,
               action: 'launch_application',
               target: 'Visual Studio Code',
-              description: 'Open GIA-AI workspace in Visual Studio Code',
+              description: `Open "${targetFolder}" folder in Visual Studio Code`,
               tool_name: 'open_folder_in_vscode',
-              tool_args: { folderName: 'GIA-AI' },
+              tool_args: { folderName: targetFolder },
               risk_level: 'medium',
               requires_approval: true,
               depends_on: [],
-              expected_outcome: 'Visual Studio Code workspace opened with GIA-AI',
+              expected_outcome: `Visual Studio Code workspace opened with "${targetFolder}"`,
             },
             {
               step_id: 2,

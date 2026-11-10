@@ -5,6 +5,7 @@ import os from 'os';
 import { ToolDefinition } from './tool.interface.js';
 import { MemoryService } from '../../memories/services/memory.service.js';
 import { DocumentService } from '../../documents/services/document.service.js';
+import { BrowserAutomationService } from './browser.service.js';
 
 // Configurable workspace root. Override via GIA_WORKSPACE_DIR env var.
 // Defaults to ~/Desktop — works on Linux/macOS without hardcoding a username.
@@ -117,6 +118,37 @@ function resolveProjectFolder(baseDir: string, folderName: string): ResolutionRe
 
   scan(homeDir, 1);
 
+  // If no match was found with direct substring, attempt compact and phonetic match (e.g. "New Go" -> "NeuGo")
+  if (matches.length === 0) {
+    const phonSearch = folderName.toLowerCase().replace(/[-_\s]/g, '').replace(/w/g, 'u').replace(/ph/g, 'f');
+    const compactSearch = folderName.toLowerCase().replace(/[-_\s]/g, '');
+
+    function scanFuzzy(dir: string, depth: number) {
+      if (depth > 3) return;
+      try {
+        const entries = fs.readdirSync(dir);
+        for (const entry of entries) {
+          if (entry.startsWith('.') && entry !== '.env') continue;
+          if (skipFolders.has(entry)) continue;
+          const fullPath = path.join(dir, entry);
+          try {
+            const stat = fs.statSync(fullPath);
+            if (stat.isDirectory()) {
+              const compactEntry = entry.toLowerCase().replace(/[-_\s]/g, '');
+              const phonEntry = compactEntry.replace(/w/g, 'u').replace(/ph/g, 'f');
+              if (phonEntry === phonSearch || compactEntry === compactSearch || compactEntry.includes(compactSearch)) {
+                matches.push(fullPath);
+              }
+              scanFuzzy(fullPath, depth + 1);
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    scanFuzzy(homeDir, 1);
+  }
+
   if (matches.length === 0) {
     return {
       success: false,
@@ -209,11 +241,12 @@ registry.register({
 // --- 4. open_url ---
 registry.register({
   name: 'open_url',
-  description: 'Opens a specified web browser URL using default handler.',
+  description: 'Opens a specified web browser URL using default handler or browser automation.',
   inputSchema: z.object({
     url: z.string().optional(),
     link: z.string().optional(),
     target: z.string().optional(),
+    browser: z.string().optional(),
   }).refine((data) => {
     const u = (data.url || data.link || data.target || '').trim();
     if (!u) return false;
@@ -230,21 +263,17 @@ registry.register({
   permissions: ['open:apps'],
   riskLevel: 'low',
   operationType: 'execute',
-  timeoutMs: 5000,
+  timeoutMs: 8000,
   async execute(args) {
     const rawUrl = (args.url || args.link || args.target || '').trim();
-    const cleanUrl = rawUrl.startsWith('http://') || rawUrl.startsWith('https://') ? rawUrl : `https://${rawUrl}`;
-
-    return new Promise((resolve, reject) => {
-      import('child_process').then(({ spawn }) => {
-        const isMac = process.platform === 'darwin';
-        const child = isMac ? spawn('open', [cleanUrl]) : spawn('xdg-open', [cleanUrl]);
-        child.on('error', (err) => {
-          reject(new Error(`Failed to open URL: ${err.message}`));
-        });
-        resolve({ success: true, openedUrl: cleanUrl });
-      }).catch(reject);
-    });
+    const res = await BrowserAutomationService.navigateUrl(rawUrl, args.browser, false);
+    return { success: true, openedUrl: res.url, browser: res.browser, message: res.message };
+  },
+  async verify(args, result) {
+    return {
+      verified: Boolean(result && result.success),
+      message: result?.message || 'URL opened successfully.',
+    };
   },
 });
 
@@ -388,9 +417,10 @@ registry.register({
 });
 
 // Helper to safely expand tilde and resolve against user's home directory, tmp, or Applications
-function resolveSafePath(inputPath: string, allowApplications = false): { success: true; path: string } | { success: false; error: string } {
+export function resolveSafePath(inputPath: string, allowApplications = false): { success: true; path: string } | { success: false; error: string } {
   const homeDir = os.homedir();
   const tmpDir = os.tmpdir();
+  const customDesktop = process.env.GIA_DESKTOP_DIR ? path.resolve(process.env.GIA_DESKTOP_DIR) : null;
   let cleanPath = inputPath.trim();
   if (cleanPath.startsWith('~')) {
     cleanPath = path.join(homeDir, cleanPath.slice(1));
@@ -399,11 +429,86 @@ function resolveSafePath(inputPath: string, allowApplications = false): { succes
   const isInsideHome = resolved.startsWith(homeDir);
   const isInsideTmp = resolved.startsWith(tmpDir) || resolved.startsWith('/tmp') || resolved.startsWith('/var/folders');
   const isInsideApps = allowApplications && (resolved.startsWith('/Applications') || resolved.startsWith('/System/Applications'));
+  const isInsideCustomDesktop = customDesktop && (resolved.startsWith(customDesktop) || cleanPath.startsWith(customDesktop));
 
-  if (!isInsideHome && !isInsideApps && !isInsideTmp) {
+  if (!isInsideHome && !isInsideApps && !isInsideTmp && !isInsideCustomDesktop) {
     return { success: false, error: 'Access denied: Path is outside permitted user boundaries.' };
   }
   return { success: true, path: resolved };
+}
+
+// Helper to resolve directory paths safely with support for Desktop, Documents, Downloads, and GIA_DESKTOP_DIR
+export function resolveTargetDirectory(
+  baseDir?: string,
+  folderName?: string
+): { success: true; path: string; name: string } | { success: false; error: string } {
+  const customDesktop = process.env.GIA_DESKTOP_DIR ? path.resolve(process.env.GIA_DESKTOP_DIR) : null;
+  const desktopDir = customDesktop || path.join(os.homedir(), 'Desktop');
+
+  let targetBase = (baseDir || 'Desktop').trim();
+  const lowerBase = targetBase.toLowerCase();
+
+  if (['desktop', '~/desktop', '~/Desktop'].includes(targetBase) || lowerBase === 'desktop') {
+    targetBase = desktopDir;
+  } else if (['documents', '~/documents', '~/Documents'].includes(targetBase) || lowerBase === 'documents') {
+    targetBase = path.join(os.homedir(), 'Documents');
+  } else if (['downloads', '~/downloads', '~/Downloads'].includes(targetBase) || lowerBase === 'downloads') {
+    targetBase = path.join(os.homedir(), 'Downloads');
+  } else if (targetBase.startsWith('~/')) {
+    targetBase = path.join(os.homedir(), targetBase.slice(2));
+  } else if (targetBase.startsWith('Desktop/')) {
+    targetBase = path.join(desktopDir, targetBase.slice('Desktop/'.length));
+  }
+
+  let finalPath: string;
+  let finalFolderName: string;
+
+  if (folderName !== undefined) {
+    const rawName = folderName.trim();
+    if (rawName.length === 0 || /^[\s.]+$/.test(rawName)) {
+      return {
+        success: false,
+        error: `Invalid folder name: "${folderName}". Name cannot be empty or pure whitespace/dots.`,
+      };
+    }
+    // Validate folder name against forbidden characters
+    if (/[/\0\\:]/.test(rawName) || rawName === '.' || rawName === '..' || rawName.includes('..')) {
+      return {
+        success: false,
+        error: `Invalid folder name: "${rawName}". Name must not contain slashes, colons, null bytes, or traversal sequences.`,
+      };
+    }
+    finalFolderName = rawName;
+    finalPath = path.resolve(targetBase, rawName);
+  } else {
+    finalPath = path.resolve(targetBase);
+    finalFolderName = path.basename(finalPath);
+    if (!finalFolderName || finalFolderName === '.' || finalFolderName === '/' || finalFolderName === '\\') {
+      return { success: false, error: 'Folder name cannot be empty.' };
+    }
+    if (/[/\0\\:]/.test(finalFolderName) || finalFolderName === '..' || finalFolderName.includes('..')) {
+      return {
+        success: false,
+        error: `Invalid folder name: "${finalFolderName}". Name must not contain slashes, colons, null bytes, or traversal sequences.`,
+      };
+    }
+  }
+
+  // Safety boundary check
+  const homeDir = os.homedir();
+  const tmpDir = os.tmpdir();
+  const isInsideHome = finalPath.startsWith(homeDir);
+  const isInsideTmp = finalPath.startsWith(tmpDir) || finalPath.startsWith('/tmp') || finalPath.startsWith('/var/folders');
+  const isInsideCustomDesktop = customDesktop && finalPath.startsWith(customDesktop);
+
+  if (!isInsideHome && !isInsideTmp && !isInsideCustomDesktop) {
+    return {
+      success: false,
+      error: `Access denied: Directory path "${finalPath}" is outside permitted user boundaries.`,
+    };
+  }
+
+  return { success: true, path: finalPath, name: finalFolderName };
 }
 
 // Known macOS app names mapping for common colloquial references
@@ -995,6 +1100,38 @@ registry.register({
   },
 });
 
+// --- Tool 2b: open_browser ---
+registry.register({
+  name: 'open_browser',
+  description: 'Launches or activates a specified web browser (e.g. Google Chrome, Brave Browser, Safari, or system default) on macOS.',
+  inputSchema: z.object({
+    browser: z.string().optional(),
+    appName: z.string().optional(),
+    app: z.string().optional(),
+    name: z.string().optional(),
+  }),
+  permissions: ['open:apps'],
+  riskLevel: 'low',
+  operationType: 'execute',
+  timeoutMs: 8000,
+  async execute(args) {
+    const targetBrowser = args.browser || args.appName || args.app || args.name;
+    const res = await BrowserAutomationService.openBrowser(targetBrowser);
+    return res;
+  },
+  async verify(args) {
+    const targetBrowser = args.browser || args.appName || args.app || args.name;
+    const info = BrowserAutomationService.resolveBrowser(targetBrowser);
+    const isRunning = await BrowserAutomationService.isBrowserRunning(info.appName);
+    return {
+      verified: isRunning,
+      message: isRunning
+        ? `Verified ${info.appName} is running.`
+        : `Verification failed: ${info.appName} is not running.`,
+    };
+  },
+});
+
 // --- Tool 3: navigate_browser ---
 registry.register({
   name: 'navigate_browser',
@@ -1003,6 +1140,8 @@ registry.register({
     url: z.string().optional(),
     link: z.string().optional(),
     target: z.string().optional(),
+    browser: z.string().optional(),
+    newTab: z.boolean().optional(),
   }).refine((data) => {
     const u = (data.url || data.link || data.target || '').trim();
     if (!u) return false;
@@ -1022,29 +1161,16 @@ registry.register({
   timeoutMs: 8000,
   async execute(args) {
     const rawUrl = (args.url || args.link || args.target || '').trim();
-    const cleanUrl = rawUrl.startsWith('http://') || rawUrl.startsWith('https://') ? rawUrl : `https://${rawUrl}`;
-
-    const { spawn } = await import('child_process');
-    const isMac = process.platform === 'darwin';
-
-    return new Promise((resolve, reject) => {
-      const child = isMac ? spawn('open', [cleanUrl]) : spawn('xdg-open', [cleanUrl]);
-      child.on('error', (err) => reject(new Error(`Failed to navigate to URL: ${err.message}`)));
-      child.on('exit', (code) => {
-        if (code !== 0) {
-          reject(new Error(`Browser navigation failed with exit code ${code}`));
-        } else {
-          resolve({ success: true, navigatedUrl: cleanUrl, message: `Navigated browser to ${cleanUrl}` });
-        }
-      });
-    });
+    const res = await BrowserAutomationService.navigateUrl(rawUrl, args.browser, args.newTab);
+    return res;
   },
-  async verify(args) {
+  async verify(args, result) {
     const rawUrl = (args.url || args.link || args.target || '').trim();
     const isValid = rawUrl.length > 0;
+    const verified = Boolean(isValid && result?.success);
     return {
-      verified: isValid,
-      message: isValid ? `Browser successfully navigated to ${rawUrl}` : 'Invalid URL protocol',
+      verified,
+      message: verified ? `Browser successfully navigated to ${rawUrl}` : 'Browser navigation verification failed',
     };
   },
 });
@@ -1052,52 +1178,51 @@ registry.register({
 // --- Tool 4: search_browser ---
 registry.register({
   name: 'search_browser',
-  description: 'Performs a search query across major search engines (Google, YouTube, GitHub, DuckDuckGo) with verification.',
+  description: 'Performs a search query across major search engines (Google, YouTube, GitHub, DuckDuckGo) with desktop browser automation and verification.',
   inputSchema: z.object({
     query: z.string().min(1, 'Search query must not be empty'),
     engine: z.enum(['google', 'youtube', 'github', 'duckduckgo']).optional().default('google'),
+    browser: z.string().optional(),
   }),
   permissions: ['open:apps'],
   riskLevel: 'low',
   operationType: 'execute',
   timeoutMs: 8000,
   async execute(args) {
-    const encoded = encodeURIComponent(args.query.trim());
-    let searchUrl = `https://www.google.com/search?q=${encoded}`;
-
-    if (args.engine === 'youtube') {
-      searchUrl = `https://www.youtube.com/results?search_query=${encoded}`;
-    } else if (args.engine === 'github') {
-      searchUrl = `https://github.com/search?q=${encoded}`;
-    } else if (args.engine === 'duckduckgo') {
-      searchUrl = `https://duckduckgo.com/?q=${encoded}`;
-    }
-
-    const { spawn } = await import('child_process');
-    const isMac = process.platform === 'darwin';
-
-    return new Promise((resolve, reject) => {
-      const child = isMac ? spawn('open', [searchUrl]) : spawn('xdg-open', [searchUrl]);
-      child.on('error', (err) => reject(new Error(`Failed to search: ${err.message}`)));
-      child.on('exit', (code) => {
-        if (code !== 0) {
-          reject(new Error(`Search navigation failed with exit code ${code}`));
-        } else {
-          resolve({
-            success: true,
-            engine: args.engine || 'google',
-            query: args.query,
-            searchUrl,
-            message: `Searched for "${args.query}" on ${args.engine || 'google'}.`,
-          });
-        }
-      });
-    });
+    const res = await BrowserAutomationService.searchWeb(args.query, args.browser, args.engine);
+    return res;
   },
   async verify(args, result) {
+    const verified = Boolean(result && result.success && result.searchUrl);
     return {
-      verified: Boolean(result && result.searchUrl),
-      message: `Verified browser search query opened for "${args.query}"`,
+      verified,
+      message: verified ? `Verified browser search query opened for "${args.query}" on ${args.engine || 'google'}` : 'Search verification failed',
+    };
+  },
+});
+
+// --- Tool 4b: browser_tab_action ---
+registry.register({
+  name: 'browser_tab_action',
+  description: 'Controls desktop browser tabs (new_tab, close_tab, back, forward, refresh) with verification.',
+  inputSchema: z.object({
+    action: z.enum(['new_tab', 'close_tab', 'back', 'forward', 'refresh']),
+    browser: z.string().optional(),
+    url: z.string().optional(),
+  }),
+  permissions: ['open:apps'],
+  riskLevel: 'low',
+  operationType: 'execute',
+  timeoutMs: 8000,
+  async execute(args) {
+    const res = await BrowserAutomationService.tabAction(args.action, args.browser, args.url);
+    return res;
+  },
+  async verify(args, result) {
+    const verified = Boolean(result && result.success);
+    return {
+      verified,
+      message: verified ? `Tab action "${args.action}" verified.` : `Tab action "${args.action}" failed.`,
     };
   },
 });
@@ -1349,6 +1474,78 @@ registry.register({
       message: isDir ? `Verified directory "${path.basename(resolution.path)}" exists.` : 'Target is not a valid directory.',
     };
   },
+});
+
+// --- Tool 9b: create_directory ---
+const createDirectoryToolDefinition: ToolDefinition<any, any> = {
+  name: 'create_directory',
+  description: 'Creates a new directory/folder at a specified location on the system (e.g. Desktop, Documents) with verification.',
+  inputSchema: z.object({
+    directoryPath: z.string().optional().default('Desktop'),
+    folderName: z.string().optional(),
+  }),
+  permissions: ['write:files'],
+  riskLevel: 'medium',
+  operationType: 'mutate',
+  timeoutMs: 5000,
+  async execute(args) {
+    const resolution = resolveTargetDirectory(args.directoryPath, args.folderName);
+    if (!resolution.success) {
+      throw new Error(resolution.error);
+    }
+    const targetPath = resolution.path;
+
+    // Check if target directory already exists
+    if (fs.existsSync(targetPath)) {
+      throw new Error(`Directory already exists: "${targetPath}". Cannot create duplicate folder.`);
+    }
+
+    // Check parent directory existence
+    const parentDir = path.dirname(targetPath);
+    if (!fs.existsSync(parentDir)) {
+      throw new Error(`Parent directory does not exist: "${parentDir}". Cannot create folder.`);
+    }
+
+    // Native filesystem directory creation
+    fs.mkdirSync(targetPath, { recursive: false, mode: 0o755 });
+
+    // Immediate post-creation verification
+    if (!fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
+      throw new Error(`Directory creation verification failed: Folder does not exist on disk at "${targetPath}".`);
+    }
+
+    return {
+      success: true,
+      action: 'create_directory',
+      path: targetPath,
+      directory: targetPath,
+      folderName: resolution.name,
+      verified: true,
+      message: `Created directory "${resolution.name}" successfully at "${targetPath}".`,
+    };
+  },
+  async verify(args) {
+    const resolution = resolveTargetDirectory(args.directoryPath, args.folderName);
+    if (!resolution.success) {
+      return { verified: false, message: resolution.error };
+    }
+    const exists = fs.existsSync(resolution.path) && fs.statSync(resolution.path).isDirectory();
+    return {
+      verified: exists,
+      message: exists
+        ? `Verified directory "${resolution.name}" exists on disk at "${resolution.path}".`
+        : `Directory "${resolution.path}" was not found on disk after creation.`,
+    };
+  },
+};
+
+registry.register(createDirectoryToolDefinition);
+
+// Alias: create_folder
+registry.register({
+  ...createDirectoryToolDefinition,
+  name: 'create_folder',
+  description: 'Alias for create_directory. Creates a new folder on Desktop or workspace with verification.',
 });
 
 // --- Tool 10: execute_terminal_command ---

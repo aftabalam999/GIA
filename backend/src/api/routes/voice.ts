@@ -1,8 +1,7 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { authenticate } from '../middleware/auth.js';
 import { aiServiceClient } from '../../ai/ml-client/ai-service.client.js';
-import { AgentOrchestrator } from '../../ai/orchestrator/orchestrator.js';
-import { NormalizedUserInput } from '../../ai/orchestrator/input.model.js';
+import { ConversationOrchestrator } from '../../ai/orchestrator/conversation-orchestrator.service.js';
 import { WakeWordDetector } from '../../shared/wakeword.js';
 import { MessageRepository } from '../../database/repositories/message.repository.js';
 import {
@@ -217,6 +216,8 @@ export async function voiceRoutes(fastify: FastifyInstance) {
       const synthesizeRequested =
         fields?.synthesize?.value === 'true' || (request.query as any)?.synthesize === 'true';
 
+      let commandText = fullTranscript;
+
       if (requireWakeWord) {
         const wakeResult = WakeWordDetector.detect(fullTranscript);
         if (!wakeResult.detected || !wakeResult.isAuthorized) {
@@ -268,53 +269,27 @@ export async function voiceRoutes(fastify: FastifyInstance) {
             audioBase64: ttsAudioBase64,
           });
         }
+
+        commandText = wakeResult.command;
       }
 
-      // 2. Build NormalizedUserInput structure for voice
-      const normalizedVoiceInput: NormalizedUserInput = {
-        inputType: 'voice',
-        content: fullTranscript,
-        userId,
+      // 2. Delegate to the unified Conversation Orchestrator
+      // Enforces identical intent classification, pending plan continuity, tool execution, and verification.
+      const result = await ConversationOrchestrator.processUserMessage({
         conversationId,
-        requestId,
-        timestamp: new Date().toISOString(),
-        metadata: {
-          voice: {
-            duration: transcription.duration,
-            confidence: transcription.confidence,
-            language: transcription.language,
-            processingTime: transcription.processing_time,
-            audioFilename: filePart.filename || 'audio.wav',
-            segmentsCount: transcription.segments.length,
-          },
+        userId,
+        content: commandText,
+        inputType: 'voice',
+        options: {
+          requestId,
+          correlationId,
+          synthesize: synthesizeRequested,
         },
-      };
+      });
 
-      // 3. Delegate to the unified AI Orchestrator
-      const result = await AgentOrchestrator.run(userId, conversationId, normalizedVoiceInput, { requestId });
-
-      // 4. Optionally synthesize TTS audio for assistant response if requested
-      let ttsAudioBase64: string | undefined = undefined;
-
-      if (synthesizeRequested && result.assistantMessage?.content) {
-        try {
-          const audioBuffer = await aiServiceClient.synthesize(result.assistantMessage.content, undefined, undefined, {
-            requestId,
-            correlationId,
-          });
-          ttsAudioBase64 = audioBuffer.toString('base64');
-        } catch {
-          // Keep response intact if optional synthesis fails
-        }
-      }
-
-      return reply.status(200).send({
-        success: true,
-        userMessage: result.userMessage,
-        assistantMessage: result.assistantMessage,
-        runId: result.runId,
+      return reply.status(result.success ? 200 : 400).send({
+        ...result,
         transcription,
-        audioBase64: ttsAudioBase64,
       });
     } catch (err: any) {
       if (err instanceof AIServiceUnavailableError) {

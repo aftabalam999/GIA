@@ -1,11 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import * as api from './services/api.js';
-import { VoiceStateMachine, VoiceState } from './services/voiceStateMachine.js';
+import { VoiceStateMachine, VoiceState, cleanSpokenText } from './services/voiceStateMachine.js';
 import { DesktopAudioPlayer, PlaybackState } from './services/desktopAudioPlayer.js';
 import { AudioRecorderService } from './services/audioRecorder.js';
 import { MicTestModal } from './components/MicTestModal.js';
 import { PlanCard } from './components/PlanCard.js';
-import { requestNativeMicrophonePermission } from './services/tauriMicrophone.js';
 import { getServiceStatuses, restartService, ServiceStatus } from './services/tauriServices.js';
 import './App.css';
 
@@ -52,9 +51,42 @@ export default function App() {
   const [voiceState, setVoiceState] = useState<VoiceState>('IDLE');
   const [playbackState, setPlaybackState] = useState<PlaybackState>('STOPPED');
   const [isVoiceModeActive, setIsVoiceModeActive] = useState<boolean>(false);
+  const [isAudioOutputEnabled, setIsAudioOutputEnabled] = useState<boolean>(true); // Voice spoken by default
+  const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
   const voiceMachineRef = useRef<VoiceStateMachine | null>(null);
   const audioPlayerRef = useRef<DesktopAudioPlayer | null>(null);
   const audioRecorderRef = useRef<AudioRecorderService | null>(null);
+
+  async function playAssistantSpeech(messageId: string, textToSpeak: string) {
+    if (!token || !textToSpeak || !audioPlayerRef.current) return;
+    try {
+      setPlayingMessageId(messageId);
+      await audioPlayerRef.current.ensureUnlocked();
+      const cleaned = cleanSpokenText(textToSpeak);
+      if (!cleaned) return;
+      const audioBuffer = await api.synthesizeSpeech(token, cleaned);
+      await audioPlayerRef.current.play(audioBuffer);
+    } catch (err: any) {
+      console.warn('[DesktopAudioPlayer] Playback failed:', err);
+    } finally {
+      setPlayingMessageId((curr) => (curr === messageId ? null : curr));
+    }
+  }
+
+  function stopAssistantSpeech() {
+    audioPlayerRef.current?.stop();
+    setPlayingMessageId(null);
+  }
+
+  function toggleAudioOutput() {
+    if (isAudioOutputEnabled) {
+      stopAssistantSpeech();
+      setIsAudioOutputEnabled(false);
+    } else {
+      audioPlayerRef.current?.ensureUnlocked().catch(() => {});
+      setIsAudioOutputEnabled(true);
+    }
+  }
 
   useEffect(() => {
     const player = new DesktopAudioPlayer({
@@ -98,62 +130,37 @@ export default function App() {
       fetchChatApi: async (convoId, txt) => {
         if (!token) return Promise.reject('No token');
         const trimmed = txt.trim();
-        const lower = trimmed.toLowerCase();
-
-        // Voice Approval Gate for Active Pending Plans
-        const currentPlan = activePlanRef.current;
-        if (currentPlan && (currentPlan.status === 'awaiting_approval' || currentPlan.status === 'pending')) {
-          if (/^(?:yes|y|proceed|approve|approved|go ahead|looks good|execute|run plan|confirm|do it|haan|karo|theek hai|sahi hai|gia,?\s*(?:approve|proceed|execute|karo))\b/i.test(lower)) {
-            const vRes = await api.sendVoicePlanCommand(token, convoId, trimmed, false);
-            if (vRes.success) {
-              setActivePlan(vRes.plan);
-              setActiveTicket(vRes.ticket);
-              const tTok = vRes.ticket?.ticketToken || vRes.ticket?.ticketId || vRes.ticket?.ticket_token;
-              if (tTok) {
-                await handleExecutePlan(vRes.plan.id, vRes.plan.version, tTok);
-              }
-              return { role: 'assistant', content: 'Plan approved and executed successfully.' };
-            }
-          }
-
-          if (/^(?:no|n|cancel|reject|rejected|abort|stop|discard plan|forget it|nahi|mat karo|cancel karo|gia,?\s*(?:reject|cancel|mat karo))\b/i.test(lower)) {
-            const vRes = await api.sendVoicePlanCommand(token, convoId, trimmed, false);
-            setActivePlan(vRes.plan);
-            const planIdToClear = vRes.plan?.id || currentPlan.id;
-            setTimeout(() => {
-              setActivePlan((curr) => (curr?.id === planIdToClear ? null : curr));
-              setPlanExecution(null);
-              setActiveTicket(null);
-            }, 1500);
-            return { role: 'assistant', content: 'Plan cancelled. No actions were performed.' };
-          }
-        }
-
-        // Actionable instruction -> Create Plan First
-        if (isActionableInstruction(trimmed)) {
-          setUiState('thinking');
-          try {
-            const pRes = await api.createPlan(token, convoId, trimmed);
-            setActivePlan(pRes.plan);
-            return {
-              role: 'assistant',
-              content: `I understood: ${pRes.plan.objective}. I have formulated an execution plan. May I execute this plan? Please say "Approve" or "Reject".`,
-            };
-          } finally {
-            setUiState('idle');
-          }
-        }
 
         setUiState('thinking');
         try {
+          // Unified orchestration: text and voice route through the exact same backend engine
           const res = await api.sendMessageAgent(token, convoId, trimmed);
-          return res;
+          if (res.plan) {
+            setActivePlan(res.plan);
+            if (res.plan.status === 'completed' || res.plan.status === 'rejected') {
+              setTimeout(() => {
+                setActivePlan(null);
+                setActiveTicket(null);
+              }, 4000);
+            }
+          }
+          if (res.execution) {
+            setPlanExecution(res.execution);
+          }
+          const spokenText = res.speechText || cleanSpokenText(res.assistantMessage?.content) || '';
+          return {
+            userMessage: res.userMessage,
+            assistantMessage: res.assistantMessage,
+            speechText: res.speechText || spokenText,
+            content: spokenText,
+          };
         } finally {
           setUiState('idle');
         }
       },
-      fetchTtsApi: (txt) => (token ? api.synthesizeSpeech(token, txt) : Promise.reject('No token')),
+      fetchTtsApi: (txt) => (token ? api.synthesizeSpeech(token, cleanSpokenText(txt)) : Promise.reject('No token')),
       playAudioApi: (buf) => player.play(buf),
+      stopAudioApi: () => player.stop(),
     });
     voiceMachineRef.current = machine;
 
@@ -165,7 +172,16 @@ export default function App() {
   }, [token]);
 
   async function toggleVoiceMode() {
-    if (!token || !activeConvoId || !voiceMachineRef.current) return;
+    if (!token || !voiceMachineRef.current) return;
+
+    // Immediately unlock Web Audio API in user gesture context
+    await audioPlayerRef.current?.ensureUnlocked();
+
+    console.log('[MIC_DIAGNOSTIC] toggleVoiceMode triggered:', {
+      runtimeType: typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window ? 'tauri' : 'browser',
+      isVoiceModeActive,
+      permissionState: micPermissionStatus,
+    });
 
     if (isVoiceModeActive) {
       setIsVoiceModeActive(false);
@@ -173,8 +189,24 @@ export default function App() {
       await voiceMachineRef.current.stopVoiceMode();
     } else {
       setChatError(null);
+      let targetConvoId = activeConvoId;
+      if (!targetConvoId && token) {
+        try {
+          const convo = await api.createConversation(token, 'General Chat');
+          setConversations((prev) => [convo, ...prev]);
+          setActiveConvoId(convo.id);
+          targetConvoId = convo.id;
+        } catch (err: any) {
+          setChatError('Failed to initialize conversation: ' + err.message);
+          return;
+        }
+      }
+      if (!targetConvoId) {
+        setChatError('Failed to initialize conversation for voice mode');
+        return;
+      }
       setIsVoiceModeActive(true);
-      await voiceMachineRef.current.startVoiceMode(activeConvoId, token);
+      await voiceMachineRef.current.startVoiceMode(targetConvoId, token);
       try {
         await audioRecorderRef.current?.start();
       } catch (err: any) {
@@ -232,6 +264,7 @@ export default function App() {
   // Microphone Permission Modal State
   const [showMicModal, setShowMicModal] = useState<boolean>(false);
   const [showMicTestModal, setShowMicTestModal] = useState<boolean>(false);
+  const [micModalError, setMicModalError] = useState<string | null>(null);
   const [micPermissionStatus, setMicPermissionStatus] = useState<'prompt' | 'granted' | 'rejected'>(
     (localStorage.getItem('gia_mic_permission') as any) || 'prompt'
   );
@@ -259,47 +292,44 @@ export default function App() {
   }, [token]);
 
   async function handleGrantMicPermission() {
+    setMicModalError(null);
     if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         stream.getTracks().forEach((track) => track.stop());
         localStorage.setItem('gia_mic_permission', 'granted');
         setMicPermissionStatus('granted');
-        setShowMicModal(false);
-        return;
-      } catch (err: any) {
-        console.warn('WebAudio getUserMedia failed, trying native permission:', err);
-      }
-    }
-
-    // Tauri Desktop Native fallback
-    try {
-      const nativeRes = await requestNativeMicrophonePermission();
-      if (nativeRes.status === 'GRANTED') {
-        localStorage.setItem('gia_mic_permission', 'granted');
-        setMicPermissionStatus('granted');
+        setMicModalError(null);
         setShowMicModal(false);
         setChatError(null);
         return;
-      } else {
+      } catch (err: any) {
+        console.error('[MIC_DIAGNOSTIC] WebAudio getUserMedia permission error:', err);
+        const isDenied = err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError';
+        const errorDetail = isDenied
+          ? 'Microphone access was denied by macOS or the browser.\nTo enable it, open macOS System Settings > Privacy & Security > Microphone, ensure GIA is toggled ON, and then click Retry.'
+          : `Failed to acquire microphone access: ${err?.message || String(err)}`;
+
         localStorage.setItem('gia_mic_permission', 'rejected');
         setMicPermissionStatus('rejected');
-        setShowMicModal(false);
-        setChatError(`Microphone access ${nativeRes.status.toLowerCase()}: ${nativeRes.message}`);
+        setMicModalError(errorDetail);
+        setChatError(errorDetail);
+        // Keep modal open so the user sees the explanation and can retry or dismiss
         return;
       }
-    } catch (err: any) {
-      localStorage.setItem('gia_mic_permission', 'rejected');
-      setMicPermissionStatus('rejected');
-      setShowMicModal(false);
-      setChatError(`Microphone permission error: ${err.message || String(err)}`);
-      return;
     }
+
+    const unavailMsg = 'Microphone mediaDevices API not supported in this runtime environment.';
+    localStorage.setItem('gia_mic_permission', 'rejected');
+    setMicPermissionStatus('rejected');
+    setMicModalError(unavailMsg);
+    setChatError(unavailMsg);
   }
 
   function handleRejectMicPermission() {
     localStorage.setItem('gia_mic_permission', 'rejected');
     setMicPermissionStatus('rejected');
+    setMicModalError(null);
     setShowMicModal(false);
   }
 
@@ -349,9 +379,11 @@ export default function App() {
     try {
       const list = await api.listConversations(token);
       setConversations(list);
-      if (list.length > 0 && !activeConvoId) {
-        selectConversation(list[0].id);
-      } else if (list.length === 0) {
+      if (list.length > 0) {
+        if (!activeConvoId || !list.some((c) => c.id === activeConvoId)) {
+          selectConversation(list[0].id);
+        }
+      } else {
         const defaultConvo = await api.createConversation(token, 'General Chat');
         setConversations([defaultConvo]);
         selectConversation(defaultConvo.id);
@@ -381,78 +413,6 @@ export default function App() {
     } catch (err: any) {
       setDocumentError('Failed to load documents: ' + err.message);
     }
-  }
-
-  function isActionableInstruction(text: string): boolean {
-    let lower = text.toLowerCase().trim();
-
-    // Strip common conversational / polite prefixes
-    lower = lower
-      .replace(/^(?:can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?|please\s+|kindly\s+|gia,?\s*(?:please\s+)?|hey\s+gia,?\s*)/i, '')
-      .trim();
-
-    // Questions or conversational chit-chat are NOT actionable instructions
-    if (
-      lower.startsWith('what is') ||
-      lower.startsWith('what are') ||
-      lower.startsWith('who is') ||
-      lower.startsWith('who are') ||
-      lower.startsWith('who am i') ||
-      lower.startsWith('how do') ||
-      lower.startsWith('how does') ||
-      lower.startsWith('why is') ||
-      lower.startsWith('why do') ||
-      lower.startsWith('tell me about') ||
-      lower.startsWith('explain') ||
-      lower.includes('recursion') ||
-      lower.includes('javascript')
-    ) {
-      return false;
-    }
-
-    // Action verbs and keywords
-    return (
-      lower.startsWith('open ') ||
-      lower.startsWith('launch ') ||
-      lower.startsWith('start ') ||
-      lower.startsWith('run ') ||
-      lower.startsWith('execute ') ||
-      lower.startsWith('navigate ') ||
-      lower.startsWith('visit ') ||
-      lower.startsWith('browse ') ||
-      lower.startsWith('search ') ||
-      lower.startsWith('create file') ||
-      lower.startsWith('make file') ||
-      lower.startsWith('write file') ||
-      lower.startsWith('read file') ||
-      lower.startsWith('delete file') ||
-      lower.startsWith('remove file') ||
-      lower.startsWith('list files') ||
-      lower.startsWith('list directory') ||
-      lower.startsWith('search for file') ||
-      lower.startsWith('find file') ||
-      lower.startsWith('close ') ||
-      lower.startsWith('quit ') ||
-      lower.startsWith('kill ') ||
-      lower.startsWith('check battery') ||
-      lower.startsWith('system info') ||
-      lower.startsWith('take a screenshot') ||
-      lower.startsWith('screenshot') ||
-      lower.includes('vs code') ||
-      lower.includes('vscode') ||
-      lower.includes('chrome') ||
-      lower.includes('youtube') ||
-      lower.includes('terminal') ||
-      lower.includes('calculator') ||
-      lower.includes('खोलो') ||
-      lower.includes('kholo') ||
-      lower.includes('चलाओ') ||
-      lower.includes('chalao') ||
-      lower.includes('ओपन') ||
-      lower.includes('open karo') ||
-      lower.includes('बनाओ') ||
-      lower.includes('banao')
-    );
   }
 
   // Load active plan for current conversation
@@ -565,6 +525,19 @@ export default function App() {
       const refreshed = await api.getMessages(token, activeConvoId);
       setMessages(refreshed);
 
+      // Play completion audio if enabled
+      if (isAudioOutputEnabled) {
+        let completionText = '';
+        if (res.execution?.status === 'completed') {
+          completionText = `Done! I have executed and verified all steps for ${activePlan?.objective || 'the requested plan'}.`;
+        } else if (res.execution?.status === 'failed') {
+          completionText = `Execution failed: ${res.execution?.errorMessage || 'An error occurred during execution'}.`;
+        }
+        if (completionText) {
+          playAssistantSpeech('exec-' + planId, completionText).catch(() => {});
+        }
+      }
+
       // Auto-remove plan after completed or failed execution
       if (res.execution?.status === 'completed' || res.execution?.status === 'failed') {
         setTimeout(() => {
@@ -591,6 +564,10 @@ export default function App() {
       setActivePlan(res.plan);
       setActiveTicket(null);
       setPlanExecution(null);
+
+      if (isAudioOutputEnabled) {
+        playAssistantSpeech('reject-' + planId, 'Plan cancelled. No actions were performed.').catch(() => {});
+      }
 
       // Auto-remove rejected plan after brief confirmation feedback
       setTimeout(() => {
@@ -763,98 +740,6 @@ export default function App() {
     setMessages((prev) => [...prev, tempUserMsg]);
 
     const trimmed = textToSend.trim();
-    const lower = trimmed.toLowerCase();
-
-    // 1. Plan Approval / Rejection / Modification Gate for Active Pending Plans
-    if (activePlan && (activePlan.status === 'awaiting_approval' || activePlan.status === 'pending')) {
-      // 1a. Explicit Plan Approval Command
-      if (/^(?:yes|y|proceed|approve|approved|go ahead|looks good|execute|run plan|confirm|do it|haan|karo|theek hai|sahi hai|gia,?\s*(?:approve|proceed|execute|karo))\b/i.test(lower)) {
-        await handleApprovePlan(activePlan.id, activePlan.version);
-        return;
-      }
-
-      // 1b. Explicit Plan Rejection / Cancellation Command
-      if (/^(?:no|n|cancel|reject|rejected|abort|stop|discard plan|forget it|nahi|mat karo|cancel karo|gia,?\s*(?:reject|cancel|mat karo))\b/i.test(lower)) {
-        await handleRejectPlan(activePlan.id, trimmed);
-        return;
-      }
-
-      // 1c. Plan Explanation Request
-      const explainMatch = lower.match(/(?:explain|what does|why do we need)\s+(?:what\s+)?(?:step\s+(\d+)|action\s+(\d+)|this\s+action|this\s+plan|the\s+plan)/i);
-      if (explainMatch) {
-        const stepNum = explainMatch[1] || explainMatch[2];
-        const targetStep = stepNum ? activePlan.steps.find((s) => s.step_id === parseInt(stepNum, 10)) : null;
-        let explanation = '';
-        if (targetStep) {
-          explanation = `🔍 **Explanation for Step ${targetStep.step_id}: ${targetStep.action}**\n\n` +
-            `• **Description:** ${targetStep.description}\n` +
-            `• **Target Resource:** \`${targetStep.target || 'None'}\`\n` +
-            `• **Risk Classification:** **${targetStep.risk_level.toUpperCase()}**\n` +
-            `• **Expected Outcome:** ${targetStep.expected_outcome}\n` +
-            `• **Requires Explicit Approval:** Yes\n\n` +
-            `*This step will not execute until you approve the plan.*`;
-        } else {
-          explanation = `🔍 **Plan Overview for: "${activePlan.objective}"**\n\n` +
-            `This plan consists of ${activePlan.steps.length} atomic steps with status: **${activePlan.status}**.\n` +
-            `No steps will be executed until you give explicit approval.`;
-        }
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Math.random().toString(),
-            role: 'assistant',
-            content: explanation,
-            created_at: new Date().toISOString(),
-          },
-        ]);
-        setUiState('idle');
-        return;
-      }
-
-      // 1d. Plan Modification Request
-      if (
-        lower.startsWith('also ') ||
-        lower.startsWith("don't ") ||
-        lower.startsWith('do not ') ||
-        lower.startsWith('instead ') ||
-        lower.startsWith('remove ') ||
-        lower.startsWith('delete ') ||
-        lower.startsWith('add ') ||
-        lower.startsWith('change ') ||
-        lower.includes('another step') ||
-        lower.includes('second step') ||
-        lower.includes('first step') ||
-        lower.startsWith('modify')
-      ) {
-        await handleModifyPlan(activePlan.id, trimmed);
-        return;
-      }
-    }
-
-    // 2. Actionable Instruction Interception: Mandatory Plan-First Requirement
-    if (isActionableInstruction(trimmed)) {
-      setUiState('thinking');
-      try {
-        const res = await api.createPlan(token, targetConvoId, trimmed);
-        setActivePlan(res.plan);
-        setActiveTicket(null);
-        setPlanExecution(null);
-
-        const presentationMsg: MessageExt = {
-          id: Math.random().toString(),
-          role: 'assistant',
-          content: res.presentation,
-          created_at: new Date().toISOString(),
-        };
-        setMessages((prev) => [...prev, presentationMsg]);
-        setUiState('idle');
-        return;
-      } catch (err: any) {
-        setChatError('Task planning failed: ' + (err.message || err));
-        setUiState('error');
-        return;
-      }
-    }
 
     if (sendMode === 'stream') {
       const tempAssistantMsg: MessageExt = {
@@ -893,6 +778,9 @@ export default function App() {
         const response = await api.sendMessageSync(token, targetConvoId, textToSend);
         setMessages((prev) => [...prev, response]);
         setUiState('idle');
+        if (isAudioOutputEnabled && response.content) {
+          playAssistantSpeech(response.id, cleanSpokenText(response.content)).catch(() => {});
+        }
       } catch (err: any) {
         setChatError(err.message);
         setUiState('error');
@@ -906,13 +794,17 @@ export default function App() {
         };
         setMessages((prev) => [...prev, assistantMsg]);
         setUiState('idle');
+        if (isAudioOutputEnabled && res.message.content) {
+          playAssistantSpeech(res.message.id, cleanSpokenText(res.message.content)).catch(() => {});
+        }
       } catch (err: any) {
         setChatError(err.message);
         setUiState('error');
       }
-    } else if (sendMode === 'agent') {
-      // Simulate real-time transitions to tool execution node
-      const toolCheck = textToSend.toLowerCase();
+    } else {
+      // Default: Unified Conversation Orchestrator ('agent')
+      // Enforces identical plan generation, missing-param resolution, permission validation, execution & verification
+      const toolCheck = trimmed.toLowerCase();
       let hasToolTrigger = false;
       if (toolCheck.includes('time') || toolCheck.includes('date') || toolCheck.includes('remember') || toolCheck.includes('note') || toolCheck.includes('document')) {
         hasToolTrigger = true;
@@ -928,6 +820,7 @@ export default function App() {
       try {
         const res = await api.sendMessageAgent(token, targetConvoId, textToSend);
         clearTimeout(executionTimer);
+        setActiveTool(null);
         if (res.plan) {
           setActivePlan(res.plan);
           if (res.execution) {
@@ -939,14 +832,24 @@ export default function App() {
               setActivePlan((curr) => (curr?.id === planIdToClear ? null : curr));
               setPlanExecution(null);
               setActiveTicket(null);
-            }, 2500);
+            }, 3000);
           }
         }
         const refreshed = await api.getMessages(token, targetConvoId);
         setMessages(refreshed);
         setUiState('idle');
+
+        // Play spoken response if audio output is enabled
+        const speechToPlay = res.speechText || cleanSpokenText(res.assistantMessage?.content);
+        if (isAudioOutputEnabled && speechToPlay) {
+          const targetMsgId = res.assistantMessage?.id || refreshed[refreshed.length - 1]?.id || 'msg-' + Date.now();
+          playAssistantSpeech(targetMsgId, speechToPlay).catch((err) =>
+            console.warn('[App] Spoken audio playback failed:', err)
+          );
+        }
       } catch (err: any) {
         clearTimeout(executionTimer);
+        setActiveTool(null);
         setChatError(err.message);
         setUiState('error');
       }
@@ -959,6 +862,8 @@ export default function App() {
     if (!inputMessage.trim() || ['thinking', 'executing'].includes(uiState)) return;
     const text = inputMessage.trim();
     setInputMessage('');
+    // User gesture unlock for Web Audio API in macOS WebKit
+    audioPlayerRef.current?.ensureUnlocked().catch(() => {});
     await handleSendMessageDirectly(text);
   }
 
@@ -1150,6 +1055,24 @@ export default function App() {
                         ))}
                       </div>
                     )}
+
+                    {/* Assistant Message Voice Playback Button */}
+                    {m.role === 'assistant' && m.content && (
+                      <div className="msg-actions-row">
+                        <button
+                          type="button"
+                          className={`msg-speaker-btn ${playingMessageId === m.id ? 'playing' : ''}`}
+                          onClick={() =>
+                            playingMessageId === m.id
+                              ? stopAssistantSpeech()
+                              : playAssistantSpeech(m.id, m.content)
+                          }
+                          title={playingMessageId === m.id ? 'Stop voice playback' : 'Play voice response'}
+                        >
+                          {playingMessageId === m.id ? '⏹️ Stop' : '🔊 Listen'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))
@@ -1175,8 +1098,14 @@ export default function App() {
           </div>
         ) : (
           <div className="welcome-chat">
-            <h2>No Conversation</h2>
-            <p>Switch to or create a conversation using the chat menu.</p>
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ opacity: 0.6 }}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 18a3.75 3.75 0 0 0 .495-7.467 5.99 5.99 0 0 0-1.925 3.546 5.974 5.974 0 0 1-2.133-1A3.75 3.75 0 0 0 12 18Z" />
+            </svg>
+            <h2>Welcome to GIA</h2>
+            <p>Ready to assist. Ask anything below or start voice mode.</p>
+            <button className="new-chat-pill-btn" style={{ marginTop: '14px', padding: '8px 20px', fontSize: '13px' }} onClick={handleCreateConvo}>
+              + Start New Conversation
+            </button>
           </div>
         )}
       </div>
@@ -1184,7 +1113,7 @@ export default function App() {
       {/* DETECTED DYNAMIC STATE INTERFACE OVERLAYS */}
       
       {/* COMPOSER FOOTER BAR */}
-      {activeConvoId && (() => {
+      {(() => {
         const currentVoiceInteractionState: 'IDLE' | 'LISTENING' | 'PROCESSING' | 'THINKING' | 'AWAITING_APPROVAL' | 'EXECUTING' | 'SPEAKING' | 'ERROR' = (() => {
           if (chatError) return 'ERROR';
           if (!isVoiceModeActive) return 'IDLE';
@@ -1268,6 +1197,15 @@ export default function App() {
                 onChange={(e) => setInputMessage(e.target.value)} 
                 disabled={['thinking', 'executing'].includes(uiState) || isVoiceModeActive} 
               />
+
+              <button
+                type="button"
+                className={`audio-output-toggle-btn ${isAudioOutputEnabled ? 'active' : ''}`}
+                onClick={toggleAudioOutput}
+                title={isAudioOutputEnabled ? "Voice responses enabled (click to mute)" : "Voice responses muted (click to enable)"}
+              >
+                {isAudioOutputEnabled ? '🔊 Voice' : '🔇 Mute'}
+              </button>
 
               <button
                 type="button"
@@ -1498,12 +1436,30 @@ export default function App() {
             <p>
               GIA Assistant requires desktop microphone access to enable continuous voice interaction, speech-to-text recognition, and hands-free control.
             </p>
+            {micModalError && (
+              <div
+                style={{
+                  background: 'rgba(239, 68, 68, 0.1)',
+                  border: '1px solid rgba(239, 68, 68, 0.3)',
+                  borderRadius: '8px',
+                  padding: '10px 12px',
+                  marginBottom: '16px',
+                  fontSize: '0.8rem',
+                  color: '#f87171',
+                  textAlign: 'left',
+                  lineHeight: '1.4',
+                  whiteSpace: 'pre-line',
+                }}
+              >
+                ⚠️ {micModalError}
+              </div>
+            )}
             <div className="mic-modal-actions">
               <button type="button" className="btn-grant-access" onClick={handleGrantMicPermission}>
-                Give Access
+                {micModalError ? 'Retry' : 'Give Access'}
               </button>
               <button type="button" className="btn-reject-access" onClick={handleRejectMicPermission}>
-                Reject
+                {micModalError ? 'Close' : 'Reject'}
               </button>
             </div>
           </div>

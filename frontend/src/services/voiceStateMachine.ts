@@ -37,8 +37,39 @@ export interface VoiceStateMachineCallbacks {
   fetchStreamChatApi?: (convoId: string, text: string, onChunk: (chunk: string) => void) => Promise<any>;
   fetchTtsApi?: (text: string) => Promise<ArrayBuffer | Buffer>;
   playAudioApi?: (audioBuffer: ArrayBuffer | Buffer) => Promise<void>;
+  stopAudioApi?: () => void;
   enableLiveMode?: boolean;
   requireWakeWord?: boolean;
+}
+
+/**
+ * Strips markdown formatting, code blocks, bullet points, and decorative emojis
+ * so Kokoro TTS synthesizes clean, natural English speech quickly without failure.
+ */
+export function cleanSpokenText(rawText?: string | null): string {
+  if (!rawText) return '';
+  return rawText
+    // Remove markdown code blocks
+    .replace(/```[\s\S]*?```/g, '')
+    // Remove inline code
+    .replace(/`([^`]+)`/g, '$1')
+    // Remove bold / italic markers
+    .replace(/[*_]{1,3}([^*_]+)[*_]{1,3}/g, '$1')
+    // Remove markdown links [text](url) -> text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    // Remove markdown headers
+    .replace(/^#{1,6}\s+/gm, '')
+    // Remove bullet points / numbered lists
+    .replace(/^[\s]*[•*-]\s+/gm, '')
+    .replace(/^[\s]*\d+\.\s+/gm, '')
+    // Remove horizontal rules
+    .replace(/^---+\s*$/gm, '')
+    // Remove emojis and decorative unicode symbols
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '')
+    // Replace multiple newlines or spaces
+    .replace(/\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export class VoiceStateMachine {
@@ -407,7 +438,11 @@ export class VoiceStateMachine {
                 this.setState('PLAYING');
                 await playApi(buf);
               },
-              stop: () => {},
+              stop: () => {
+                if (this._callbacks.stopAudioApi) {
+                  this._callbacks.stopAudioApi();
+                }
+              },
               state: 'PLAYING',
               isPlaying: true,
             } as any,
@@ -424,10 +459,12 @@ export class VoiceStateMachine {
       const chunker = new SpeechTextChunker();
       const pushSpeechChunk = (sc: string) => {
         if (this.checkInterrupted(utteranceGenId)) return;
+        const cleaned = cleanSpokenText(sc);
+        if (!cleaned) return;
         voiceLatencyTracker.record('firstSpeechReadyChunk');
         this.setState('SYNTHESIZING');
         if (this._streamingQueue) {
-          this._streamingQueue.pushChunk(sc, utteranceGenId);
+          this._streamingQueue.pushChunk(cleaned, utteranceGenId);
         }
       };
 
@@ -456,11 +493,20 @@ export class VoiceStateMachine {
         const chatRes = await this._callbacks.fetchChatApi(this._conversationId, commandText);
         if (this.checkInterrupted(utteranceGenId)) return;
 
-        assistantReplyText =
+        // Prioritize concise, human-spoken speech text over verbose markdown presentation
+        const spokenCandidate =
+          chatRes?.speechText ||
+          chatRes?.data?.speechText ||
+          chatRes?.content ||
+          chatRes?.assistantMessage?.metadata?.speechText ||
+          '';
+
+        const rawFallback =
           chatRes?.assistantMessage?.content ||
           chatRes?.data?.assistantMessage?.content ||
-          chatRes?.content ||
           '';
+
+        assistantReplyText = spokenCandidate ? cleanSpokenText(spokenCandidate) : cleanSpokenText(rawFallback);
 
         if (this._callbacks.onAssistantResponse) {
           const userMsg = chatRes?.userMessage || {
@@ -472,7 +518,7 @@ export class VoiceStateMachine {
           const assistantMsg = chatRes?.assistantMessage || {
             id: Math.random().toString(),
             role: 'assistant',
-            content: assistantReplyText,
+            content: rawFallback || assistantReplyText,
             created_at: new Date().toISOString(),
           };
           this._callbacks.onAssistantResponse(userMsg, assistantMsg);
@@ -503,7 +549,7 @@ export class VoiceStateMachine {
         this.setState('SYNTHESIZING');
         let audioBuffer: ArrayBuffer | Buffer | null = null;
         if (this._callbacks.fetchTtsApi && assistantReplyText) {
-          audioBuffer = await this._callbacks.fetchTtsApi(assistantReplyText);
+          audioBuffer = await this._callbacks.fetchTtsApi(cleanSpokenText(assistantReplyText));
         }
 
         if (this.checkInterrupted(utteranceGenId)) return;
