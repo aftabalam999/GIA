@@ -1,8 +1,11 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { PlanRepository } from '../planner/plan.repository.js';
 import { PermissionManager } from '../permissions/permission.manager.js';
 import { ToolExecutor } from '../tools/executor.js';
-import { registry } from '../tools/registry.js';
+import { registry, resolveTargetDirectory } from '../tools/registry.js';
+import { BrowserAutomationService } from '../tools/browser.service.js';
 import { ExecutionPlan, PlanStep } from '../planner/planner.interface.js';
 import {
   PlanExecutionRequest,
@@ -375,6 +378,11 @@ export class PlanExecutionEngine {
     const rawArgs = { ...(step.tool_args || {}) };
     const toolName = step.tool_name || '';
 
+    if (toolName === 'open_browser') {
+      const browser = rawArgs.browser || rawArgs.appName || rawArgs.app || rawArgs.name || step.target || undefined;
+      return { ...rawArgs, browser };
+    }
+
     if (toolName === 'open_application' || toolName === 'launch_application') {
       let appName = rawArgs.appName || rawArgs.application || rawArgs.app || rawArgs.name || step.target || '';
       if (!appName || ['default_browser', 'browser', 'web browser', 'web_browser', 'website'].includes(appName.toLowerCase().trim())) {
@@ -386,9 +394,25 @@ export class PlanExecutionEngine {
     if (toolName === 'open_url' || toolName === 'navigate_browser') {
       let url = rawArgs.url || rawArgs.link || step.target || '';
       if (!url.startsWith('http://') && !url.startsWith('https://')) {
-        url = url ? `https://${url}` : 'https://www.youtube.com';
+        url = url ? `https://${url}` : 'https://www.google.com';
       }
-      return { ...rawArgs, url };
+      const browser = rawArgs.browser || rawArgs.appName || undefined;
+      const newTab = Boolean(rawArgs.newTab);
+      return { ...rawArgs, url, browser, newTab };
+    }
+
+    if (toolName === 'search_browser') {
+      const query = rawArgs.query || rawArgs.searchQuery || rawArgs.target || step.target || '';
+      const engine = rawArgs.engine || 'google';
+      const browser = rawArgs.browser || rawArgs.appName || undefined;
+      return { ...rawArgs, query, engine, browser };
+    }
+
+    if (toolName === 'browser_tab_action') {
+      const action = rawArgs.action || 'new_tab';
+      const browser = rawArgs.browser || rawArgs.appName || undefined;
+      const url = rawArgs.url || undefined;
+      return { ...rawArgs, action, browser, url };
     }
 
     if (toolName === 'open_folder_in_vscode') {
@@ -399,6 +423,12 @@ export class PlanExecutionEngine {
     if (toolName === 'open_folder') {
       const folderPath = rawArgs.folderPath || rawArgs.path || rawArgs.folder || step.target || 'downloads';
       return { ...rawArgs, folderPath };
+    }
+
+    if (toolName === 'create_directory' || toolName === 'create_folder') {
+      const directoryPath = rawArgs.directoryPath || rawArgs.path || rawArgs.folderPath || 'Desktop';
+      const folderName = rawArgs.folderName || rawArgs.name || step.target || '';
+      return { ...rawArgs, directoryPath, folderName };
     }
 
     return rawArgs;
@@ -456,6 +486,47 @@ export class PlanExecutionEngine {
     step: PlanStep
   ): Promise<{ success: boolean; message: string }> {
     const action = step.action.toLowerCase();
+
+    // Directory / Folder verification
+    if (action.includes('verify_directory') || action.includes('verify folder')) {
+      const targetBase = step.tool_args?.directoryPath || 'Desktop';
+      const folderName = step.tool_args?.folderName || step.target;
+      const resolution = resolveTargetDirectory(targetBase, folderName);
+      if (!resolution.success) {
+        return {
+          success: false,
+          message: resolution.error,
+        };
+      }
+      const exists = fs.existsSync(resolution.path) && fs.statSync(resolution.path).isDirectory();
+      if (!exists) {
+        return {
+          success: false,
+          message: `Directory verification failed: Directory "${resolution.name}" does not exist on disk at "${resolution.path}".`,
+        };
+      }
+      return {
+        success: true,
+        message: `Verified directory "${resolution.name}" exists on disk at "${resolution.path}".`,
+      };
+    }
+
+    // Browser verification
+    if (action.includes('verify_browser') || action.includes('verify browser') || action.includes('verify_page_loaded')) {
+      const browserTarget = step.tool_args?.browser || step.target;
+      try {
+        const info = BrowserAutomationService.resolveBrowser(browserTarget);
+        const isRunning = await BrowserAutomationService.isBrowserRunning(info.appName);
+        if (isRunning) {
+          return {
+            success: true,
+            message: `Verified ${info.appName} is running and ready.`,
+          };
+        }
+      } catch {
+        // Continue to general verification fallback
+      }
+    }
 
     if (action.includes('wait') || action.includes('verify')) {
       // Small simulated delay for window/UI synchronization

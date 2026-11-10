@@ -69,7 +69,7 @@ export class DesktopAudioPlayer {
   /**
    * Initializes or returns active Web Audio API AudioContext.
    */
-  private getOrCreateAudioContext(): AudioContext {
+  public getOrCreateAudioContext(): AudioContext {
     if (!this._audioContext || this._audioContext.state === 'closed') {
       const AudioContextClass =
         (typeof window !== 'undefined' ? (window.AudioContext || (window as any).webkitAudioContext) : null) ||
@@ -82,10 +82,34 @@ export class DesktopAudioPlayer {
     if (!this._audioContext) {
       throw new Error('Failed to create AudioContext');
     }
-    if (this._audioContext.state === 'suspended') {
-      this._audioContext.resume();
-    }
     return this._audioContext;
+  }
+
+  /**
+   * Explicitly ensures the AudioContext is running/resumed.
+   * MUST be invoked during or right after direct user interaction (click/tap)
+   * to satisfy macOS WebKit / Safari WKWebView autoplay policies.
+   */
+  public async ensureUnlocked(): Promise<void> {
+    try {
+      const ctx = this.getOrCreateAudioContext();
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+      // If still suspended (WebKit edge case), play an inaudible micro-buffer to unlock hardware clock
+      if (ctx.state === 'suspended') {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        gain.gain.value = 0.00001;
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(0);
+        osc.stop(ctx.currentTime + 0.001);
+        await ctx.resume();
+      }
+    } catch (err: any) {
+      console.warn('[DesktopAudioPlayer] Failed to unlock AudioContext:', err);
+    }
   }
 
   /**
@@ -96,6 +120,13 @@ export class DesktopAudioPlayer {
     this.stop(); // Stop any active playback first & resolve previous promise if any
 
     const ctx = this.getOrCreateAudioContext();
+    if (ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch (err) {
+        console.warn('[DesktopAudioPlayer] Failed to resume AudioContext in play():', err);
+      }
+    }
     
     // Convert Buffer to ArrayBuffer if needed
     let bufferToDecode: ArrayBuffer;
@@ -136,6 +167,10 @@ export class DesktopAudioPlayer {
 
   private _startSourceNode(offset: number): void {
     if (!this._audioContext || !this._audioBuffer) return;
+
+    if (this._audioContext.state === 'suspended') {
+      this._audioContext.resume().catch(() => {});
+    }
 
     this._sourceNode = this._audioContext.createBufferSource();
     this._sourceNode.buffer = this._audioBuffer;

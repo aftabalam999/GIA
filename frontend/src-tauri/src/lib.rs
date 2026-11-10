@@ -4,6 +4,7 @@ mod service_manager;
 use mic_capture::{MicCaptureResult, MicPermissionResult};
 use service_manager::{get_service_manager, ServiceStatus};
 use tauri::{AppHandle, Manager};
+use tauri::webview::{PermissionKind, PermissionResponse};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 #[tauri::command]
@@ -29,6 +30,16 @@ async fn start_microphone_test_capture(duration_secs: Option<u64>) -> Result<Mic
 #[tauri::command]
 fn stop_microphone_test_capture() {
     mic_capture::stop_test_capture_internal();
+}
+
+#[tauri::command]
+fn start_continuous_microphone_capture(app: AppHandle) -> Result<(), String> {
+    mic_capture::start_continuous_capture_internal(app)
+}
+
+#[tauri::command]
+fn stop_continuous_microphone_capture() -> Result<(), String> {
+    mic_capture::stop_continuous_capture_internal()
 }
 
 #[tauri::command]
@@ -84,6 +95,41 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .on_permission_request(|webview, kind| {
+            // Verify that the permission request originates from the trusted GIA application origin
+            let is_allowed_origin = match webview.url() {
+                Ok(url) => {
+                    let scheme = url.scheme();
+                    let host = url.host_str().unwrap_or("");
+                    // Allow local Vite dev server and Tauri bundled custom protocols
+                    (scheme == "http" && (host == "localhost" || host == "127.0.0.1" || host == "tauri.localhost"))
+                        || (scheme == "tauri" && host == "localhost")
+                }
+                Err(_) => false,
+            };
+
+            if !is_allowed_origin {
+                eprintln!("⚠️ [Tauri Permissions] Denied {:?} request from untrusted origin: {:?}", kind, webview.url());
+                return PermissionResponse::Deny;
+            }
+
+            match kind {
+                PermissionKind::Microphone => {
+                    println!("🎙️ [Tauri Permissions] Allowing Microphone capture request for GIA Webview");
+                    // Explicitly grant microphone permission to allow WebKit to query macOS TCC
+                    PermissionResponse::Allow
+                }
+                PermissionKind::Camera => {
+                    // Do not grant camera access unless explicitly requested by the application
+                    println!("📷 [Tauri Permissions] Denied unrequested Camera permission");
+                    PermissionResponse::Deny
+                }
+                _ => {
+                    // Deny all unrelated permission requests
+                    PermissionResponse::Deny
+                }
+            }
+        })
         .setup(move |app| {
             let handle = app.handle().clone();
             let hotkey = shortcut_str.clone();
@@ -112,6 +158,8 @@ pub fn run() {
             request_microphone_permission,
             start_microphone_test_capture,
             stop_microphone_test_capture,
+            start_continuous_microphone_capture,
+            stop_continuous_microphone_capture,
             get_service_statuses,
             start_local_services,
             stop_local_services,

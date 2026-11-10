@@ -3,6 +3,10 @@ import { MessageRepository, Message } from '../../database/repositories/message.
 import { LLMGateway } from '../../ai/router/index.js';
 import { ContextBuilder } from '../../ai/orchestrator/contextBuilder.js';
 import { TaskPlanningEngine } from '../../ai/planner/planner.service.js';
+import { PlanRepository } from '../../ai/planner/plan.repository.js';
+import { PermissionManager } from '../../ai/permissions/permission.manager.js';
+import { PlanExecutionEngine } from '../../ai/execution/plan-execution.engine.js';
+import { ConversationOrchestrator } from '../../ai/orchestrator/conversation-orchestrator.service.js';
 import { NotFoundError, AuthorizationError } from '../../shared/errors.js';
 
 export class ConversationService {
@@ -44,50 +48,24 @@ export class ConversationService {
   }
 
   /**
-   * Sends a user message, calls the LLM synchronously, persists assistant response, and returns both messages.
+   * Sends a user message, delegates to the unified Conversation Orchestrator, and returns both messages.
    */
   static async sendMessageSync(
     userId: string,
     conversationId: string,
     content: string
   ): Promise<{ userMessage: Message; assistantMessage: Message }> {
-    await this.verifyOwnership(userId, conversationId);
-
-    // 1. Mandatory Plan-First Interception for Actionable Instructions
-    if (TaskPlanningEngine.isActionableInstruction(content)) {
-      const userMessage = await MessageRepository.create(conversationId, 'user', content);
-      const plan = await TaskPlanningEngine.createPlan(userId, conversationId, content);
-      const presentation = TaskPlanningEngine.presentPlan(plan);
-      const assistantMessage = await MessageRepository.create(
-        conversationId,
-        'assistant',
-        presentation,
-        { planId: plan.id, version: plan.version }
-      );
-      return { userMessage, assistantMessage };
-    }
-
-    // 1. Save user message
-    const userMessage = await MessageRepository.create(conversationId, 'user', content);
-
-    // 2. Load context
-    const history = await MessageRepository.findByConversationId(conversationId);
-    const llmRequest = ContextBuilder.buildContext(history);
-    llmRequest.maxTokens = 350;
-    llmRequest.enableThinking = false;
-
-    // 3. Call LLM Gateway
-    const response = await LLMGateway.generate(llmRequest, { conversationId });
-
-    // 4. Save assistant reply
-    const assistantMessage = await MessageRepository.create(
+    const result = await ConversationOrchestrator.processUserMessage({
       conversationId,
-      'assistant',
-      response.content,
-      { model: response.model, provider: response.provider }
-    );
+      userId,
+      content,
+      inputType: 'text',
+    });
 
-    return { userMessage, assistantMessage };
+    return {
+      userMessage: result.userMessage,
+      assistantMessage: result.assistantMessage,
+    };
   }
 
   /**
@@ -105,26 +83,23 @@ export class ConversationService {
   ): Promise<Message> {
     await this.verifyOwnership(userId, conversationId);
 
-    // Mandatory Plan-First Interception for Actionable Instructions
-    if (TaskPlanningEngine.isActionableInstruction(content)) {
-      const userMessage = await MessageRepository.create(conversationId, 'user', content);
-      (async () => {
-        try {
-          const plan = await TaskPlanningEngine.createPlan(userId, conversationId, content);
-          const presentation = TaskPlanningEngine.presentPlan(plan);
-          callbacks.onChunk(presentation);
-          const assistantMessage = await MessageRepository.create(
-            conversationId,
-            'assistant',
-            presentation,
-            { planId: plan.id, version: plan.version }
-          );
-          callbacks.onComplete(assistantMessage);
-        } catch (err: any) {
-          callbacks.onError(err);
-        }
-      })();
-      return userMessage;
+    // 1. Check for Active Pending Plan or Actionable Instruction -> Route to Unified Orchestrator
+    const activePlan = await PlanRepository.findActiveByConversationId(conversationId);
+    if (activePlan || TaskPlanningEngine.isActionableInstruction(content)) {
+      try {
+        const res = await ConversationOrchestrator.processUserMessage({
+          conversationId,
+          userId,
+          content,
+          inputType: 'text',
+        });
+        callbacks.onChunk(res.assistantMessage.content);
+        callbacks.onComplete(res.assistantMessage);
+        return res.userMessage;
+      } catch (err: any) {
+        callbacks.onError(err);
+        throw err;
+      }
     }
 
     // 1. Save user message

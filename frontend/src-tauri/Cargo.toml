@@ -2,7 +2,7 @@
 name = "frontend"
 version = "0.1.0"
 description = "A Tauri App"
-authors = ["you"]
+authors = ["Aftab"]
 edition = "2021"
 
 [lib]
@@ -20,3 +20,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hound = "3.5"
 tokio = { version = "1", features = ["process", "sync", "rt", "time"] }
+cpal = "0.18.2"

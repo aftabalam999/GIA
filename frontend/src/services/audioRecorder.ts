@@ -1,9 +1,15 @@
 import {
   requestNativeMicrophonePermission,
-  startNativeMicrophoneTestCapture,
+  startContinuousMicrophoneCapture,
+  stopContinuousMicrophoneCapture,
+  listenToMicrophoneAudioFrames,
+  listenToMicrophoneCaptureError,
   stopNativeMicrophoneTestCapture,
-  base64ToBlob,
+  createWavBlobFromPcm,
+  base64ToUint8Array,
+  AudioFramePayload,
 } from './tauriMicrophone.js';
+import { isTauriEnvironment } from './tauriServices.js';
 import { voiceLatencyTracker } from './voiceLatencyTracker.js';
 import { LocalVAD } from './localVad.js';
 
@@ -24,10 +30,18 @@ export class AudioRecorderService {
 
   private isRecording: boolean = false;
   private isPaused: boolean = false;
+  private isNativeContinuous: boolean = false;
   private _hasReceivedFrames: boolean = false;
   private lastDiagLogTime: number = 0;
   private audioChunks: Blob[] = [];
   private selectedMimeType: string = '';
+
+  private nativePcmChunks: Uint8Array[] = [];
+  private nativePreRollChunks: Uint8Array[] = [];
+  private readonly PRE_ROLL_LIMIT: number = 4; // ~128ms pre-roll (4 x 32ms frames)
+
+  private unlistenAudioFrames: (() => void) | null = null;
+  private unlistenCaptureError: (() => void) | null = null;
 
   private callbacks: AudioRecorderCallbacks = {};
   private vad: LocalVAD;
@@ -60,6 +74,12 @@ export class AudioRecorderService {
           voiceLatencyTracker.startUtterance();
           voiceLatencyTracker.record('micSpeechStart');
           console.log('[AUDIO_PIPELINE] Speech onset detected by VAD');
+
+          if (this.isNativeContinuous) {
+            this.nativePcmChunks = [...this.nativePreRollChunks];
+            this.nativePreRollChunks = [];
+          }
+
           if (this.callbacks.onSpeechStart) {
             this.callbacks.onSpeechStart();
           }
@@ -75,6 +95,41 @@ export class AudioRecorderService {
           if (this.callbacks.onSpeechEnd) {
             this.callbacks.onSpeechEnd();
           }
+
+          // 1. Native continuous capture: package accumulated 16kHz PCM chunks into standard WAV Blob
+          if (this.isNativeContinuous) {
+            if (this.nativePcmChunks.length > 0) {
+              let totalBytes = 0;
+              for (const chunk of this.nativePcmChunks) {
+                totalBytes += chunk.length;
+              }
+              const combinedPcm = new Uint8Array(totalBytes);
+              let offset = 0;
+              for (const chunk of this.nativePcmChunks) {
+                combinedPcm.set(chunk, offset);
+                offset += chunk.length;
+              }
+              const chunksRecorded = this.nativePcmChunks.length;
+              this.nativePcmChunks = [];
+
+              const wavBlob = createWavBlobFromPcm(combinedPcm, 16000, 1);
+              console.log('[AUDIO_PIPELINE] Native utterance packaged:', {
+                chunks: chunksRecorded,
+                totalBytes: wavBlob.size,
+                durationSec: (combinedPcm.length / (16000 * 2)).toFixed(2),
+                mimeType: 'audio/wav',
+              });
+
+              if (this.callbacks.onUtteranceRecorded && this.isRecording) {
+                this.callbacks.onUtteranceRecorded(wavBlob);
+              }
+            } else {
+              console.warn('[AUDIO_PIPELINE] Speech ended with 0 native audio frames.');
+            }
+            return;
+          }
+
+          // 2. Browser WebAudio MediaRecorder path
           if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
             try {
               if (typeof (this.mediaRecorder as any).requestData === 'function') {
@@ -124,21 +179,40 @@ export class AudioRecorderService {
       return;
     }
 
+    const runtimeType = isTauriEnvironment() ? 'tauri' : 'browser';
+
     // Clean up any stale handles before starting new stream to prevent duplicate streams/leaks
-    if (this.mediaStream || this.audioContext || this.animFrameId) {
+    if (this.mediaStream || this.audioContext || this.animFrameId || this.isNativeContinuous) {
       this.stop();
     }
 
     this._hasReceivedFrames = false;
 
-    // 1. Check if browser/webview supports navigator.mediaDevices.getUserMedia
+    // 1. In Tauri environment: prefer reliable continuous native capture via CPAL/CoreAudio
+    if (isTauriEnvironment()) {
+      try {
+        console.log('[MIC_DIAGNOSTIC] selectedCaptureImplementation:', 'tauri_native_continuous');
+        await this.startNativeContinuousCapture();
+        return;
+      } catch (err: any) {
+        console.warn('[MIC_DIAGNOSTIC] Native continuous capture initialization failed, checking getUserMedia fallback:', err);
+      }
+    }
+
+    // 2. In browser environment (or fallback): use WebAudio navigator.mediaDevices.getUserMedia
     const hasGetUserMedia =
       typeof navigator !== 'undefined' &&
       Boolean(navigator.mediaDevices) &&
       typeof navigator.mediaDevices.getUserMedia === 'function';
 
+    console.log('[MIC_DIAGNOSTIC] start() initiated:', {
+      runtimeType,
+      hasGetUserMedia,
+    });
+
     if (hasGetUserMedia) {
       try {
+        console.log('[MIC_DIAGNOSTIC] selectedCaptureImplementation:', 'webaudio_getusermedia');
         this.mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             sampleRate: 16000,
@@ -208,6 +282,15 @@ export class AudioRecorderService {
           audioContextState: this.audioContext?.state,
         });
 
+        console.log('[MIC_DIAGNOSTIC] captureStartResult:', {
+          runtimeType,
+          selectedCaptureImplementation: 'webaudio_getusermedia',
+          success: true,
+          sampleRate: trackSettings.sampleRate || this.audioContext?.sampleRate || 16000,
+          channelCount: trackSettings.channelCount || 1,
+          audioFrameSize: this.analyser?.fftSize || 512,
+        });
+
         this.mediaRecorder.ondataavailable = (event) => {
           if (event.data.size > 0) {
             this.audioChunks.push(event.data);
@@ -238,75 +321,130 @@ export class AudioRecorderService {
         this.monitorVolume();
         return;
       } catch (err: any) {
-        console.warn('WebAudio getUserMedia unavailable, falling back to desktop native capture:', err);
+        console.warn('[MIC_DIAGNOSTIC] captureError (getUserMedia):', {
+          runtimeType,
+          selectedCaptureImplementation: 'webaudio_getusermedia',
+          errorName: err?.name,
+          errorMessage: err?.message || String(err),
+        });
       }
     }
 
-    // 2. Fallback to Tauri Native Desktop Microphone Capture (Cross-Platform macOS & Linux)
-    try {
-      const nativePerm = await requestNativeMicrophonePermission();
-      if (nativePerm.status === 'GRANTED') {
-        this.isRecording = true;
-        this.vad.start();
-        this.startNativeCaptureLoop();
-        return;
-      }
+    const msg = 'Microphone capture failed: No active audio capture method available.';
+    if (this.callbacks.onError) {
+      this.callbacks.onError(msg);
+    }
+    throw new Error(msg);
+  }
 
+  private async startNativeContinuousCapture(): Promise<void> {
+    const nativePerm = await requestNativeMicrophonePermission();
+    console.log('[MIC_DIAGNOSTIC] permissionRequestResult:', {
+      runtimeType: 'tauri',
+      selectedCaptureImplementation: 'tauri_native_continuous',
+      status: nativePerm.status,
+      message: nativePerm.message,
+    });
+
+    if (nativePerm.status !== 'GRANTED') {
       const msg = `Microphone access denied: ${nativePerm.message || 'Permission denied'}`;
       if (this.callbacks.onError) {
         this.callbacks.onError(msg);
       }
       throw new Error(msg);
-    } catch (err: any) {
-      const msg = `Microphone capture failed: ${err.message || 'Permission denied'}`;
+    }
+
+    this.nativePcmChunks = [];
+    this.nativePreRollChunks = [];
+
+    // Register audio frame listener
+    this.unlistenAudioFrames = await listenToMicrophoneAudioFrames((frame: AudioFramePayload) => {
+      this.handleNativeAudioFrame(frame);
+    });
+
+    // Register capture error listener
+    this.unlistenCaptureError = await listenToMicrophoneCaptureError((errMsg: string) => {
+      console.error('[MIC_DIAGNOSTIC] captureError (native stream):', errMsg);
       if (this.callbacks.onError) {
-        this.callbacks.onError(msg);
+        this.callbacks.onError(errMsg);
       }
-      throw new Error(msg);
+    });
+
+    // Start continuous CPAL CoreAudio stream
+    await startContinuousMicrophoneCapture();
+
+    this.isRecording = true;
+    this.isNativeContinuous = true;
+    this.vad.start();
+
+    console.log('[MIC_DIAGNOSTIC] captureStartResult:', {
+      runtimeType: 'tauri',
+      selectedCaptureImplementation: 'tauri_native_continuous',
+      success: true,
+      sampleRate: 16000,
+      channelCount: 1,
+      audioFrameSize: 512,
+    });
+  }
+
+  private handleNativeAudioFrame(frame: AudioFramePayload) {
+    if (!this.isRecording) return;
+
+    if (!this._hasReceivedFrames) {
+      this._hasReceivedFrames = true;
+      console.log('[MIC_DIAGNOSTIC] firstAudioFrameReceived:', {
+        runtimeType: 'tauri',
+        selectedCaptureImplementation: 'tauri_native_continuous',
+        sampleRate: frame.sample_rate,
+        channelCount: frame.channels,
+        audioFrameSize: frame.samples_count,
+        initialRms: Number(frame.rms.toFixed(4)),
+      });
+    }
+
+    // Process frame in LocalVAD (speech start/end and barge-in interruption detection)
+    this.vad.processAudioFrame(frame.rms, 32);
+
+    const now = Date.now();
+    if (now - this.lastDiagLogTime >= 3000) {
+      this.lastDiagLogTime = now;
+      console.log('[AUDIO_PIPELINE_DIAGNOSTIC]', {
+        framesReceived: this._hasReceivedFrames,
+        currentRms: Number(frame.rms.toFixed(4)),
+        isSpeaking: this.vad.isSpeaking,
+        bargeInMode: this.vad.bargeInMode,
+        nativeContinuous: true,
+      });
+    }
+
+    // If recorder is muted/paused during TTS playback, discard audio for speech recognition
+    if (this.isPaused) {
+      return;
+    }
+
+    if (frame.pcm_base64) {
+      const pcmBytes = base64ToUint8Array(frame.pcm_base64);
+      if (this.vad.isSpeaking) {
+        this.nativePcmChunks.push(pcmBytes);
+      } else {
+        this.nativePreRollChunks.push(pcmBytes);
+        if (this.nativePreRollChunks.length > this.PRE_ROLL_LIMIT) {
+          this.nativePreRollChunks.shift();
+        }
+      }
     }
   }
 
   public pause() {
     this.isPaused = true;
     this.vad.setAudioInputEnabled(false);
+    this.nativePcmChunks = [];
+    this.nativePreRollChunks = [];
   }
 
   public resume() {
     this.isPaused = false;
     this.vad.setAudioInputEnabled(true);
-  }
-
-  private async startNativeCaptureLoop() {
-    while (this.isRecording) {
-      if (this.isPaused) {
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        continue;
-      }
-
-      const res = await startNativeMicrophoneTestCapture(4);
-      if (!this.isRecording) break;
-
-      if (this.isPaused) {
-        // Discard audio captured while recorder was muted during TTS playback
-        continue;
-      }
-
-      if (res.success && res.wav_base64 && res.samples_captured > 1000) {
-        this._hasReceivedFrames = true;
-        this.vad.processAudioFrame(res.rms_volume);
-        const blob = base64ToBlob(res.wav_base64, 'audio/wav');
-        if (this.callbacks.onUtteranceRecorded && !this.isPaused) {
-          this.callbacks.onUtteranceRecorded(blob);
-        }
-      } else if (!res.success && res.error) {
-        if (this.callbacks.onError) {
-          this.callbacks.onError(res.error);
-        }
-        break;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 300));
-    }
   }
 
   private monitorVolume() {
@@ -347,7 +485,17 @@ export class AudioRecorderService {
     }
 
     // Delegate VAD speech start / end detection to LocalVAD
-    this._hasReceivedFrames = true;
+    if (!this._hasReceivedFrames) {
+      this._hasReceivedFrames = true;
+      console.log('[MIC_DIAGNOSTIC] firstAudioFrameReceived:', {
+        runtimeType: isTauriEnvironment() ? 'tauri' : 'browser',
+        selectedCaptureImplementation: 'webaudio_getusermedia',
+        sampleRate: this.audioContext?.sampleRate || 16000,
+        channelCount: 1,
+        audioFrameSize: this.analyser.fftSize,
+        initialRms: Number(rms.toFixed(4)),
+      });
+    }
     this.vad.processAudioFrame(rms);
 
     const now = Date.now();
@@ -370,6 +518,25 @@ export class AudioRecorderService {
     this.isPaused = false;
     this._hasReceivedFrames = false;
     this.vad.stop();
+
+    if (this.unlistenAudioFrames) {
+      try {
+        this.unlistenAudioFrames();
+      } catch {}
+      this.unlistenAudioFrames = null;
+    }
+
+    if (this.unlistenCaptureError) {
+      try {
+        this.unlistenCaptureError();
+      } catch {}
+      this.unlistenCaptureError = null;
+    }
+
+    if (this.isNativeContinuous) {
+      this.isNativeContinuous = false;
+      stopContinuousMicrophoneCapture().catch(() => {});
+    }
 
     stopNativeMicrophoneTestCapture().catch(() => {});
 
@@ -397,5 +564,7 @@ export class AudioRecorderService {
     }
 
     this.audioChunks = [];
+    this.nativePcmChunks = [];
+    this.nativePreRollChunks = [];
   }
 }

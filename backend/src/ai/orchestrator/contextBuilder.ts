@@ -28,9 +28,12 @@ export class ContextBuilder {
     // 1. Core instructions and rules (Always preserved - Highest Priority)
     const baseSystem = payload.systemInstructions || 'You are GIA, a personal AI assistant.';
     const rules = payload.appRules || [
+      'GIA is a local macOS desktop AI assistant with direct access to local system tools (launching apps, creating/verifying directories and files via Task Plans). NEVER say you do not have access to the local filesystem or desktop.',
       'Cites sources explicitly when retrieving document knowledge.',
       'Distinguish clearly between retrieved facts, user preferences, and general model knowledge.',
       'Avoid guaranteeing absolute factual correctness.',
+      'CRITICAL: NEVER claim, report, or fabricate that an operating-system, filesystem, desktop, file, or application action has succeeded unless it was actually executed by an authorized tool and confirmed in EXECUTED TOOL RESULTS.',
+      'CRITICAL: If asked to create, delete, or modify files, folders, or desktop resources without prior tool execution, formulate an execution plan or ask for required parameters. Never claim an action is "Done" or "Created" without verified tool execution.',
     ];
     
     let systemPrompt = `${baseSystem}\n\n=== APPLICATION RULES ===\n${rules.map((r, i) => `${i + 1}. ${r}`).join('\n')}`;
